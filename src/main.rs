@@ -18,6 +18,7 @@ use iphone_mirror_rs::{
 };
 use std::collections::BTreeSet;
 use std::env;
+use std::io::Write;
 use tracing::{debug, info, warn};
 
 enum Command {
@@ -520,8 +521,22 @@ async fn run_mirror() -> Result<()> {
             let mut decoder: Option<HardwareDecoder> = None;
             let mut nal_count = 0_u64;
             let mut audio_packet_count = 0_u64;
+            let mut audio_highest_sequence = 0_u32;
+            let mut audio_decode_errors = 0_u32;
             let mut audio_decoder = AacEldDecoder::new()?;
             let mut audio_player = AudioPlayer::new()?;
+            let mut audio_rtcp = tokio::time::interval(std::time::Duration::from_secs(1));
+            audio_rtcp.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut audio_peak = 0_u16;
+            let mut audio_pcm_bytes = 0_u64;
+            let audio_stats_start = std::time::Instant::now();
+            let mut audio_dump = env::var_os("IPHONE_MIRROR_AUDIO_DUMP").map(|directory| {
+                let directory = std::path::PathBuf::from(directory);
+                (
+                    std::fs::File::create(directory.join("pcm.raw")).expect("create pcm dump"),
+                    std::fs::File::create(directory.join("au.bin")).expect("create AU dump"),
+                )
+            });
 
             loop {
                 tokio::select! {
@@ -564,12 +579,82 @@ async fn run_mirror() -> Result<()> {
                             continue;
                         }
                         audio_packet_count += 1;
+                        let sequence = packet.sequence_number as u32;
+                        let cycles = audio_highest_sequence >> 16;
+                        let last_sequence = audio_highest_sequence & 0xFFFF;
+                        let cycles = if sequence < last_sequence
+                            && last_sequence - sequence > 0x8000
+                        {
+                            cycles + 1
+                        } else {
+                            cycles
+                        };
+                        let extended = (cycles << 16) | sequence;
+                        if audio_highest_sequence == 0
+                            || extended.wrapping_sub(audio_highest_sequence) < 0x8000_0000
+                        {
+                            audio_highest_sequence = extended;
+                        }
+                        let payload_type = packet.payload_type;
+                        if let Some((_, au_dump)) = audio_dump.as_mut() {
+                            let _ = au_dump.write_all(&(packet.payload.len() as u32).to_le_bytes());
+                            let _ = au_dump.write_all(&packet.payload);
+                        }
                         match audio_decoder.decode(&packet.payload) {
-                            Ok(pcm) => audio_player.play(&pcm)?,
-                            Err(error) => debug!(%error, "Dropped invalid AAC-ELD audio packet"),
+                            Ok(pcm) => {
+                                audio_decode_errors = 0;
+                                if let Some((pcm_dump, _)) = audio_dump.as_mut() {
+                                    let _ = pcm_dump.write_all(&pcm);
+                                }
+                                audio_pcm_bytes += pcm.len() as u64;
+                                audio_peak = audio_peak.max(
+                                    pcm.chunks_exact(2)
+                                        .map(|sample| {
+                                            i16::from_le_bytes([sample[0], sample[1]]).unsigned_abs()
+                                        })
+                                        .max()
+                                        .unwrap_or(0),
+                                );
+                                if let Err(error) = audio_player.play(&pcm) {
+                                    debug!(%error, "Audio queue rejected a decoded PCM packet");
+                                }
+                            }
+                            Err(error) => {
+                                audio_decode_errors += 1;
+                                if audio_decode_errors == 1 {
+                                    debug!(%error, payload_type, "AAC-ELD decode failed");
+                                }
+                                if audio_decode_errors >= 5 {
+                                    match AacEldDecoder::new() {
+                                        Ok(decoder) => {
+                                            audio_decoder = decoder;
+                                            audio_decode_errors = 0;
+                                            info!("Recreated the AAC-ELD decoder after repeated failures");
+                                        }
+                                        Err(error) => {
+                                            warn!(%error, "Failed to recreate the AAC-ELD decoder");
+                                        }
+                                    }
+                                }
+                            }
                         }
                         if audio_packet_count % 500 == 0 {
-                            info!(audio_packet_count, "Playing iPhone system audio");
+                            let elapsed = audio_stats_start.elapsed().as_secs_f64();
+                            info!(
+                                audio_packet_count,
+                                packets_per_second = audio_packet_count as f64 / elapsed,
+                                peak = audio_peak,
+                                pcm_bytes = audio_pcm_bytes,
+                                dropped = audio_player.dropped(),
+                                "Playing iPhone system audio"
+                            );
+                        }
+                    }
+                    _ = audio_rtcp.tick() => {
+                        if let Some(report) = client.audio_rtcp_report(audio_highest_sequence) {
+                            if let Err(error) = client.send_audio_rtcp(report).await {
+                                debug!(%error, "Failed to send the audio RTCP keepalive");
+                            }
                         }
                     }
                     changed = shutdown_rx.changed() => {

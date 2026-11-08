@@ -15,9 +15,20 @@ use uuid::Uuid;
 const CLIENT_SUPPORTED_FEATURES: u64 = 140;
 const SERVICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
+#[derive(Debug, Clone, Copy)]
+pub struct AudioSession {
+    /// SSRC the device expects in our RTCP sender field.
+    local_ssrc: u32,
+    /// SSRC carried by the device's RTP stream.
+    remote_ssrc: u32,
+    /// Device source port where RTCP reports are delivered.
+    rtcp_port: u16,
+}
+
 pub struct DisplayClient {
     client: DisplayServiceClient<Box<dyn ReadWrite>>,
     audio_udp: UdpSocketHandle,
+    audio_session: Option<AudioSession>,
     video_udp: UdpSocketHandle,
 }
 
@@ -67,6 +78,10 @@ impl DisplayClient {
                 .context("Display service rejected the audio media stream")?;
         dump_answer("audio", &audio_answer);
         log_audio_negotiation(&audio_answer);
+        let audio_session = audio_session_from_answer(&audio_answer);
+        if audio_session.is_none() {
+            tracing::warn!("Audio streamConfig is missing SSRC/RTCP fields; keepalive disabled");
+        }
 
         let video_call_id = Uuid::new_v4().to_string().to_uppercase();
         let controller_ssrc = Uuid::new_v4().as_u128() as u32;
@@ -106,8 +121,43 @@ impl DisplayClient {
         Ok(Self {
             client,
             audio_udp,
+            audio_session,
             video_udp,
         })
+    }
+
+    /// Build a compound RTCP Receiver Report + SDES for the audio stream.
+    /// The device stops emitting audio after `RTCPTimeoutInterval` without it.
+    pub fn audio_rtcp_report(&self, highest_sequence: u32) -> Option<Vec<u8>> {
+        let session = self.audio_session?;
+        let mut packet = Vec::with_capacity(48);
+        packet.extend_from_slice(&[
+            0x81, 0xC9, 0x00, 0x07, // V=2, RC=1, PT=RR, length=7 words
+        ]);
+        packet.extend_from_slice(&session.local_ssrc.to_be_bytes());
+        packet.extend_from_slice(&session.remote_ssrc.to_be_bytes());
+        packet.extend_from_slice(&[0, 0, 0, 0]); // fraction lost + cumulative loss
+        packet.extend_from_slice(&highest_sequence.to_be_bytes());
+        packet.extend_from_slice(&[0, 0, 0, 0]); // jitter
+        packet.extend_from_slice(&[0, 0, 0, 0]); // last SR
+        packet.extend_from_slice(&[0, 0, 0, 0]); // delay since last SR
+        packet.extend_from_slice(&[
+            0x81, 0xCA, 0x00, 0x02, // V=2, SC=1, PT=SDES, length=2 words
+        ]);
+        packet.extend_from_slice(&session.local_ssrc.to_be_bytes());
+        packet.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // empty CNAME + END
+        Some(packet)
+    }
+
+    pub async fn send_audio_rtcp(&self, packet: Vec<u8>) -> Result<()> {
+        let Some(session) = self.audio_session else {
+            return Ok(());
+        };
+        self.audio_udp
+            .send_to(session.rtcp_port, packet)
+            .await
+            .context("Failed to send the audio RTCP receiver report")?;
+        Ok(())
     }
 
     pub async fn recv_audio_packet(&self) -> Result<Vec<u8>> {
@@ -173,6 +223,21 @@ fn log_audio_negotiation(answer: &plist::Value) {
         Ok(negotiation) => info!(?negotiation, "Parsed audio negotiation"),
         Err(error) => tracing::warn!(%error, "Could not parse audio negotiation answer"),
     }
+}
+
+fn audio_session_from_answer(answer: &plist::Value) -> Option<AudioSession> {
+    let config = answer
+        .as_dictionary()?
+        .get("connection")?
+        .as_dictionary()?
+        .get("streamConfig")?
+        .as_dictionary()?;
+    let number = |key: &str| config.get(key).and_then(plist::Value::as_unsigned_integer);
+    Some(AudioSession {
+        local_ssrc: number("RemoteSSRC")? as u32,
+        remote_ssrc: number("LocalSSRC")? as u32,
+        rtcp_port: number("SourcePort")? as u16,
+    })
 }
 
 fn host_call_info() -> CallInfoBlob {

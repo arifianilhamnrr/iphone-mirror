@@ -188,8 +188,10 @@ impl AacEldDecoder {
             )
         };
         if status != 0 {
-            unsafe { AudioConverterDispose(converter) };
-            bail!("Setting AAC-ELD magic cookie failed with OSStatus {status}");
+            // The reference implementation ignores this too: the cookie is
+            // already advertised out-of-band and some AudioToolbox builds
+            // reject re-setting it while still decoding AAC-ELD correctly.
+            tracing::debug!(status, "AudioConverter rejected AAC-ELD magic cookie");
         }
         Ok(Self { converter })
     }
@@ -281,7 +283,7 @@ impl AudioPlayer {
         if status != 0 || queue.is_null() {
             bail!("AudioQueueNewOutput failed with OSStatus {status}");
         }
-        for _ in 0..24 {
+        for _ in 0..12 {
             let mut buffer = ptr::null_mut();
             let status = unsafe { AudioQueueAllocateBuffer(queue, PCM_BYTES as u32, &mut buffer) };
             if status != 0 {
@@ -336,6 +338,10 @@ impl AudioPlayer {
             bail!("AudioQueueEnqueueBuffer failed with OSStatus {status}");
         }
         Ok(())
+    }
+
+    pub fn dropped(&self) -> u64 {
+        self.dropped
     }
 }
 

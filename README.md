@@ -3,7 +3,7 @@
 Experimental native iPhone screen mirroring client in Rust for **macOS 26 Tahoe** and **macOS 15 Sequoia**, with Intel Mac/Hackintosh support as a primary goal.
 
 > [!IMPORTANT]
-> This project is under active development. End-to-end display streaming, Metal rendering, touch forwarding, and text clipboard sync work on tested hardware. Reconnect and release hardening are not complete yet.
+> This project is under active development. End-to-end display streaming, Metal rendering, touch forwarding, text clipboard sync, keyboard input, and iPhone system audio playback work on tested hardware. Reconnect and release hardening are not complete yet.
 
 ---
 
@@ -13,6 +13,7 @@ Experimental native iPhone screen mirroring client in Rust for **macOS 26 Tahoe*
 - Implemented: aspect-fit mouse mapping and CoreDevice touchscreen down/move/up forwarding.
 - Hardware-tested: bidirectional text clipboard sharing between macOS and iPhone.
 - Implemented: physical laptop keyboard forwarding (letters, numbers, punctuation, navigation, function keys, and modifiers).
+- Hardware-tested: iPhone system audio playback on the host Mac (AAC-ELD, 48 kHz stereo, via AudioToolbox/AudioQueue) with RTCP receiver reports keeping the audio session alive.
 - In progress: image/file clipboard payloads and hardware-button shortcuts.
 - Planned: reconnect, app-bundle polish, and performance hardening.
 - Performance and zero-copy behavior have not been benchmarked yet.
@@ -51,12 +52,15 @@ Plain-text clipboard contents synchronize automatically in both directions while
 
 Focus the mirror window and type while an editable field is active on the iPhone. Keyboard input uses physical USB HID usages, including Shift, Control, Option, and Command modifiers. The current implementation follows the physical key layout rather than macOS text composition, so IME/dead-key input is not supported yet.
 
+While a mirror session is active, the iPhone's system audio is decoded (AAC-ELD, 48 kHz stereo) and played through the host Mac's current output device. Audio starts automatically and is kept alive with RTCP receiver reports; there is no separate mute control yet. Set `IPHONE_MIRROR_AUDIO_DUMP=/some/directory` to write `au.bin` (length-prefixed access units) and `pcm.raw` for diagnostics.
+
 ---
 
 ## Architecture
 
 ```
 src/
+├── audio/           # AAC-ELD decode (AudioConverter) & PCM playback (AudioQueue)
 ├── codec/           # Hardware VideoToolbox FFI & CMFormatDescription bindings
 ├── input/           # CoreDevice HID Touch serialization & coordinate mapper
 ├── media/           # RFC 7798 RTP parser, H.265 depacketizer & UDP receiver
