@@ -73,7 +73,7 @@ Text and image clipboard contents synchronize automatically in both directions w
 
 Focus the mirror window and type while an editable field is active on the iPhone. Keyboard input uses physical USB HID usages, including Shift, Control, Option, and Command modifiers. The current implementation follows the physical key layout rather than macOS text composition, so IME/dead-key input is not supported yet.
 
-While a mirror session is active, the iPhone's system audio is decoded (AAC-ELD, 48 kHz stereo) and played through the host Mac's current output device. Audio starts automatically and is kept alive with RTCP receiver reports; press `Ctrl+M` to mute playback locally. Mute uses AudioQueue's native volume parameter, so AAC decoding, jitter buffering, and PCM enqueueing continue uninterrupted and unmute resumes immediately. Set `IPHONE_MIRROR_AUDIO_DUMP=/some/directory` to write `au.bin` (length-prefixed access units) and `pcm.raw` for diagnostics.
+While a mirror session is active, the iPhone's system audio is decoded (AAC-ELD, 48 kHz stereo) and played through the host Mac's current output device. Audio starts automatically and is kept alive with RTCP receiver reports; press `Ctrl+M` to mute playback locally. While muted, the queue receives 10 ms silent PCM frames instead of changing native AudioQueue volume/state. On unmute the host output queue is recreated before live PCM resumes, avoiding output units that remain silent on some Hackintosh audio drivers without disturbing RTP or AAC decoder state. Set `IPHONE_MIRROR_AUDIO_DUMP=/some/directory` to write `au.bin` (length-prefixed access units) and `pcm.raw` for diagnostics.
 
 Keyboard shortcuts (hold Control):
 

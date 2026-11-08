@@ -115,7 +115,6 @@ extern "C" {
         packet_descriptions: *const AudioStreamPacketDescription,
     ) -> i32;
     fn AudioQueueStart(queue: AudioQueueRef, start_time: *const c_void) -> i32;
-    fn AudioQueueSetParameter(queue: AudioQueueRef, parameter: u32, value: f32) -> i32;
     fn AudioQueueStop(queue: AudioQueueRef, immediate: bool) -> i32;
     fn AudioQueueDispose(queue: AudioQueueRef, immediate: bool) -> i32;
 }
@@ -349,17 +348,12 @@ impl AudioPlayer {
         Ok(())
     }
 
-    /// Mute at the native output queue while continuing to enqueue PCM. This
-    /// avoids starving/stopping AudioQueue and makes unmute instantaneous.
-    pub fn set_muted(&mut self, muted: bool) -> Result<()> {
-        const AUDIO_QUEUE_PARAMETER_VOLUME: u32 = 1;
-        let volume = if muted { 0.0 } else { 1.0 };
-        let status =
-            unsafe { AudioQueueSetParameter(self.queue, AUDIO_QUEUE_PARAMETER_VOLUME, volume) };
-        if status != 0 {
-            bail!("AudioQueue volume change failed with OSStatus {status}");
-        }
-        Ok(())
+    /// Keep AudioQueue running while muted by enqueueing one 10 ms silent PCM
+    /// frame. Software silence avoids output-unit volume/state transitions that
+    /// do not reliably recover on every macOS/Hackintosh audio driver.
+    pub fn play_silence(&mut self) -> Result<()> {
+        const SILENCE: [u8; PCM_BYTES] = [0; PCM_BYTES];
+        self.play(&SILENCE)
     }
 
     pub fn dropped(&self) -> u64 {
@@ -395,13 +389,11 @@ mod tests {
     use super::{AudioPlayer, PCM_BYTES};
 
     #[test]
-    fn audio_queue_can_mute_unmute_and_resume_enqueueing() {
+    fn audio_queue_can_play_silence_then_resume_pcm() {
         let mut player = AudioPlayer::new().expect("create AudioQueue");
         let silence = vec![0_u8; PCM_BYTES];
         player.play(&silence).expect("initial enqueue");
-        player.set_muted(true).expect("mute AudioQueue");
-        player.play(&silence).expect("enqueue while muted");
-        player.set_muted(false).expect("unmute AudioQueue");
+        player.play_silence().expect("software-muted enqueue");
         player.play(&silence).expect("enqueue after unmute");
     }
 }

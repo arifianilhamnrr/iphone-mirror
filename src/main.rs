@@ -863,7 +863,7 @@ async fn run_mirror() -> Result<()> {
             let mut audio_decode_errors = 0_u32;
             let mut audio_decoder = AacEldDecoder::new()?;
             let mut audio_player = AudioPlayer::new()?;
-            let mut audio_output_muted = false;
+            let mut audio_was_muted = false;
             let mut audio_rtcp = tokio::time::interval(std::time::Duration::from_secs(1));
             audio_rtcp.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut audio_playback = tokio::time::interval(std::time::Duration::from_millis(10));
@@ -1003,18 +1003,27 @@ async fn run_mirror() -> Result<()> {
                         }
                     }
                     _ = audio_playback.tick() => {
-                        let requested_mute = audio_muted_stream.load(Ordering::Relaxed);
-                        if requested_mute != audio_output_muted {
-                            match audio_player.set_muted(requested_mute) {
-                                Ok(()) => {
-                                    audio_output_muted = requested_mute;
-                                    info!(muted = requested_mute, "Applied host audio mute state");
+                        let muted = audio_muted_stream.load(Ordering::Relaxed);
+                        if audio_was_muted && !muted {
+                            // Some Hackintosh CoreAudio drivers leave an output unit silent
+                            // after a prolonged run of zero-valued frames. Recreating only the
+                            // host output queue is cheap and leaves RTP/AAC state untouched.
+                            match AudioPlayer::new() {
+                                Ok(player) => {
+                                    audio_player = player;
+                                    info!("Recreated host audio output after unmute");
                                 }
-                                Err(error) => warn!(%error, "Failed to change host audio mute state"),
+                                Err(error) => warn!(%error, "Failed to recreate host audio output after unmute"),
                             }
                         }
+                        audio_was_muted = muted;
                         if let Some(pcm) = audio_jitter.pop_front() {
-                            if let Err(error) = audio_player.play(&pcm) {
+                            let result = if muted {
+                                audio_player.play_silence()
+                            } else {
+                                audio_player.play(&pcm)
+                            };
+                            if let Err(error) = result {
                                 debug!(%error, "Audio queue rejected a decoded PCM packet");
                             }
                         }
