@@ -32,11 +32,51 @@ pub struct VTDecompressionOutputCallbackRecord {
     pub decompression_output_ref_con: *mut c_void,
 }
 
+#[repr(C)]
+pub struct OpaqueCMBlockBuffer(c_void);
+pub type CMBlockBufferRef = *mut OpaqueCMBlockBuffer;
+
+#[repr(C)]
+pub struct OpaqueCMSampleBuffer(c_void);
+pub type CMSampleBufferRef = *mut OpaqueCMSampleBuffer;
+
 #[cfg(target_os = "macos")]
 #[link(name = "VideoToolbox", kind = "framework")]
 #[link(name = "CoreMedia", kind = "framework")]
 #[link(name = "CoreVideo", kind = "framework")]
 extern "C" {
+    pub fn CMBlockBufferCreateWithMemoryBlock(
+        structure_allocator: *mut c_void,
+        memory_block: *mut c_void,
+        block_length: usize,
+        block_allocator: *mut c_void,
+        custom_block_source: *mut c_void,
+        offset_to_data: usize,
+        data_length: usize,
+        flags: u32,
+        block_buffer_out: *mut CMBlockBufferRef,
+    ) -> OSStatus;
+
+    pub fn CMSampleBufferCreateReady(
+        allocator: *mut c_void,
+        data_buffer: CMBlockBufferRef,
+        format_description: CMVideoFormatDescriptionRef,
+        sample_count: usize,
+        sample_timing_entry_count: usize,
+        sample_timing_array: *const c_void,
+        sample_size_entry_count: usize,
+        sample_size_array: *const usize,
+        sample_buffer_out: *mut CMSampleBufferRef,
+    ) -> OSStatus;
+
+    pub fn VTDecompressionSessionDecodeFrame(
+        session: VTDecompressionSessionRef,
+        sample_buffer: CMSampleBufferRef,
+        decode_flags: u32,
+        source_frame_ref_con: *mut c_void,
+        info_flags_out: *mut u32,
+    ) -> OSStatus;
+
     pub fn CMVideoFormatDescriptionCreateFromHEVCParameterSets(
         allocator: *mut c_void,
         parameter_set_count: usize,

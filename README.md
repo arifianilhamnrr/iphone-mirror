@@ -1,13 +1,14 @@
 # iphone-mirror-rs 📱⚡
 
-Native, zero-copy, 60fps iPhone screen mirroring & HID touch control in pure Rust for **macOS Sequoia / Sonoma** (specifically designed for **Intel / AMD Hackintosh** where native Apple Silicon / T2 iPhone Mirroring is locked out).
+Native, zero-copy, 60fps iPhone screen mirroring & HID touch control in pure Rust for **macOS Tahoe (macOS 16)** & **macOS Sequoia (macOS 15)** (specifically designed for **Intel / AMD Hackintosh** where native Apple Silicon / T2 iPhone Mirroring is locked out).
 
 ---
 
 ## 🚀 Key Advantages over Windows Python Implementations
-- **Zero-Copy Native Pipeline**: H.265 NAL units stream directly into macOS `VideoToolbox` hardware decompression (`VTDecompressionSession`), outputting directly to `CAMetalLayer` / `CVMetalTextureCache`.
+- **Zero-Copy Native Pipeline**: H.265 NAL units stream directly into macOS `VideoToolbox` hardware decompression (`VTDecompressionSession`), outputting directly to `CAMetalLayer` / `CVMetalTextureCache` via Metal 3.
 - **Tiny Footprint**: Native Rust binary (~15–25 MB RAM, < 1.5% CPU steady state) vs Python + Edge WebView2 (~88 MB RAM).
 - **No T2 / Apple Silicon Lock**: Interacts directly with Xcode's official `com.apple.coredevice.displayservice` over `/var/run/usbmuxd`.
+- **macOS Tahoe Compatibility**: Pure C-ABI FFI to `CoreMedia`, `CoreVideo`, and `VideoToolbox` avoids internal API breakage across major macOS version bumps.
 
 ---
 
