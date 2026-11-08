@@ -778,6 +778,10 @@ async fn run_mirror() -> Result<()> {
             let mut audio_player = AudioPlayer::new()?;
             let mut audio_rtcp = tokio::time::interval(std::time::Duration::from_secs(1));
             audio_rtcp.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut audio_playback = tokio::time::interval(std::time::Duration::from_millis(10));
+            audio_playback.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut audio_jitter = std::collections::VecDeque::<Vec<u8>>::with_capacity(12);
+            let mut audio_jitter_drops = 0_u64;
             let mut audio_peak = 0_u16;
             let mut audio_pcm_bytes = 0_u64;
             let audio_stats_start = std::time::Instant::now();
@@ -869,9 +873,15 @@ async fn run_mirror() -> Result<()> {
                                         .max()
                                         .unwrap_or(0),
                                 );
-                                if let Err(error) = audio_player.play(&pcm) {
-                                    debug!(%error, "Audio queue rejected a decoded PCM packet");
+                                // USB/tunnel delivery is bursty even though each AU represents
+                                // exactly 10 ms. Pace playback and cap queued latency at 120 ms;
+                                // dropping the oldest packet catches up instead of accumulating
+                                // seconds of stale audio.
+                                if audio_jitter.len() == 12 {
+                                    audio_jitter.pop_front();
+                                    audio_jitter_drops += 1;
                                 }
+                                audio_jitter.push_back(pcm);
                             }
                             Err(error) => {
                                 audio_decode_errors += 1;
@@ -899,9 +909,18 @@ async fn run_mirror() -> Result<()> {
                                 packets_per_second = audio_packet_count as f64 / elapsed,
                                 peak = audio_peak,
                                 pcm_bytes = audio_pcm_bytes,
-                                dropped = audio_player.dropped(),
+                                queue_dropped = audio_player.dropped(),
+                                jitter_dropped = audio_jitter_drops,
+                                jitter_depth = audio_jitter.len(),
                                 "Playing iPhone system audio"
                             );
+                        }
+                    }
+                    _ = audio_playback.tick() => {
+                        if let Some(pcm) = audio_jitter.pop_front() {
+                            if let Err(error) = audio_player.play(&pcm) {
+                                debug!(%error, "Audio queue rejected a decoded PCM packet");
+                            }
                         }
                     }
                     _ = audio_rtcp.tick() => {

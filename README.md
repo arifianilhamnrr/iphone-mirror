@@ -13,7 +13,7 @@ Experimental native iPhone screen mirroring client in Rust for **macOS 26 Tahoe*
 - Implemented: aspect-fit mouse mapping and CoreDevice touchscreen down/move/up forwarding.
 - Hardware-tested: bidirectional text and image clipboard sharing between macOS and iPhone.
 - Implemented: physical laptop keyboard forwarding (letters, numbers, punctuation, navigation, function keys, and modifiers).
-- Hardware-tested: iPhone system audio playback on the host Mac (AAC-ELD, 48 kHz stereo, via AudioToolbox/AudioQueue) with RTCP receiver reports keeping the audio session alive.
+- Hardware-tested: iPhone system audio playback on the host Mac (AAC-ELD, 48 kHz stereo, via AudioToolbox/AudioQueue), bounded 120 ms burst buffering, and RTCP receiver reports keeping the audio session alive.
 - Implemented: hardware-button shortcuts (Home, Lock, volume, mute) through the Indigo HID service.
 - Hardware-tested: full-resolution PNG screenshots, fullscreen, and always-on-top window controls.
 - Implemented: automatic session restart after a stream/tunnel failure; each retry recreates CoreDevice, VideoToolbox, AudioToolbox, HID, and clipboard state cleanly.
