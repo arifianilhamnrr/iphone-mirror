@@ -115,6 +115,7 @@ extern "C" {
         packet_descriptions: *const AudioStreamPacketDescription,
     ) -> i32;
     fn AudioQueueStart(queue: AudioQueueRef, start_time: *const c_void) -> i32;
+    fn AudioQueueSetParameter(queue: AudioQueueRef, parameter: u32, value: f32) -> i32;
     fn AudioQueueStop(queue: AudioQueueRef, immediate: bool) -> i32;
     fn AudioQueueDispose(queue: AudioQueueRef, immediate: bool) -> i32;
 }
@@ -337,6 +338,27 @@ impl AudioPlayer {
                 .push_back(raw);
             bail!("AudioQueueEnqueueBuffer failed with OSStatus {status}");
         }
+        // AudioQueue can transition to an underrun-stopped state when the
+        // device is temporarily silent or the machine is under load. Starting
+        // an already-running queue is harmless and guarantees recovery once a
+        // new PCM buffer has been enqueued.
+        let status = unsafe { AudioQueueStart(self.queue, ptr::null()) };
+        if status != 0 {
+            bail!("AudioQueueStart after enqueue failed with OSStatus {status}");
+        }
+        Ok(())
+    }
+
+    /// Mute at the native output queue while continuing to enqueue PCM. This
+    /// avoids starving/stopping AudioQueue and makes unmute instantaneous.
+    pub fn set_muted(&mut self, muted: bool) -> Result<()> {
+        const AUDIO_QUEUE_PARAMETER_VOLUME: u32 = 1;
+        let volume = if muted { 0.0 } else { 1.0 };
+        let status =
+            unsafe { AudioQueueSetParameter(self.queue, AUDIO_QUEUE_PARAMETER_VOLUME, volume) };
+        if status != 0 {
+            bail!("AudioQueue volume change failed with OSStatus {status}");
+        }
         Ok(())
     }
 
@@ -365,5 +387,21 @@ fn pcm_format() -> AudioStreamBasicDescription {
         channels_per_frame: CHANNELS,
         bits_per_channel: 16,
         reserved: 0,
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::{AudioPlayer, PCM_BYTES};
+
+    #[test]
+    fn audio_queue_can_mute_unmute_and_resume_enqueueing() {
+        let mut player = AudioPlayer::new().expect("create AudioQueue");
+        let silence = vec![0_u8; PCM_BYTES];
+        player.play(&silence).expect("initial enqueue");
+        player.set_muted(true).expect("mute AudioQueue");
+        player.play(&silence).expect("enqueue while muted");
+        player.set_muted(false).expect("unmute AudioQueue");
+        player.play(&silence).expect("enqueue after unmute");
     }
 }

@@ -863,6 +863,7 @@ async fn run_mirror() -> Result<()> {
             let mut audio_decode_errors = 0_u32;
             let mut audio_decoder = AacEldDecoder::new()?;
             let mut audio_player = AudioPlayer::new()?;
+            let mut audio_output_muted = false;
             let mut audio_rtcp = tokio::time::interval(std::time::Duration::from_secs(1));
             audio_rtcp.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut audio_playback = tokio::time::interval(std::time::Duration::from_millis(10));
@@ -962,18 +963,11 @@ async fn run_mirror() -> Result<()> {
                                 // exactly 10 ms. Pace playback and cap queued latency at 120 ms;
                                 // dropping the oldest packet catches up instead of accumulating
                                 // seconds of stale audio.
-                                if audio_muted_stream.load(Ordering::Relaxed) {
-                                    // Keep feeding every compressed AU to the stateful AAC-ELD
-                                    // converter. Only discard decoded PCM, otherwise unmute
-                                    // resumes from a stale converter state and can stay silent.
-                                    audio_jitter.clear();
-                                } else {
-                                    if audio_jitter.len() == 12 {
-                                        audio_jitter.pop_front();
-                                        audio_jitter_drops += 1;
-                                    }
-                                    audio_jitter.push_back(pcm);
+                                if audio_jitter.len() == 12 {
+                                    audio_jitter.pop_front();
+                                    audio_jitter_drops += 1;
                                 }
+                                audio_jitter.push_back(pcm);
                             }
                             Err(error) => {
                                 audio_decode_errors += 1;
@@ -1009,6 +1003,16 @@ async fn run_mirror() -> Result<()> {
                         }
                     }
                     _ = audio_playback.tick() => {
+                        let requested_mute = audio_muted_stream.load(Ordering::Relaxed);
+                        if requested_mute != audio_output_muted {
+                            match audio_player.set_muted(requested_mute) {
+                                Ok(()) => {
+                                    audio_output_muted = requested_mute;
+                                    info!(muted = requested_mute, "Applied host audio mute state");
+                                }
+                                Err(error) => warn!(%error, "Failed to change host audio mute state"),
+                            }
+                        }
                         if let Some(pcm) = audio_jitter.pop_front() {
                             if let Err(error) = audio_player.play(&pcm) {
                                 debug!(%error, "Audio queue rejected a decoded PCM packet");
