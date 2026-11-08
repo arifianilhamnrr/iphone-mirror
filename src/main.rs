@@ -2,7 +2,8 @@
 use anyhow::{Context, Result};
 use idevice::{
     core_device::{
-        DataInclusionPolicy, PasteboardServiceClient, UniversalHidServiceClient, GENERAL_PASTEBOARD,
+        ButtonState, DataInclusionPolicy, IndigoHidClient, PasteboardServiceClient,
+        UniversalHidServiceClient, GENERAL_PASTEBOARD,
     },
     RsdService,
 };
@@ -19,6 +20,10 @@ use iphone_mirror_rs::{
 use std::collections::BTreeSet;
 use std::env;
 use std::io::Write;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tracing::{debug, info, warn};
 
 enum Command {
@@ -42,6 +47,47 @@ enum InputCommand {
     SetKeys(Vec<u16>),
 }
 
+/// Consumer-page (0x0C) HID usages for the iPhone's physical buttons.
+#[derive(Debug, Clone, Copy)]
+enum HardwareButton {
+    Home,
+    Lock,
+    VolumeUp,
+    VolumeDown,
+    Mute,
+}
+
+impl HardwareButton {
+    fn usage(self) -> (u64, u64) {
+        match self {
+            Self::Home => (0x0C, 0x40),
+            Self::Lock => (0x0C, 0x30),
+            Self::VolumeUp => (0x0C, 0xE9),
+            Self::VolumeDown => (0x0C, 0xEA),
+            Self::Mute => (0x0C, 0xE2),
+        }
+    }
+
+    /// iOS rejects near-instant taps for the side button; everything else
+    /// behaves like a normal 50 ms tap.
+    fn hold(self) -> std::time::Duration {
+        match self {
+            Self::Lock => std::time::Duration::from_millis(500),
+            _ => std::time::Duration::from_millis(50),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Home => "home",
+            Self::Lock => "lock",
+            Self::VolumeUp => "volume-up",
+            Self::VolumeDown => "volume-down",
+            Self::Mute => "mute",
+        }
+    }
+}
+
 struct MirrorApp {
     window: Option<winit::window::Window>,
     renderer: Option<MetalRenderer>,
@@ -52,7 +98,10 @@ struct MirrorApp {
     touch_active: bool,
     last_touch_position: Option<(u16, u16)>,
     input_tx: tokio::sync::mpsc::UnboundedSender<InputCommand>,
+    button_tx: tokio::sync::mpsc::UnboundedSender<HardwareButton>,
+    audio_muted: Arc<AtomicBool>,
     pressed_keys: BTreeSet<u16>,
+    modifiers: winit::keyboard::ModifiersState,
     clipboard: SystemClipboard,
     clipboard_tx: tokio::sync::mpsc::UnboundedSender<String>,
     last_device_clipboard: Option<String>,
@@ -182,7 +231,40 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                     let _ = self.input_tx.send(InputCommand::Up(x, y));
                 }
             }
+            winit::event::WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers.state();
+            }
             winit::event::WindowEvent::KeyboardInput { event, .. } => {
+                if event.state == winit::event::ElementState::Pressed && !event.repeat {
+                    if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
+                        let control = self.modifiers.control_key()
+                            || self.pressed_keys.contains(&0xE0)
+                            || self.pressed_keys.contains(&0xE4);
+                        if control {
+                            if code == winit::keyboard::KeyCode::KeyM {
+                                let was_muted = self.audio_muted.fetch_xor(true, Ordering::Relaxed);
+                                info!(muted = !was_muted, "Toggled host audio mute");
+                                return;
+                            }
+                            let button = match code {
+                                winit::keyboard::KeyCode::KeyH => Some(HardwareButton::Home),
+                                winit::keyboard::KeyCode::KeyL => Some(HardwareButton::Lock),
+                                winit::keyboard::KeyCode::BracketLeft => {
+                                    Some(HardwareButton::VolumeDown)
+                                }
+                                winit::keyboard::KeyCode::BracketRight => {
+                                    Some(HardwareButton::VolumeUp)
+                                }
+                                winit::keyboard::KeyCode::Backslash => Some(HardwareButton::Mute),
+                                _ => None,
+                            };
+                            if let Some(button) = button {
+                                let _ = self.button_tx.send(button);
+                                return;
+                            }
+                        }
+                    }
+                }
                 if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
                     if let Some(usage) = key_code_to_hid_usage(code) {
                         let changed = match event.state {
@@ -449,6 +531,9 @@ async fn run_mirror() -> Result<()> {
         UniversalHidServiceClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake)
             .await
             .context("Failed to connect to the universal HID service")?;
+    let mut indigo_hid = IndigoHidClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake)
+        .await
+        .context("Failed to connect to the Indigo HID service")?;
     let mut keyboard = hid.create_main_keyboard().await.map_err(|error| {
         anyhow::anyhow!("Failed to create the iPhone keyboard surface: {error}")
     })?;
@@ -477,7 +562,32 @@ async fn run_mirror() -> Result<()> {
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel(3);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (button_tx, mut button_rx) = tokio::sync::mpsc::unbounded_channel::<HardwareButton>();
     let (clipboard_tx, mut clipboard_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let audio_muted = Arc::new(AtomicBool::new(false));
+    let audio_muted_stream = audio_muted.clone();
+
+    tokio::spawn(async move {
+        while let Some(button) = button_rx.recv().await {
+            let (usage_page, usage_code) = button.usage();
+            let press = indigo_hid
+                .send_button(usage_page, usage_code, ButtonState::Down)
+                .await;
+            if let Err(error) = press {
+                warn!(%error, button = button.label(), "Failed to press hardware button");
+                continue;
+            }
+            tokio::time::sleep(button.hold()).await;
+            if let Err(error) = indigo_hid
+                .send_button(usage_page, usage_code, ButtonState::Up)
+                .await
+            {
+                warn!(%error, button = button.label(), "Failed to release hardware button");
+            } else {
+                info!(button = button.label(), "Sent hardware button");
+            }
+        }
+    });
 
     let clipboard_proxy = stream_proxy.clone();
     let mut clipboard_shutdown = shutdown_rx.clone();
@@ -594,6 +704,9 @@ async fn run_mirror() -> Result<()> {
                             || extended.wrapping_sub(audio_highest_sequence) < 0x8000_0000
                         {
                             audio_highest_sequence = extended;
+                        }
+                        if audio_muted_stream.load(Ordering::Relaxed) {
+                            continue;
                         }
                         let payload_type = packet.payload_type;
                         if let Some((_, au_dump)) = audio_dump.as_mut() {
@@ -733,7 +846,10 @@ async fn run_mirror() -> Result<()> {
         touch_active: false,
         last_touch_position: None,
         input_tx,
+        button_tx,
+        audio_muted,
         pressed_keys: BTreeSet::new(),
+        modifiers: winit::keyboard::ModifiersState::empty(),
         clipboard: SystemClipboard::new(),
         clipboard_tx,
         last_device_clipboard: None,

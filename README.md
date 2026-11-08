@@ -14,7 +14,8 @@ Experimental native iPhone screen mirroring client in Rust for **macOS 26 Tahoe*
 - Hardware-tested: bidirectional text clipboard sharing between macOS and iPhone.
 - Implemented: physical laptop keyboard forwarding (letters, numbers, punctuation, navigation, function keys, and modifiers).
 - Hardware-tested: iPhone system audio playback on the host Mac (AAC-ELD, 48 kHz stereo, via AudioToolbox/AudioQueue) with RTCP receiver reports keeping the audio session alive.
-- In progress: image/file clipboard payloads and hardware-button shortcuts.
+- Implemented: hardware-button shortcuts (Home, Lock, volume, mute) through the Indigo HID service.
+- In progress: image/file clipboard payloads and reconnect supervision.
 - Planned: reconnect, app-bundle polish, and performance hardening.
 - Performance and zero-copy behavior have not been benchmarked yet.
 
@@ -52,7 +53,17 @@ Plain-text clipboard contents synchronize automatically in both directions while
 
 Focus the mirror window and type while an editable field is active on the iPhone. Keyboard input uses physical USB HID usages, including Shift, Control, Option, and Command modifiers. The current implementation follows the physical key layout rather than macOS text composition, so IME/dead-key input is not supported yet.
 
-While a mirror session is active, the iPhone's system audio is decoded (AAC-ELD, 48 kHz stereo) and played through the host Mac's current output device. Audio starts automatically and is kept alive with RTCP receiver reports; there is no separate mute control yet. Set `IPHONE_MIRROR_AUDIO_DUMP=/some/directory` to write `au.bin` (length-prefixed access units) and `pcm.raw` for diagnostics.
+While a mirror session is active, the iPhone's system audio is decoded (AAC-ELD, 48 kHz stereo) and played through the host Mac's current output device. Audio starts automatically and is kept alive with RTCP receiver reports; press `Ctrl+M` to mute playback locally. Set `IPHONE_MIRROR_AUDIO_DUMP=/some/directory` to write `au.bin` (length-prefixed access units) and `pcm.raw` for diagnostics.
+
+Keyboard shortcuts (hold Control):
+
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl+H` | Home |
+| `Ctrl+L` | Lock / sleep |
+| `Ctrl+[` / `Ctrl+]` | Volume down / up |
+| `Ctrl+\` | Mute the iPhone |
+| `Ctrl+M` | Mute or unmute audio playback on the Mac (local only) |
 
 ---
 
