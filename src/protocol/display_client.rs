@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use idevice::{
     core_device::{
         build_screen_audio_offer, build_screen_video_offer, build_start_audio_parameters,
-        build_start_video_parameters, CallInfoBlob, DisplayServiceClient,
+        build_start_video_parameters, CallInfoBlob, DisplayServiceClient, MediaNegotiationBlob,
     },
     tcp::handle::UdpSocketHandle,
     ReadWrite, RsdService,
@@ -17,7 +17,7 @@ const SERVICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 pub struct DisplayClient {
     client: DisplayServiceClient<Box<dyn ReadWrite>>,
-    _audio_udp: UdpSocketHandle,
+    audio_udp: UdpSocketHandle,
     video_udp: UdpSocketHandle,
 }
 
@@ -60,10 +60,13 @@ impl DisplayClient {
             CLIENT_SUPPORTED_FEATURES,
             session_id,
         );
-        tokio::time::timeout(SERVICE_TIMEOUT, client.start_media_stream(audio_params))
-            .await
-            .context("Timed out starting the audio media stream")?
-            .context("Display service rejected the audio media stream")?;
+        let audio_answer =
+            tokio::time::timeout(SERVICE_TIMEOUT, client.start_media_stream(audio_params))
+                .await
+                .context("Timed out starting the audio media stream")?
+                .context("Display service rejected the audio media stream")?;
+        dump_answer("audio", &audio_answer);
+        log_audio_negotiation(&audio_answer);
 
         let video_call_id = Uuid::new_v4().to_string().to_uppercase();
         let controller_ssrc = Uuid::new_v4().as_u128() as u32;
@@ -80,14 +83,18 @@ impl DisplayClient {
             session_id,
         );
 
-        if let Err(error) =
-            tokio::time::timeout(SERVICE_TIMEOUT, client.start_media_stream(video_params))
+        let video_answer =
+            match tokio::time::timeout(SERVICE_TIMEOUT, client.start_media_stream(video_params))
                 .await
                 .context("Timed out starting the video media stream")?
-        {
-            let _ = client.stop_media_stream().await;
-            return Err(error).context("Display service rejected the video media stream");
-        }
+            {
+                Ok(answer) => answer,
+                Err(error) => {
+                    let _ = client.stop_media_stream().await;
+                    return Err(error).context("Display service rejected the video media stream");
+                }
+            };
+        dump_answer("video", &video_answer);
 
         info!(
             %session_id,
@@ -98,9 +105,18 @@ impl DisplayClient {
 
         Ok(Self {
             client,
-            _audio_udp: audio_udp,
+            audio_udp,
             video_udp,
         })
+    }
+
+    pub async fn recv_audio_packet(&self) -> Result<Vec<u8>> {
+        Ok(self
+            .audio_udp
+            .recv()
+            .await
+            .context("Tunneled audio receiver stopped")?
+            .data)
     }
 
     pub async fn recv_video_packet(&self) -> Result<Vec<u8>> {
@@ -118,6 +134,44 @@ impl DisplayClient {
             .await
             .context("Failed to stop the display media stream")?;
         Ok(())
+    }
+}
+
+fn dump_answer(kind: &str, answer: &plist::Value) {
+    let Ok(directory) = std::env::var("IPHONE_MIRROR_DUMP_NEGOTIATION") else {
+        return;
+    };
+    let path = std::path::Path::new(&directory).join(format!("{kind}-answer.plist"));
+    if let Ok(mut file) = std::fs::File::create(&path) {
+        let _ = plist::to_writer_xml(&mut file, answer);
+        info!(path = %path.display(), "Dumped media negotiation answer");
+    }
+}
+
+fn log_audio_negotiation(answer: &plist::Value) {
+    let Some(blob) = answer
+        .as_dictionary()
+        .and_then(|dict| dict.get("negotiatorAnswer"))
+        .and_then(plist::Value::as_data)
+    else {
+        return;
+    };
+    let compressed = plist::from_bytes::<plist::Value>(blob)
+        .ok()
+        .and_then(|value| {
+            value
+                .as_dictionary()?
+                .get("avcMediaStreamNegotiatorMediaBlob")?
+                .as_data()
+                .map(Vec::from)
+        });
+    let Some(compressed) = compressed else {
+        tracing::warn!("Audio negotiation answer did not contain a media blob");
+        return;
+    };
+    match MediaNegotiationBlob::from_negotiator_offer(&compressed) {
+        Ok(negotiation) => info!(?negotiation, "Parsed audio negotiation"),
+        Err(error) => tracing::warn!(%error, "Could not parse audio negotiation answer"),
     }
 }
 

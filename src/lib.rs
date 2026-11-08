@@ -1,4 +1,5 @@
 // language: Rust, file: src/lib.rs, target: macOS 14+/15+ (Hackintosh / Mac)
+pub mod audio;
 pub mod codec;
 pub mod input;
 pub mod media;

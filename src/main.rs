@@ -7,6 +7,7 @@ use idevice::{
     RsdService,
 };
 use iphone_mirror_rs::{
+    audio::{AacEldDecoder, AudioPlayer},
     codec::{decoder::HardwareDecoder, format_desc::FormatDescription},
     input::{clipboard::SystemClipboard, coordinate_mapper::CoordinateMapper},
     media::nal_parser::ParameterSetCache,
@@ -518,6 +519,9 @@ async fn run_mirror() -> Result<()> {
             let mut parameter_sets = ParameterSetCache::new();
             let mut decoder: Option<HardwareDecoder> = None;
             let mut nal_count = 0_u64;
+            let mut audio_packet_count = 0_u64;
+            let mut audio_decoder = AacEldDecoder::new()?;
+            let mut audio_player = AudioPlayer::new()?;
 
             loop {
                 tokio::select! {
@@ -548,6 +552,24 @@ async fn run_mirror() -> Result<()> {
                                 }
                             },
                             Err(error) => debug!(%error, "Dropped malformed media packet"),
+                        }
+                    }
+                    packet = client.recv_audio_packet() => {
+                        let packet = packet?;
+                        if RtpPacket::is_rtcp(&packet) {
+                            continue;
+                        }
+                        let packet = RtpPacket::parse(&packet)?;
+                        if packet.payload_type != 101 || packet.payload.is_empty() {
+                            continue;
+                        }
+                        audio_packet_count += 1;
+                        match audio_decoder.decode(&packet.payload) {
+                            Ok(pcm) => audio_player.play(&pcm)?,
+                            Err(error) => debug!(%error, "Dropped invalid AAC-ELD audio packet"),
+                        }
+                        if audio_packet_count % 500 == 0 {
+                            info!(audio_packet_count, "Playing iPhone system audio");
                         }
                     }
                     changed = shutdown_rx.changed() => {
