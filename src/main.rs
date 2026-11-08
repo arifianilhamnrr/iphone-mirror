@@ -17,6 +17,16 @@ async fn main() -> Result<()> {
     let devices = DeviceScanner::list_devices().await
         .context("Could not scan usbmuxd devices")?;
 
+    // Start background hotplug watcher
+    let (hotplug_tx, mut hotplug_rx) = mpsc::channel(16);
+    let _hotplug_task = iphone_mirror_rs::transport::hotplug::HotplugMonitor::start_monitor(hotplug_tx);
+
+    tokio::spawn(async move {
+        while let Some(event) = hotplug_rx.recv().await {
+            info!(?event, "Device hotplug state update");
+        }
+    });
+
     if devices.is_empty() {
         info!("No iPhone detected. Connect your iPhone via USB cable to continue.");
         return Ok(());
