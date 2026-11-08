@@ -1,9 +1,14 @@
 // language: Rust, file: src/main.rs, target: macOS (Hackintosh / Mac)
 use anyhow::{Context, Result};
-use idevice::{core_device::UniversalHidServiceClient, RsdService};
+use idevice::{
+    core_device::{
+        DataInclusionPolicy, PasteboardServiceClient, UniversalHidServiceClient, GENERAL_PASTEBOARD,
+    },
+    RsdService,
+};
 use iphone_mirror_rs::{
     codec::{decoder::HardwareDecoder, format_desc::FormatDescription},
-    input::coordinate_mapper::CoordinateMapper,
+    input::{clipboard::SystemClipboard, coordinate_mapper::CoordinateMapper},
     media::nal_parser::ParameterSetCache,
     media::{h265_depacketizer::H265Depacketizer, rtp::RtpPacket},
     protocol::display_client::DisplayClient,
@@ -22,6 +27,7 @@ enum Command {
 
 enum UiEvent {
     Frame(iphone_mirror_rs::codec::decoder::DecodedFrame),
+    ClipboardText(String),
     StreamError(String),
 }
 
@@ -42,10 +48,16 @@ struct MirrorApp {
     touch_active: bool,
     last_touch_position: Option<(u16, u16)>,
     touch_tx: tokio::sync::mpsc::UnboundedSender<TouchCommand>,
+    clipboard: SystemClipboard,
+    clipboard_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    last_device_clipboard: Option<String>,
 }
 
 impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+            std::time::Instant::now() + std::time::Duration::from_millis(250),
+        ));
         if self.window.is_some() {
             return;
         }
@@ -93,6 +105,16 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
             UiEvent::StreamError(error) => {
                 tracing::error!(error, "Display stream stopped");
                 event_loop.exit();
+            }
+            UiEvent::ClipboardText(text) => {
+                if self.clipboard.current_text().as_deref() != Some(text.as_str()) {
+                    if let Err(error) = self.clipboard.set_text(&text) {
+                        warn!(%error, "Failed to copy iPhone clipboard text to macOS");
+                    } else {
+                        info!(bytes = text.len(), "Copied iPhone clipboard text to macOS");
+                    }
+                }
+                self.last_device_clipboard = Some(text);
             }
         }
     }
@@ -157,6 +179,17 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
             }
             _ => {}
         }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        if let Some(text) = self.clipboard.changed_text() {
+            if self.last_device_clipboard.as_deref() != Some(text.as_str()) {
+                let _ = self.clipboard_tx.send(text);
+            }
+        }
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+            std::time::Instant::now() + std::time::Duration::from_millis(250),
+        ));
     }
 }
 
@@ -300,6 +333,22 @@ async fn run_mirror() -> Result<()> {
         UniversalHidServiceClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake)
             .await
             .context("Failed to connect to the universal HID service")?;
+    let mut clipboard_writer =
+        PasteboardServiceClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake)
+            .await
+            .context("Failed to connect to the pasteboard service")?;
+    let mut clipboard_watcher =
+        PasteboardServiceClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake)
+            .await
+            .context("Failed to open the pasteboard notification channel")?;
+    clipboard_watcher
+        .set_change_notifications(
+            true,
+            GENERAL_PASTEBOARD,
+            Some(DataInclusionPolicy::AllResolved),
+        )
+        .await
+        .context("Failed to subscribe to iPhone clipboard changes")?;
 
     let event_loop = winit::event_loop::EventLoop::<UiEvent>::with_user_event()
         .build()
@@ -309,6 +358,34 @@ async fn run_mirror() -> Result<()> {
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel(3);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let (touch_tx, mut touch_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (clipboard_tx, mut clipboard_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    let clipboard_proxy = stream_proxy.clone();
+    let mut clipboard_shutdown = shutdown_rx.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                snapshot = clipboard_watcher.recv_push() => match snapshot {
+                    Ok(snapshot) => {
+                        if let Some(text) = snapshot.text() {
+                            if clipboard_proxy.send_event(UiEvent::ClipboardText(text)).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        debug!(%error, "iPhone clipboard notification stream ended");
+                        break;
+                    }
+                },
+                changed = clipboard_shutdown.changed() => {
+                    if changed.is_err() || *clipboard_shutdown.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
 
     tokio::spawn(async move {
         while let Some(frame) = frame_rx.recv().await {
@@ -385,6 +462,13 @@ async fn run_mirror() -> Result<()> {
                             warn!(%error, ?command, "Failed to send touch event");
                         }
                     }
+                    Some(text) = clipboard_rx.recv() => {
+                        if let Err(error) = clipboard_writer.set_text(&text, GENERAL_PASTEBOARD).await {
+                            warn!(%error, "Failed to copy macOS clipboard text to iPhone");
+                        } else {
+                            info!(bytes = text.len(), "Copied macOS clipboard text to iPhone");
+                        }
+                    }
                 }
             }
             if let Err(error) = client.stop().await {
@@ -407,6 +491,9 @@ async fn run_mirror() -> Result<()> {
         touch_active: false,
         last_touch_position: None,
         touch_tx,
+        clipboard: SystemClipboard::new(),
+        clipboard_tx,
+        last_device_clipboard: None,
     };
     event_loop
         .run_app(&mut app)

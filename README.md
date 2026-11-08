@@ -3,7 +3,7 @@
 Experimental native iPhone screen mirroring client in Rust for **macOS 26 Tahoe** and **macOS 15 Sequoia**, with Intel Mac/Hackintosh support as a primary goal.
 
 > [!IMPORTANT]
-> This project is under active development. End-to-end display streaming and Metal rendering work on tested hardware. Mouse-to-touch forwarding is implemented and awaiting broader device validation; reconnect and release hardening are not complete yet.
+> This project is under active development. End-to-end display streaming, Metal rendering, touch forwarding, and text clipboard sync work on tested hardware. Reconnect and release hardening are not complete yet.
 
 ---
 
@@ -11,7 +11,8 @@ Experimental native iPhone screen mirroring client in Rust for **macOS 26 Tahoe*
 
 - Working and hardware-tested: usbmuxd discovery, CoreDeviceProxy/RSD, display-service negotiation, tunneled RTP, HEVC depacketization, VideoToolbox decoding, and Metal presentation.
 - Implemented: aspect-fit mouse mapping and CoreDevice touchscreen down/move/up forwarding.
-- In progress: broader HID validation and keyboard/hardware-button shortcuts.
+- Hardware-tested: bidirectional text clipboard sharing between macOS and iPhone.
+- In progress: image/file clipboard payloads and keyboard/hardware-button shortcuts.
 - Planned: reconnect, app-bundle polish, and performance hardening.
 - Performance and zero-copy behavior have not been benchmarked yet.
 
@@ -44,6 +45,8 @@ Set `IPHONE_MIRROR_LIST_SERVICES=1` to include the full RSD service catalog in d
 The default `mirror` command establishes the CoreDevice tunnel and display-service session, decodes HEVC with VideoToolbox, and displays it in a native Metal window.
 
 Click or drag inside the displayed phone image to send touchscreen input. Clicks in letterbox/pillarbox regions are ignored.
+
+Plain-text clipboard contents synchronize automatically in both directions while a mirror session is active. Image and file clipboard payloads are not synchronized yet.
 
 ---
 
