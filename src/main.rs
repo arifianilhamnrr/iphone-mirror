@@ -15,6 +15,7 @@ use iphone_mirror_rs::{
     transport::{device_scanner::DeviceScanner, rsd_tunnel::RsdTunnel},
     ui::metal_renderer::MetalRenderer,
 };
+use std::collections::BTreeSet;
 use std::env;
 use tracing::{debug, info, warn};
 
@@ -31,11 +32,12 @@ enum UiEvent {
     StreamError(String),
 }
 
-#[derive(Debug, Clone, Copy)]
-enum TouchCommand {
+#[derive(Debug, Clone)]
+enum InputCommand {
     Down(u16, u16),
     Move(u16, u16),
     Up(u16, u16),
+    SetKeys(Vec<u16>),
 }
 
 struct MirrorApp {
@@ -47,7 +49,8 @@ struct MirrorApp {
     cursor_position: Option<winit::dpi::PhysicalPosition<f64>>,
     touch_active: bool,
     last_touch_position: Option<(u16, u16)>,
-    touch_tx: tokio::sync::mpsc::UnboundedSender<TouchCommand>,
+    input_tx: tokio::sync::mpsc::UnboundedSender<InputCommand>,
+    pressed_keys: BTreeSet<u16>,
     clipboard: SystemClipboard,
     clipboard_tx: tokio::sync::mpsc::UnboundedSender<String>,
     last_device_clipboard: Option<String>,
@@ -140,7 +143,7 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                 if self.touch_active {
                     if let Some((x, y)) = self.touch_coordinates(position) {
                         self.last_touch_position = Some((x, y));
-                        let _ = self.touch_tx.send(TouchCommand::Move(x, y));
+                        let _ = self.input_tx.send(InputCommand::Move(x, y));
                     }
                 }
             }
@@ -154,7 +157,7 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                         if let Some((x, y)) = self.touch_coordinates(position) {
                             self.touch_active = true;
                             self.last_touch_position = Some((x, y));
-                            let _ = self.touch_tx.send(TouchCommand::Down(x, y));
+                            let _ = self.input_tx.send(InputCommand::Down(x, y));
                         }
                     }
                 }
@@ -166,7 +169,7 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                             .and_then(|position| self.touch_coordinates(position))
                             .or(self.last_touch_position.take());
                         if let Some((x, y)) = release {
-                            let _ = self.touch_tx.send(TouchCommand::Up(x, y));
+                            let _ = self.input_tx.send(InputCommand::Up(x, y));
                         }
                     }
                 }
@@ -174,8 +177,29 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
             winit::event::WindowEvent::CursorLeft { .. } if self.touch_active => {
                 self.touch_active = false;
                 if let Some((x, y)) = self.last_touch_position.take() {
-                    let _ = self.touch_tx.send(TouchCommand::Up(x, y));
+                    let _ = self.input_tx.send(InputCommand::Up(x, y));
                 }
+            }
+            winit::event::WindowEvent::KeyboardInput { event, .. } => {
+                if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
+                    if let Some(usage) = key_code_to_hid_usage(code) {
+                        let changed = match event.state {
+                            winit::event::ElementState::Pressed => self.pressed_keys.insert(usage),
+                            winit::event::ElementState::Released => {
+                                self.pressed_keys.remove(&usage)
+                            }
+                        };
+                        if changed {
+                            let _ = self.input_tx.send(InputCommand::SetKeys(
+                                self.pressed_keys.iter().copied().collect(),
+                            ));
+                        }
+                    }
+                }
+            }
+            winit::event::WindowEvent::Focused(false) if !self.pressed_keys.is_empty() => {
+                self.pressed_keys.clear();
+                let _ = self.input_tx.send(InputCommand::SetKeys(Vec::new()));
             }
             _ => {}
         }
@@ -191,6 +215,96 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
             std::time::Instant::now() + std::time::Duration::from_millis(250),
         ));
     }
+}
+
+fn key_code_to_hid_usage(code: winit::keyboard::KeyCode) -> Option<u16> {
+    use winit::keyboard::KeyCode;
+    Some(match code {
+        KeyCode::KeyA => 0x04,
+        KeyCode::KeyB => 0x05,
+        KeyCode::KeyC => 0x06,
+        KeyCode::KeyD => 0x07,
+        KeyCode::KeyE => 0x08,
+        KeyCode::KeyF => 0x09,
+        KeyCode::KeyG => 0x0A,
+        KeyCode::KeyH => 0x0B,
+        KeyCode::KeyI => 0x0C,
+        KeyCode::KeyJ => 0x0D,
+        KeyCode::KeyK => 0x0E,
+        KeyCode::KeyL => 0x0F,
+        KeyCode::KeyM => 0x10,
+        KeyCode::KeyN => 0x11,
+        KeyCode::KeyO => 0x12,
+        KeyCode::KeyP => 0x13,
+        KeyCode::KeyQ => 0x14,
+        KeyCode::KeyR => 0x15,
+        KeyCode::KeyS => 0x16,
+        KeyCode::KeyT => 0x17,
+        KeyCode::KeyU => 0x18,
+        KeyCode::KeyV => 0x19,
+        KeyCode::KeyW => 0x1A,
+        KeyCode::KeyX => 0x1B,
+        KeyCode::KeyY => 0x1C,
+        KeyCode::KeyZ => 0x1D,
+        KeyCode::Digit1 => 0x1E,
+        KeyCode::Digit2 => 0x1F,
+        KeyCode::Digit3 => 0x20,
+        KeyCode::Digit4 => 0x21,
+        KeyCode::Digit5 => 0x22,
+        KeyCode::Digit6 => 0x23,
+        KeyCode::Digit7 => 0x24,
+        KeyCode::Digit8 => 0x25,
+        KeyCode::Digit9 => 0x26,
+        KeyCode::Digit0 => 0x27,
+        KeyCode::Enter => 0x28,
+        KeyCode::Escape => 0x29,
+        KeyCode::Backspace => 0x2A,
+        KeyCode::Tab => 0x2B,
+        KeyCode::Space => 0x2C,
+        KeyCode::Minus => 0x2D,
+        KeyCode::Equal => 0x2E,
+        KeyCode::BracketLeft => 0x2F,
+        KeyCode::BracketRight => 0x30,
+        KeyCode::Backslash => 0x31,
+        KeyCode::Semicolon => 0x33,
+        KeyCode::Quote => 0x34,
+        KeyCode::Backquote => 0x35,
+        KeyCode::Comma => 0x36,
+        KeyCode::Period => 0x37,
+        KeyCode::Slash => 0x38,
+        KeyCode::CapsLock => 0x39,
+        KeyCode::F1 => 0x3A,
+        KeyCode::F2 => 0x3B,
+        KeyCode::F3 => 0x3C,
+        KeyCode::F4 => 0x3D,
+        KeyCode::F5 => 0x3E,
+        KeyCode::F6 => 0x3F,
+        KeyCode::F7 => 0x40,
+        KeyCode::F8 => 0x41,
+        KeyCode::F9 => 0x42,
+        KeyCode::F10 => 0x43,
+        KeyCode::F11 => 0x44,
+        KeyCode::F12 => 0x45,
+        KeyCode::Insert => 0x49,
+        KeyCode::Home => 0x4A,
+        KeyCode::PageUp => 0x4B,
+        KeyCode::Delete => 0x4C,
+        KeyCode::End => 0x4D,
+        KeyCode::PageDown => 0x4E,
+        KeyCode::ArrowRight => 0x4F,
+        KeyCode::ArrowLeft => 0x50,
+        KeyCode::ArrowDown => 0x51,
+        KeyCode::ArrowUp => 0x52,
+        KeyCode::ControlLeft => 0xE0,
+        KeyCode::ShiftLeft => 0xE1,
+        KeyCode::AltLeft => 0xE2,
+        KeyCode::SuperLeft => 0xE3,
+        KeyCode::ControlRight => 0xE4,
+        KeyCode::ShiftRight => 0xE5,
+        KeyCode::AltRight => 0xE6,
+        KeyCode::SuperRight => 0xE7,
+        _ => return None,
+    })
 }
 
 impl MirrorApp {
@@ -333,6 +447,9 @@ async fn run_mirror() -> Result<()> {
         UniversalHidServiceClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake)
             .await
             .context("Failed to connect to the universal HID service")?;
+    let mut keyboard = hid.create_main_keyboard().await.map_err(|error| {
+        anyhow::anyhow!("Failed to create the iPhone keyboard surface: {error}")
+    })?;
     let mut clipboard_writer =
         PasteboardServiceClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake)
             .await
@@ -357,7 +474,7 @@ async fn run_mirror() -> Result<()> {
     let stream_proxy = proxy.clone();
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel(3);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    let (touch_tx, mut touch_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
     let (clipboard_tx, mut clipboard_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     let clipboard_proxy = stream_proxy.clone();
@@ -438,10 +555,16 @@ async fn run_mirror() -> Result<()> {
                             break;
                         }
                     }
-                    Some(command) = touch_rx.recv() => {
-                        debug!(?command, "Sending HID touch event");
+                    Some(command) = input_rx.recv() => {
+                        debug!(?command, "Sending HID input event");
+                        let command_kind = match &command {
+                            InputCommand::Down(..) => "touch-down",
+                            InputCommand::Move(..) => "touch-move",
+                            InputCommand::Up(..) => "touch-up",
+                            InputCommand::SetKeys(..) => "keyboard",
+                        };
                         let result = match command {
-                            TouchCommand::Down(x, y) | TouchCommand::Move(x, y) => {
+                            InputCommand::Down(x, y) | InputCommand::Move(x, y) => {
                                 hid.send_touchscreen(
                                     idevice::core_device::TOUCHSCREEN_STATE_CONTACT,
                                     x,
@@ -449,7 +572,7 @@ async fn run_mirror() -> Result<()> {
                                     None,
                                 ).await
                             }
-                            TouchCommand::Up(x, y) => {
+                            InputCommand::Up(x, y) => {
                                 hid.send_touchscreen(
                                     idevice::core_device::TOUCHSCREEN_STATE_RELEASE,
                                     x,
@@ -457,9 +580,18 @@ async fn run_mirror() -> Result<()> {
                                     None,
                                 ).await
                             }
+                            InputCommand::SetKeys(usages) => {
+                                let usages = usages.into_iter()
+                                    .map(idevice::core_device::KeyboardUsage::new)
+                                    .collect::<std::result::Result<Vec<_>, _>>()
+                                    .map_err(|error| idevice::IdeviceError::UnexpectedResponse(error.to_string()))?;
+                                hid.set_main_keyboard_usages(&mut keyboard, usages)
+                                    .await
+                                    .map_err(|error| idevice::IdeviceError::UnexpectedResponse(error.to_string()))
+                            }
                         };
                         if let Err(error) = result {
-                            warn!(%error, ?command, "Failed to send touch event");
+                            warn!(%error, command_kind, "Failed to send HID input event");
                         }
                     }
                     Some(text) = clipboard_rx.recv() => {
@@ -470,6 +602,9 @@ async fn run_mirror() -> Result<()> {
                         }
                     }
                 }
+            }
+            if let Err(error) = hid.remove_main_keyboard(&mut keyboard).await {
+                warn!(%error, "Failed to remove the virtual keyboard service");
             }
             if let Err(error) = client.stop().await {
                 warn!(%error, "Display stream shutdown was not acknowledged");
@@ -490,7 +625,8 @@ async fn run_mirror() -> Result<()> {
         cursor_position: None,
         touch_active: false,
         last_touch_position: None,
-        touch_tx,
+        input_tx,
+        pressed_keys: BTreeSet::new(),
         clipboard: SystemClipboard::new(),
         clipboard_tx,
         last_device_clipboard: None,
