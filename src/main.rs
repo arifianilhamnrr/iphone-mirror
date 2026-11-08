@@ -47,6 +47,9 @@ enum InputCommand {
     Down(u16, u16),
     Move(u16, u16),
     Up(u16, u16),
+    ScrollStart(u16, u16),
+    ScrollMove(i32, i32),
+    ScrollEnd,
     SetKeys(Vec<u16>),
 }
 
@@ -99,6 +102,8 @@ struct MirrorApp {
     frame_size: Option<(usize, usize)>,
     cursor_position: Option<winit::dpi::PhysicalPosition<f64>>,
     touch_active: bool,
+    scroll_active: bool,
+    scroll_deadline: Option<std::time::Instant>,
     last_touch_position: Option<(u16, u16)>,
     input_tx: tokio::sync::mpsc::UnboundedSender<InputCommand>,
     button_tx: tokio::sync::mpsc::UnboundedSender<HardwareButton>,
@@ -259,10 +264,69 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                     }
                 }
             },
-            winit::event::WindowEvent::CursorLeft { .. } if self.touch_active => {
-                self.touch_active = false;
-                if let Some((x, y)) = self.last_touch_position.take() {
-                    let _ = self.input_tx.send(InputCommand::Up(x, y));
+            winit::event::WindowEvent::CursorLeft { .. } => {
+                if self.touch_active {
+                    self.touch_active = false;
+                    if let Some((x, y)) = self.last_touch_position.take() {
+                        let _ = self.input_tx.send(InputCommand::Up(x, y));
+                    }
+                }
+                if self.scroll_active {
+                    self.scroll_active = false;
+                    self.scroll_deadline = None;
+                    let _ = self.input_tx.send(InputCommand::ScrollEnd);
+                }
+            }
+            winit::event::WindowEvent::MouseWheel { delta, phase, .. } => {
+                let (x, y) = match delta {
+                    // Trackpads report physical pixels. Keep the sign that macOS
+                    // supplies so natural-scrolling follows the system setting.
+                    winit::event::MouseScrollDelta::PixelDelta(delta) => (delta.x, delta.y),
+                    // Wheel mice report abstract lines; 24 points per line gives
+                    // a useful iOS scroll distance without large jumps.
+                    winit::event::MouseScrollDelta::LineDelta(x, y) => {
+                        (x as f64 * 24.0, y as f64 * 24.0)
+                    }
+                };
+                if phase == winit::event::TouchPhase::Started || !self.scroll_active {
+                    let anchor = self
+                        .cursor_position
+                        .and_then(|position| self.touch_coordinates(position))
+                        .unwrap_or((u16::MAX / 2, u16::MAX / 2));
+                    self.scroll_active = true;
+                    let _ = self
+                        .input_tx
+                        .send(InputCommand::ScrollStart(anchor.0, anchor.1));
+                }
+                if x != 0.0 || y != 0.0 {
+                    // Scale trackpad pixels into the 0...65535 touchscreen
+                    // coordinate domain. Positive wheel motion is positive
+                    // finger motion, preserving the macOS natural-scroll setting.
+                    let scale = self
+                        .window
+                        .as_ref()
+                        .map(|window| {
+                            let size = window.inner_size();
+                            (
+                                u16::MAX as f64 / size.width.max(1) as f64,
+                                u16::MAX as f64 / size.height.max(1) as f64,
+                            )
+                        })
+                        .unwrap_or((100.0, 100.0));
+                    let _ = self.input_tx.send(InputCommand::ScrollMove(
+                        (x * scale.0).round() as i32,
+                        (y * scale.1).round() as i32,
+                    ));
+                    self.scroll_deadline =
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(120));
+                }
+                if matches!(
+                    phase,
+                    winit::event::TouchPhase::Ended | winit::event::TouchPhase::Cancelled
+                ) {
+                    self.scroll_active = false;
+                    self.scroll_deadline = None;
+                    let _ = self.input_tx.send(InputCommand::ScrollEnd);
                 }
             }
             winit::event::WindowEvent::ModifiersChanged(modifiers) => {
@@ -344,15 +408,28 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                     }
                 }
             }
-            winit::event::WindowEvent::Focused(false) if !self.pressed_keys.is_empty() => {
-                self.pressed_keys.clear();
-                let _ = self.input_tx.send(InputCommand::SetKeys(Vec::new()));
+            winit::event::WindowEvent::Focused(false) => {
+                if !self.pressed_keys.is_empty() {
+                    self.pressed_keys.clear();
+                    let _ = self.input_tx.send(InputCommand::SetKeys(Vec::new()));
+                }
+                if self.scroll_active {
+                    self.scroll_active = false;
+                    self.scroll_deadline = None;
+                    let _ = self.input_tx.send(InputCommand::ScrollEnd);
+                }
             }
             _ => {}
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        let now = std::time::Instant::now();
+        if self.scroll_active && self.scroll_deadline.is_some_and(|deadline| now >= deadline) {
+            self.scroll_active = false;
+            self.scroll_deadline = None;
+            let _ = self.input_tx.send(InputCommand::ScrollEnd);
+        }
         if let Some(content) = self.clipboard.changed_content() {
             let is_device_text = matches!(
                 &content,
@@ -363,8 +440,11 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                 let _ = self.clipboard_tx.send(content);
             }
         }
+        let clipboard_deadline = now + std::time::Duration::from_millis(250);
         event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
-            std::time::Instant::now() + std::time::Duration::from_millis(250),
+            self.scroll_deadline.map_or(clipboard_deadline, |deadline| {
+                deadline.min(clipboard_deadline)
+            }),
         ));
     }
 }
@@ -490,6 +570,13 @@ fn default_screenshot_path() -> Result<std::path::PathBuf> {
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis();
     Ok(directory.join(format!("iphone-mirror-{millis}.png")))
+}
+
+fn offset_touch_position(position: (u16, u16), delta: (i32, i32)) -> (u16, u16) {
+    (
+        (position.0 as i32 + delta.0).clamp(0, u16::MAX as i32) as u16,
+        (position.1 as i32 + delta.1).clamp(0, u16::MAX as i32) as u16,
+    )
 }
 
 fn parse_command() -> Result<Command> {
@@ -792,6 +879,7 @@ async fn run_mirror() -> Result<()> {
                     std::fs::File::create(directory.join("au.bin")).expect("create AU dump"),
                 )
             });
+            let mut scroll_position: Option<(u16, u16)> = None;
 
             loop {
                 tokio::select! {
@@ -850,9 +938,6 @@ async fn run_mirror() -> Result<()> {
                         {
                             audio_highest_sequence = extended;
                         }
-                        if audio_muted_stream.load(Ordering::Relaxed) {
-                            continue;
-                        }
                         let payload_type = packet.payload_type;
                         if let Some((_, au_dump)) = audio_dump.as_mut() {
                             let _ = au_dump.write_all(&(packet.payload.len() as u32).to_le_bytes());
@@ -877,11 +962,18 @@ async fn run_mirror() -> Result<()> {
                                 // exactly 10 ms. Pace playback and cap queued latency at 120 ms;
                                 // dropping the oldest packet catches up instead of accumulating
                                 // seconds of stale audio.
-                                if audio_jitter.len() == 12 {
-                                    audio_jitter.pop_front();
-                                    audio_jitter_drops += 1;
+                                if audio_muted_stream.load(Ordering::Relaxed) {
+                                    // Keep feeding every compressed AU to the stateful AAC-ELD
+                                    // converter. Only discard decoded PCM, otherwise unmute
+                                    // resumes from a stale converter state and can stay silent.
+                                    audio_jitter.clear();
+                                } else {
+                                    if audio_jitter.len() == 12 {
+                                        audio_jitter.pop_front();
+                                        audio_jitter_drops += 1;
+                                    }
+                                    audio_jitter.push_back(pcm);
                                 }
-                                audio_jitter.push_back(pcm);
                             }
                             Err(error) => {
                                 audio_decode_errors += 1;
@@ -941,6 +1033,9 @@ async fn run_mirror() -> Result<()> {
                             InputCommand::Down(..) => "touch-down",
                             InputCommand::Move(..) => "touch-move",
                             InputCommand::Up(..) => "touch-up",
+                            InputCommand::ScrollStart(..) => "scroll-start",
+                            InputCommand::ScrollMove(..) => "scroll-move",
+                            InputCommand::ScrollEnd => "scroll-end",
                             InputCommand::SetKeys(..) => "keyboard",
                         };
                         let result = match command {
@@ -959,6 +1054,41 @@ async fn run_mirror() -> Result<()> {
                                     y,
                                     None,
                                 ).await
+                            }
+                            InputCommand::ScrollStart(x, y) => {
+                                scroll_position = Some((x, y));
+                                hid.send_touchscreen(
+                                    idevice::core_device::TOUCHSCREEN_STATE_CONTACT,
+                                    x,
+                                    y,
+                                    None,
+                                ).await
+                            }
+                            InputCommand::ScrollMove(dx, dy) => {
+                                if let Some((x, y)) = scroll_position {
+                                    let (x, y) = offset_touch_position((x, y), (dx, dy));
+                                    scroll_position = Some((x, y));
+                                    hid.send_touchscreen(
+                                        idevice::core_device::TOUCHSCREEN_STATE_CONTACT,
+                                        x,
+                                        y,
+                                        None,
+                                    ).await
+                                } else {
+                                    Ok(())
+                                }
+                            }
+                            InputCommand::ScrollEnd => {
+                                if let Some((x, y)) = scroll_position.take() {
+                                    hid.send_touchscreen(
+                                        idevice::core_device::TOUCHSCREEN_STATE_RELEASE,
+                                        x,
+                                        y,
+                                        None,
+                                    ).await
+                                } else {
+                                    Ok(())
+                                }
                             }
                             InputCommand::SetKeys(usages) => {
                                 let usages = usages.into_iter()
@@ -1015,6 +1145,8 @@ async fn run_mirror() -> Result<()> {
         frame_size: None,
         cursor_position: None,
         touch_active: false,
+        scroll_active: false,
+        scroll_deadline: None,
         last_touch_position: None,
         input_tx,
         button_tx,
@@ -1036,4 +1168,22 @@ async fn run_mirror() -> Result<()> {
         anyhow::bail!("Mirror session failed: {error}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::offset_touch_position;
+
+    #[test]
+    fn scroll_position_moves_and_clamps_to_touchscreen_bounds() {
+        assert_eq!(
+            offset_touch_position((30_000, 40_000), (1_500, -2_000)),
+            (31_500, 38_000)
+        );
+        assert_eq!(offset_touch_position((100, 100), (-1_000, -1_000)), (0, 0));
+        assert_eq!(
+            offset_touch_position((65_000, 65_000), (10_000, 10_000)),
+            (u16::MAX, u16::MAX)
+        );
+    }
 }
