@@ -24,7 +24,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 plist = "1.6"
 
-# macOS Native Frameworks (macOS 14 Sonoma / 15 Sequoia / 16 Tahoe)
+# macOS Native Frameworks (macOS 15 Sequoia / macOS 26 Tahoe)
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
 objc2-foundation = "0.2"
