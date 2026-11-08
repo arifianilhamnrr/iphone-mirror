@@ -10,7 +10,10 @@ use idevice::{
 use iphone_mirror_rs::{
     audio::{AacEldDecoder, AudioPlayer},
     codec::{decoder::HardwareDecoder, format_desc::FormatDescription, screenshot::save_frame_png},
-    input::{clipboard::SystemClipboard, coordinate_mapper::CoordinateMapper},
+    input::{
+        clipboard::{ClipboardContent, SystemClipboard, MAX_CLIPBOARD_IMAGE_BYTES},
+        coordinate_mapper::CoordinateMapper,
+    },
     media::nal_parser::ParameterSetCache,
     media::{h265_depacketizer::H265Depacketizer, rtp::RtpPacket},
     protocol::display_client::DisplayClient,
@@ -35,7 +38,7 @@ enum Command {
 
 enum UiEvent {
     Frame(iphone_mirror_rs::codec::decoder::DecodedFrame),
-    ClipboardText(String),
+    Clipboard(ClipboardContent),
     StreamError(String),
 }
 
@@ -106,7 +109,7 @@ struct MirrorApp {
     pressed_keys: BTreeSet<u16>,
     modifiers: winit::keyboard::ModifiersState,
     clipboard: SystemClipboard,
-    clipboard_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    clipboard_tx: tokio::sync::mpsc::UnboundedSender<ClipboardContent>,
     last_device_clipboard: Option<String>,
     stream_error: Option<String>,
 }
@@ -176,16 +179,31 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                 self.stream_error = Some(error);
                 event_loop.exit();
             }
-            UiEvent::ClipboardText(text) => {
-                if self.clipboard.current_text().as_deref() != Some(text.as_str()) {
-                    if let Err(error) = self.clipboard.set_text(&text) {
-                        warn!(%error, "Failed to copy iPhone clipboard text to macOS");
-                    } else {
-                        info!(bytes = text.len(), "Copied iPhone clipboard text to macOS");
+            UiEvent::Clipboard(content) => match content {
+                ClipboardContent::Text(text) => {
+                    if self.clipboard.current_text().as_deref() != Some(text.as_str()) {
+                        if let Err(error) = self.clipboard.set_text(&text) {
+                            warn!(%error, "Failed to copy iPhone clipboard text to macOS");
+                        } else {
+                            info!(bytes = text.len(), "Copied iPhone clipboard text to macOS");
+                        }
                     }
+                    self.last_device_clipboard = Some(text);
                 }
-                self.last_device_clipboard = Some(text);
-            }
+                ClipboardContent::Image { uti, bytes } => {
+                    if bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+                        warn!(
+                            bytes = bytes.len(),
+                            "Ignoring oversized iPhone clipboard image"
+                        );
+                    } else if let Err(error) = self.clipboard.set_image(&uti, &bytes) {
+                        warn!(%error, "Failed to copy iPhone clipboard image to macOS");
+                    } else {
+                        info!(%uti, bytes = bytes.len(), "Copied iPhone clipboard image to macOS");
+                    }
+                    self.last_device_clipboard = None;
+                }
+            },
         }
     }
 
@@ -335,9 +353,14 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        if let Some(text) = self.clipboard.changed_text() {
-            if self.last_device_clipboard.as_deref() != Some(text.as_str()) {
-                let _ = self.clipboard_tx.send(text);
+        if let Some(content) = self.clipboard.changed_content() {
+            let is_device_text = matches!(
+                &content,
+                ClipboardContent::Text(text)
+                    if self.last_device_clipboard.as_deref() == Some(text.as_str())
+            );
+            if !is_device_text {
+                let _ = self.clipboard_tx.send(content);
             }
         }
         event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
@@ -672,7 +695,8 @@ async fn run_mirror() -> Result<()> {
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
     let (button_tx, mut button_rx) = tokio::sync::mpsc::unbounded_channel::<HardwareButton>();
-    let (clipboard_tx, mut clipboard_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (clipboard_tx, mut clipboard_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ClipboardContent>();
     let audio_muted = Arc::new(AtomicBool::new(false));
     let audio_muted_stream = audio_muted.clone();
 
@@ -705,8 +729,16 @@ async fn run_mirror() -> Result<()> {
             tokio::select! {
                 snapshot = clipboard_watcher.recv_push() => match snapshot {
                     Ok(snapshot) => {
-                        if let Some(text) = snapshot.text() {
-                            if clipboard_proxy.send_event(UiEvent::ClipboardText(text)).is_err() {
+                        let content = snapshot
+                            .image()
+                            .filter(|(_, bytes)| bytes.len() <= MAX_CLIPBOARD_IMAGE_BYTES)
+                            .map(|(uti, bytes)| ClipboardContent::Image {
+                                uti: uti.to_string(),
+                                bytes,
+                            })
+                            .or_else(|| snapshot.text().map(ClipboardContent::Text));
+                        if let Some(content) = content {
+                            if clipboard_proxy.send_event(UiEvent::Clipboard(content)).is_err() {
                                 break;
                             }
                         }
@@ -923,11 +955,22 @@ async fn run_mirror() -> Result<()> {
                             warn!(%error, command_kind, "Failed to send HID input event");
                         }
                     }
-                    Some(text) = clipboard_rx.recv() => {
-                        if let Err(error) = clipboard_writer.set_text(&text, GENERAL_PASTEBOARD).await {
-                            warn!(%error, "Failed to copy macOS clipboard text to iPhone");
-                        } else {
-                            info!(bytes = text.len(), "Copied macOS clipboard text to iPhone");
+                    Some(content) = clipboard_rx.recv() => {
+                        match content {
+                            ClipboardContent::Text(text) => {
+                                if let Err(error) = clipboard_writer.set_text(&text, GENERAL_PASTEBOARD).await {
+                                    warn!(%error, "Failed to copy macOS clipboard text to iPhone");
+                                } else {
+                                    info!(bytes = text.len(), "Copied macOS clipboard text to iPhone");
+                                }
+                            }
+                            ClipboardContent::Image { uti, bytes } => {
+                                if let Err(error) = clipboard_writer.set_image(&bytes, &uti, GENERAL_PASTEBOARD).await {
+                                    warn!(%error, %uti, "Failed to copy macOS clipboard image to iPhone");
+                                } else {
+                                    info!(%uti, bytes = bytes.len(), "Copied macOS clipboard image to iPhone");
+                                }
+                            }
                         }
                     }
                 }

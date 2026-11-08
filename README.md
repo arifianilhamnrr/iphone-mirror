@@ -11,13 +11,13 @@ Experimental native iPhone screen mirroring client in Rust for **macOS 26 Tahoe*
 
 - Working and hardware-tested: usbmuxd discovery, CoreDeviceProxy/RSD, display-service negotiation, tunneled RTP, HEVC depacketization, VideoToolbox decoding, and Metal presentation.
 - Implemented: aspect-fit mouse mapping and CoreDevice touchscreen down/move/up forwarding.
-- Hardware-tested: bidirectional text clipboard sharing between macOS and iPhone.
+- Hardware-tested: bidirectional text and image clipboard sharing between macOS and iPhone.
 - Implemented: physical laptop keyboard forwarding (letters, numbers, punctuation, navigation, function keys, and modifiers).
 - Hardware-tested: iPhone system audio playback on the host Mac (AAC-ELD, 48 kHz stereo, via AudioToolbox/AudioQueue) with RTCP receiver reports keeping the audio session alive.
 - Implemented: hardware-button shortcuts (Home, Lock, volume, mute) through the Indigo HID service.
 - Hardware-tested: full-resolution PNG screenshots, fullscreen, and always-on-top window controls.
 - Implemented: automatic session restart after a stream/tunnel failure; each retry recreates CoreDevice, VideoToolbox, AudioToolbox, HID, and clipboard state cleanly.
-- In progress: image/file clipboard payloads.
+- In progress: file clipboard payloads and drag-and-drop transfer.
 - Planned: app-bundle polish and performance hardening.
 - Performance and zero-copy behavior have not been benchmarked yet.
 
@@ -53,7 +53,7 @@ If the cable, tunnel, or display session drops, the supervisor waits two seconds
 
 Click or drag inside the displayed phone image to send touchscreen input. Clicks in letterbox/pillarbox regions are ignored.
 
-Plain-text clipboard contents synchronize automatically in both directions while a mirror session is active. Image and file clipboard payloads are not synchronized yet.
+Text and image clipboard contents synchronize automatically in both directions while a mirror session is active. PNG and TIFF are accepted from macOS; PNG, JPEG, and TIFF snapshots are accepted from iPhone. Images larger than 20 MiB are ignored to keep memory and tunnel usage bounded. File clipboard payloads are not synchronized yet.
 
 Focus the mirror window and type while an editable field is active on the iPhone. Keyboard input uses physical USB HID usages, including Shift, Control, Option, and Command modifiers. The current implementation follows the physical key layout rather than macOS text composition, so IME/dead-key input is not supported yet.
 
