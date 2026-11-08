@@ -14,7 +14,24 @@ pub type CMVideoFormatDescriptionRef = *mut OpaqueCMFormatDescription;
 pub struct __CVBuffer(c_void);
 pub type CVPixelBufferRef = *mut __CVBuffer;
 
+#[repr(C)]
+pub struct OpaqueCVMetalTextureCache(c_void);
+pub type CVMetalTextureCacheRef = *mut OpaqueCVMetalTextureCache;
+
+#[repr(C)]
+pub struct OpaqueCVMetalTexture(c_void);
+pub type CVMetalTextureRef = *mut OpaqueCVMetalTexture;
+
 pub type OSStatus = i32;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CMTime {
+    pub value: i64,
+    pub timescale: i32,
+    pub flags: u32,
+    pub epoch: i64,
+}
 
 pub type VTDecompressionOutputCallback = extern "C" fn(
     decompression_output_ref_con: *mut c_void,
@@ -22,8 +39,8 @@ pub type VTDecompressionOutputCallback = extern "C" fn(
     status: OSStatus,
     info_flags: u32,
     image_buffer: CVPixelBufferRef,
-    presentation_time_stamp: u64,
-    presentation_duration: u64,
+    presentation_time_stamp: CMTime,
+    presentation_duration: CMTime,
 );
 
 #[repr(C)]
@@ -42,8 +59,17 @@ pub type CMSampleBufferRef = *mut OpaqueCMSampleBuffer;
 
 #[cfg(target_os = "macos")]
 #[link(name = "VideoToolbox", kind = "framework")]
+extern "C" {}
+
+#[cfg(target_os = "macos")]
 #[link(name = "CoreMedia", kind = "framework")]
+extern "C" {}
+
+#[cfg(target_os = "macos")]
 #[link(name = "CoreVideo", kind = "framework")]
+extern "C" {}
+
+#[cfg(target_os = "macos")]
 extern "C" {
     pub fn CMBlockBufferCreateWithMemoryBlock(
         structure_allocator: *mut c_void,
@@ -55,6 +81,13 @@ extern "C" {
         data_length: usize,
         flags: u32,
         block_buffer_out: *mut CMBlockBufferRef,
+    ) -> OSStatus;
+
+    pub fn CMBlockBufferReplaceDataBytes(
+        source_bytes: *const c_void,
+        destination_buffer: CMBlockBufferRef,
+        offset_into_destination: usize,
+        data_length: usize,
     ) -> OSStatus;
 
     pub fn CMSampleBufferCreateReady(
@@ -97,4 +130,43 @@ extern "C" {
     ) -> OSStatus;
 
     pub fn VTDecompressionSessionInvalidate(session: VTDecompressionSessionRef);
+    pub fn VTDecompressionSessionWaitForAsynchronousFrames(
+        session: VTDecompressionSessionRef,
+    ) -> OSStatus;
+
+    pub fn CVPixelBufferRetain(pixel_buffer: CVPixelBufferRef) -> CVPixelBufferRef;
+    pub fn CVPixelBufferRelease(pixel_buffer: CVPixelBufferRef);
+    pub fn CVPixelBufferGetWidth(pixel_buffer: CVPixelBufferRef) -> usize;
+    pub fn CVPixelBufferGetHeight(pixel_buffer: CVPixelBufferRef) -> usize;
+    pub fn CVPixelBufferGetPlaneCount(pixel_buffer: CVPixelBufferRef) -> usize;
+    pub fn CVPixelBufferGetWidthOfPlane(
+        pixel_buffer: CVPixelBufferRef,
+        plane_index: usize,
+    ) -> usize;
+    pub fn CVPixelBufferGetHeightOfPlane(
+        pixel_buffer: CVPixelBufferRef,
+        plane_index: usize,
+    ) -> usize;
+
+    pub fn CVMetalTextureCacheCreate(
+        allocator: *const c_void,
+        cache_attributes: *const c_void,
+        metal_device: *mut c_void,
+        texture_attributes: *const c_void,
+        cache_out: *mut CVMetalTextureCacheRef,
+    ) -> i32;
+    pub fn CVMetalTextureCacheCreateTextureFromImage(
+        allocator: *const c_void,
+        texture_cache: CVMetalTextureCacheRef,
+        source_image: CVPixelBufferRef,
+        texture_attributes: *const c_void,
+        pixel_format: u64,
+        width: usize,
+        height: usize,
+        plane_index: usize,
+        texture_out: *mut CVMetalTextureRef,
+    ) -> i32;
+    pub fn CVMetalTextureGetTexture(texture: CVMetalTextureRef) -> *mut c_void;
+
+    pub fn CFRelease(cf: *const c_void);
 }

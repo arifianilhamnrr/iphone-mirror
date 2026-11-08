@@ -1,18 +1,25 @@
-# iphone-mirror-rs 📱⚡
+# iphone-mirror-rs
 
-Native, zero-copy, 60fps iPhone screen mirroring & HID touch control in pure Rust for **macOS 26 Tahoe** & **macOS 15 Sequoia** (specifically designed for **Intel / AMD Hackintosh** where native Apple Silicon / T2 iPhone Mirroring is locked out).
+Experimental native iPhone screen mirroring client in Rust for **macOS 26 Tahoe** and **macOS 15 Sequoia**, with Intel Mac/Hackintosh support as a primary goal.
 
----
-
-## 🚀 Key Advantages over Windows Python Implementations
-- **Zero-Copy Native Pipeline**: H.265 NAL units stream directly into macOS `VideoToolbox` hardware decompression (`VTDecompressionSession`), outputting directly to `CAMetalLayer` / `CVMetalTextureCache` via Metal 3.
-- **Tiny Footprint**: Native Rust binary (~15–25 MB RAM, < 1.5% CPU steady state) vs Python + Edge WebView2 (~88 MB RAM).
-- **No T2 / Apple Silicon Lock**: Interacts directly with Xcode's official `com.apple.coredevice.displayservice` over `/var/run/usbmuxd`.
-- **macOS 26 Tahoe Compatibility**: Pure C-ABI FFI to `CoreMedia`, `CoreVideo`, and `VideoToolbox` avoids internal API breakage across major macOS version bumps.
+> [!IMPORTANT]
+> This project is under active development. End-to-end display streaming and Metal rendering work on tested hardware. Mouse-to-touch forwarding is implemented and awaiting broader device validation; reconnect and release hardening are not complete yet.
 
 ---
 
-## 🛠️ Build & Run on macOS (Hackintosh / Mac)
+## Current status
+
+- Working and hardware-tested: usbmuxd discovery, CoreDeviceProxy/RSD, display-service negotiation, tunneled RTP, HEVC depacketization, VideoToolbox decoding, and Metal presentation.
+- Implemented: aspect-fit mouse mapping and CoreDevice touchscreen down/move/up forwarding.
+- In progress: broader HID validation and keyboard/hardware-button shortcuts.
+- Planned: reconnect, app-bundle polish, and performance hardening.
+- Performance and zero-copy behavior have not been benchmarked yet.
+
+---
+
+## Build and diagnostics
+
+Requirements: Xcode command-line tools and Rust 1.85 or newer.
 
 ```bash
 # 1. Clone repository
@@ -22,13 +29,25 @@ cd iphone-mirror-rs
 # 2. Build in release mode
 cargo build --release
 
-# 3. Connect iPhone via USB cable & execute
-./target/release/iphone-mirror
+# 3. Connect and trust an iPhone, then list devices
+./target/release/iphone-mirror devices
+
+# 4. Verify CoreDevice/RSD and display-service availability
+./target/release/iphone-mirror diagnose
+
+# Select a device when multiple iPhones are connected
+./target/release/iphone-mirror diagnose --udid <UDID>
 ```
+
+Set `IPHONE_MIRROR_LIST_SERVICES=1` to include the full RSD service catalog in diagnostic output. Use `RUST_LOG=debug` for detailed logs.
+
+The default `mirror` command establishes the CoreDevice tunnel and display-service session, decodes HEVC with VideoToolbox, and displays it in a native Metal window.
+
+Click or drag inside the displayed phone image to send touchscreen input. Clicks in letterbox/pillarbox regions are ignored.
 
 ---
 
-## 📁 Architecture Structure
+## Architecture
 
 ```
 src/

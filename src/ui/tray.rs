@@ -24,3 +24,9 @@ impl TrayManager {
         }
     }
 }
+
+impl Default for TrayManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}

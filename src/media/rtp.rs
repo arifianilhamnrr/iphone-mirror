@@ -15,9 +15,16 @@ pub struct RtpPacket {
 }
 
 impl RtpPacket {
+    pub fn is_rtcp(data: &[u8]) -> bool {
+        data.len() >= 2 && (200..=206).contains(&data[1])
+    }
+
     pub fn parse(data: &[u8]) -> Result<Self> {
         if data.len() < 12 {
-            bail!("RTP packet too small: {} bytes (minimum 12 bytes)", data.len());
+            bail!(
+                "RTP packet too small: {} bytes (minimum 12 bytes)",
+                data.len()
+            );
         }
 
         let b0 = data[0];
@@ -55,11 +62,15 @@ impl RtpPacket {
         }
 
         let mut end = data.len();
-        if padding && end > offset {
-            let pad_len = data[end - 1] as usize;
-            if pad_len > 0 && pad_len <= (end - offset) {
-                end -= pad_len;
+        if padding {
+            if end <= offset {
+                bail!("RTP padding flag set on an empty payload");
             }
+            let pad_len = data[end - 1] as usize;
+            if pad_len == 0 || pad_len > (end - offset) {
+                bail!("Invalid RTP padding length: {}", pad_len);
+            }
+            end -= pad_len;
         }
 
         let payload = data[offset..end].to_vec();

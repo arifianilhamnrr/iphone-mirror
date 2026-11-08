@@ -4,6 +4,7 @@ use anyhow::{bail, Result};
 use tracing::warn;
 
 pub const START_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
+const MAX_NAL_SIZE: usize = 16 * 1024 * 1024;
 
 pub struct H265Depacketizer {
     fu_buffer: Vec<u8>,
@@ -21,10 +22,10 @@ impl H265Depacketizer {
     }
 
     /// Process incoming RTP packet per RFC 7798
-    /// Returns Some(complete_nal_with_start_code) when a NAL finishes
-    pub fn process_packet(&mut self, pkt: &RtpPacket) -> Result<Option<Vec<u8>>> {
+    /// Returns every complete Annex-B NAL carried by the packet.
+    pub fn process_packet(&mut self, pkt: &RtpPacket) -> Result<Vec<Vec<u8>>> {
         if pkt.payload.is_empty() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
         // Sequence continuity check
@@ -50,7 +51,33 @@ impl H265Depacketizer {
                 let mut nal = Vec::with_capacity(START_CODE.len() + payload.len());
                 nal.extend_from_slice(&START_CODE);
                 nal.extend_from_slice(payload);
-                Ok(Some(nal))
+                Ok(vec![nal])
+            }
+
+            // Aggregation Packet (AP, Type 48): 2-byte AP header followed by
+            // repeated 16-bit lengths and complete NAL units.
+            48 => {
+                if payload.len() < 4 {
+                    bail!("H.265 aggregation packet is too short");
+                }
+                let mut offset = 2;
+                let mut nals = Vec::new();
+                while offset < payload.len() {
+                    if payload.len() - offset < 2 {
+                        bail!("Truncated H.265 aggregation-unit length");
+                    }
+                    let size = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+                    offset += 2;
+                    if size < 2 || payload.len() - offset < size {
+                        bail!("Invalid H.265 aggregation-unit size: {size}");
+                    }
+                    let mut nal = Vec::with_capacity(START_CODE.len() + size);
+                    nal.extend_from_slice(&START_CODE);
+                    nal.extend_from_slice(&payload[offset..offset + size]);
+                    nals.push(nal);
+                    offset += size;
+                }
+                Ok(nals)
             }
 
             // Fragmentation Unit (FU, Type 49)
@@ -70,34 +97,45 @@ impl H265Depacketizer {
                     self.fu_buffer.extend_from_slice(&START_CODE);
 
                     // Reconstruct reconstructed NAL header (2 bytes)
-                    let reconstructed_hdr1 = ((payload[0] & 0x81)) | (original_nal_type << 1);
+                    let reconstructed_hdr1 = (payload[0] & 0x81) | (original_nal_type << 1);
                     let reconstructed_hdr2 = payload[1];
                     self.fu_buffer.push(reconstructed_hdr1);
                     self.fu_buffer.push(reconstructed_hdr2);
 
                     self.fu_buffer.extend_from_slice(&payload[3..]);
                     self.is_assembling_fu = true;
-                    Ok(None)
+                    Ok(Vec::new())
                 } else if self.is_assembling_fu {
+                    if self.fu_buffer.len() + payload.len().saturating_sub(3) > MAX_NAL_SIZE {
+                        self.fu_buffer.clear();
+                        self.is_assembling_fu = false;
+                        bail!("Fragmented H.265 NAL exceeds the 16 MiB safety limit");
+                    }
                     self.fu_buffer.extend_from_slice(&payload[3..]);
                     if e_bit {
                         self.is_assembling_fu = false;
                         let completed_nal = std::mem::take(&mut self.fu_buffer);
-                        Ok(Some(completed_nal))
+                        Ok(vec![completed_nal])
                     } else {
-                        Ok(None)
+                        Ok(Vec::new())
                     }
                 } else {
                     // Fragment arrived without start bit, discard
-                    Ok(None)
+                    Ok(Vec::new())
                 }
             }
 
-            // Aggregation Packet (AP, Type 48) or other
+            // PACI (type 50) or unsupported packet type.
             _ => {
                 warn!(nal_type, "Unhandled H.265 packet type");
-                Ok(None)
+                Ok(Vec::new())
             }
         }
+    }
+}
+
+impl Default for H265Depacketizer {
+    fn default() -> Self {
+        Self::new()
     }
 }

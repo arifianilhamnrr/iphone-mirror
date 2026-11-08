@@ -1,16 +1,16 @@
 // language: Rust, file: src/media/nal_parser.rs
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NalUnitType {
-    TrailN = 0,
-    TrailR = 1,
-    IdrWRadl = 19,
-    IdrNLp = 20,
-    CraNut = 21,
-    VpsNut = 32,
-    SpsNut = 33,
-    PpsNut = 34,
-    PrefixSei = 39,
-    SuffixSei = 40,
+    TrailN,
+    TrailR,
+    IdrWRadl,
+    IdrNLp,
+    CraNut,
+    VpsNut,
+    SpsNut,
+    PpsNut,
+    PrefixSei,
+    SuffixSei,
     Other(u8),
 }
 
@@ -82,5 +82,11 @@ impl ParameterSetCache {
 
     pub fn is_complete(&self) -> bool {
         self.vps.is_some() && self.sps.is_some() && self.pps.is_some()
+    }
+}
+
+impl Default for ParameterSetCache {
+    fn default() -> Self {
+        Self::new()
     }
 }

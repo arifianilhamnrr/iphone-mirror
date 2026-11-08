@@ -41,27 +41,27 @@ impl UdpMediaReceiver {
 
             loop {
                 match self.socket.recv_from(&mut buf).await {
-                    Ok((len, _from)) => {
-                        match RtpPacket::parse(&buf[..len]) {
-                            Ok(pkt) => {
-                                match depacketizer.process_packet(&pkt) {
-                                    Ok(Some(nal)) => {
+                    Ok((len, _from)) => match RtpPacket::parse(&buf[..len]) {
+                        Ok(pkt) if !RtpPacket::is_rtcp(&buf[..len]) => {
+                            match depacketizer.process_packet(&pkt) {
+                                Ok(nals) => {
+                                    for nal in nals {
                                         if nal_tx.send(nal).await.is_err() {
                                             debug!("Receiver channel closed, stopping worker");
-                                            break;
+                                            return;
                                         }
                                     }
-                                    Ok(None) => {}
-                                    Err(e) => {
-                                        debug!(error = %e, "Failed to depacketize packet");
-                                    }
+                                }
+                                Err(e) => {
+                                    debug!(error = %e, "Failed to depacketize packet");
                                 }
                             }
-                            Err(e) => {
-                                debug!(error = %e, "Corrupt RTP packet received");
-                            }
                         }
-                    }
+                        Ok(_) => {}
+                        Err(e) => {
+                            debug!(error = %e, "Corrupt RTP packet received");
+                        }
+                    },
                     Err(e) => {
                         error!(error = %e, "UDP socket read error");
                         break;

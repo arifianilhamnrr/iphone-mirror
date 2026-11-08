@@ -1,6 +1,6 @@
 // language: Rust, file: src/transport/ddi_mounter.rs
 use anyhow::Result;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tracing::info;
 
 pub struct DdiMounter;
@@ -13,7 +13,9 @@ impl DdiMounter {
             paths.push(PathBuf::from(&home).join("Library/Developer/DeveloperDiskImages"));
             paths.push(PathBuf::from(&home).join(".pymobiledevice3/image_mounter"));
         }
-        paths.push(PathBuf::from("/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/DeviceSupport"));
+        paths.push(PathBuf::from(
+            "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/DeviceSupport",
+        ));
         paths
     }
 

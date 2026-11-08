@@ -1,6 +1,5 @@
 // language: Rust, file: src/transport/hotplug.rs, target: macOS / Linux
 use crate::transport::device_scanner::DeviceScanner;
-use anyhow::Result;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
@@ -24,7 +23,8 @@ impl HotplugMonitor {
                 tokio::time::sleep(Duration::from_millis(1000)).await;
 
                 if let Ok(current_list) = DeviceScanner::list_devices().await {
-                    let current_udids: Vec<String> = current_list.into_iter().map(|d| d.udid).collect();
+                    let current_udids: Vec<String> =
+                        current_list.into_iter().map(|d| d.udid).collect();
 
                     // Check for newly attached devices
                     for udid in &current_udids {

@@ -39,4 +39,42 @@ impl CoordinateMapper {
             }
         }
     }
+
+    /// Map a point from a letterboxed window into normalized video coordinates.
+    /// Points in the surrounding bars are intentionally rejected.
+    pub fn map_aspect_fit(
+        window_width: f64,
+        window_height: f64,
+        content_width: f64,
+        content_height: f64,
+        x: f64,
+        y: f64,
+    ) -> Option<(f32, f32)> {
+        if window_width <= 0.0
+            || window_height <= 0.0
+            || content_width <= 0.0
+            || content_height <= 0.0
+        {
+            return None;
+        }
+
+        let scale = (window_width / content_width).min(window_height / content_height);
+        let fitted_width = content_width * scale;
+        let fitted_height = content_height * scale;
+        let offset_x = (window_width - fitted_width) * 0.5;
+        let offset_y = (window_height - fitted_height) * 0.5;
+
+        if x < offset_x
+            || y < offset_y
+            || x > offset_x + fitted_width
+            || y > offset_y + fitted_height
+        {
+            return None;
+        }
+
+        Some((
+            ((x - offset_x) / fitted_width).clamp(0.0, 1.0) as f32,
+            ((y - offset_y) / fitted_height).clamp(0.0, 1.0) as f32,
+        ))
+    }
 }
