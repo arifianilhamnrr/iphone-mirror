@@ -108,6 +108,7 @@ struct MirrorApp {
     clipboard: SystemClipboard,
     clipboard_tx: tokio::sync::mpsc::UnboundedSender<String>,
     last_device_clipboard: Option<String>,
+    stream_error: Option<String>,
 }
 
 impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
@@ -171,7 +172,8 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                 }
             }
             UiEvent::StreamError(error) => {
-                tracing::error!(error, "Display stream stopped");
+                tracing::error!(%error, "Display stream stopped");
+                self.stream_error = Some(error);
                 event_loop.exit();
             }
             UiEvent::ClipboardText(text) => {
@@ -509,7 +511,7 @@ async fn main() -> Result<()> {
         .init();
 
     match parse_command()? {
-        Command::Mirror => run_mirror().await,
+        Command::Mirror => supervise_mirror().await,
         Command::Devices => list_devices().await,
         Command::Diagnose { udid } => diagnose(udid.as_deref()).await,
         Command::Help => {
@@ -564,6 +566,57 @@ async fn diagnose(udid: Option<&str>) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Run each CoreDevice session in a fresh process. A cable disconnect tears
+/// down several private-protocol clients and native decoder/output objects at
+/// once; recreating the worker process guarantees that no stale RSD, HID,
+/// AudioToolbox, or VideoToolbox state leaks into the next attempt.
+async fn supervise_mirror() -> Result<()> {
+    const WORKER_ENV: &str = "IPHONE_MIRROR_SESSION_WORKER";
+    if env::var_os(WORKER_ENV).is_some() {
+        return run_mirror().await;
+    }
+
+    let executable = env::current_exe().context("Could not locate the iphone-mirror executable")?;
+    let mut attempt = 0_u64;
+    loop {
+        attempt += 1;
+        if attempt > 1 {
+            info!(attempt, "Attempting to reconnect the iPhone mirror session");
+        }
+
+        let mut child = tokio::process::Command::new(&executable)
+            .arg("mirror")
+            .env(WORKER_ENV, "1")
+            .kill_on_drop(true)
+            .spawn()
+            .context("Failed to launch the mirror session worker")?;
+
+        let status = tokio::select! {
+            status = child.wait() => status.context("Mirror session worker wait failed")?,
+            signal = tokio::signal::ctrl_c() => {
+                signal.context("Failed to listen for Ctrl-C")?;
+                let _ = child.kill().await;
+                return Ok(());
+            }
+        };
+        if status.success() {
+            return Ok(());
+        }
+
+        warn!(
+            ?status,
+            "Mirror session ended; waiting for the iPhone before reconnecting"
+        );
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+            signal = tokio::signal::ctrl_c() => {
+                signal.context("Failed to listen for Ctrl-C")?;
+                return Ok(());
+            }
+        }
+    }
 }
 
 async fn run_mirror() -> Result<()> {
@@ -912,9 +965,13 @@ async fn run_mirror() -> Result<()> {
         clipboard: SystemClipboard::new(),
         clipboard_tx,
         last_device_clipboard: None,
+        stream_error: None,
     };
     event_loop
         .run_app(&mut app)
         .context("macOS window event loop failed")?;
+    if let Some(error) = app.stream_error {
+        anyhow::bail!("Mirror session failed: {error}");
+    }
     Ok(())
 }

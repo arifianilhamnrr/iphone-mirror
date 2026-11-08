@@ -16,8 +16,9 @@ Experimental native iPhone screen mirroring client in Rust for **macOS 26 Tahoe*
 - Hardware-tested: iPhone system audio playback on the host Mac (AAC-ELD, 48 kHz stereo, via AudioToolbox/AudioQueue) with RTCP receiver reports keeping the audio session alive.
 - Implemented: hardware-button shortcuts (Home, Lock, volume, mute) through the Indigo HID service.
 - Hardware-tested: full-resolution PNG screenshots, fullscreen, and always-on-top window controls.
-- In progress: image/file clipboard payloads and reconnect supervision.
-- Planned: reconnect, app-bundle polish, and performance hardening.
+- Implemented: automatic session restart after a stream/tunnel failure; each retry recreates CoreDevice, VideoToolbox, AudioToolbox, HID, and clipboard state cleanly.
+- In progress: image/file clipboard payloads.
+- Planned: app-bundle polish and performance hardening.
 - Performance and zero-copy behavior have not been benchmarked yet.
 
 ---
@@ -47,6 +48,8 @@ cargo build --release
 Set `IPHONE_MIRROR_LIST_SERVICES=1` to include the full RSD service catalog in diagnostic output. Use `RUST_LOG=debug` for detailed logs.
 
 The default `mirror` command establishes the CoreDevice tunnel and display-service session, decodes HEVC with VideoToolbox, and displays it in a native Metal window.
+
+If the cable, tunnel, or display session drops, the supervisor waits two seconds and starts a fresh session automatically. The mirror window closes while disconnected and reappears after reconnection. Closing the window normally stops the supervisor.
 
 Click or drag inside the displayed phone image to send touchscreen input. Clicks in letterbox/pillarbox regions are ignored.
 
