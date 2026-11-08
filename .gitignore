@@ -3,3 +3,5 @@ target/
 *.dmg
 *.log
 .DS_Store
+dist/
+build/

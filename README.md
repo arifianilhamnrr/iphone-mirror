@@ -47,6 +47,20 @@ cargo build --release
 
 Set `IPHONE_MIRROR_LIST_SERVICES=1` to include the full RSD service catalog in diagnostic output. Use `RUST_LOG=debug` for detailed logs.
 
+To create a LaunchServices-ready, ad-hoc-signed app bundle and distributable ZIP:
+
+```bash
+# Regenerate the checked-in icon only when its artwork changes (requires Pillow).
+make icon
+
+# Build, bundle, verify the signature, and create dist/iPhone-Mirror-macOS.zip.
+make package
+
+open "dist/iPhone Mirror.app"
+```
+
+`make package` itself only needs the Xcode command-line tools and Rust; the generated `resources/AppIcon.icns` is tracked so end users do not need Python/Pillow.
+
 The default `mirror` command establishes the CoreDevice tunnel and display-service session, decodes HEVC with VideoToolbox, and displays it in a native Metal window.
 
 If the cable, tunnel, or display session drops, the supervisor waits two seconds and starts a fresh session automatically. The mirror window closes while disconnected and reappears after reconnection. Closing the window normally stops the supervisor.
