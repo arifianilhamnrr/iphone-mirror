@@ -15,6 +15,7 @@ Experimental native iPhone screen mirroring client in Rust for **macOS 26 Tahoe*
 - Implemented: physical laptop keyboard forwarding (letters, numbers, punctuation, navigation, function keys, and modifiers).
 - Hardware-tested: iPhone system audio playback on the host Mac (AAC-ELD, 48 kHz stereo, via AudioToolbox/AudioQueue) with RTCP receiver reports keeping the audio session alive.
 - Implemented: hardware-button shortcuts (Home, Lock, volume, mute) through the Indigo HID service.
+- Hardware-tested: full-resolution PNG screenshots, fullscreen, and always-on-top window controls.
 - In progress: image/file clipboard payloads and reconnect supervision.
 - Planned: reconnect, app-bundle polish, and performance hardening.
 - Performance and zero-copy behavior have not been benchmarked yet.
@@ -64,6 +65,9 @@ Keyboard shortcuts (hold Control):
 | `Ctrl+[` / `Ctrl+]` | Volume down / up |
 | `Ctrl+\` | Mute the iPhone |
 | `Ctrl+M` | Mute or unmute audio playback on the Mac (local only) |
+| `Ctrl+S` | Save a PNG to `~/Pictures/iPhone Mirror` |
+| `Ctrl+T` | Toggle always-on-top |
+| `Ctrl+Cmd+F` | Toggle borderless fullscreen |
 
 ---
 

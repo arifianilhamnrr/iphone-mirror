@@ -147,6 +147,17 @@ extern "C" {
         pixel_buffer: CVPixelBufferRef,
         plane_index: usize,
     ) -> usize;
+    pub fn CVPixelBufferGetBaseAddressOfPlane(
+        pixel_buffer: CVPixelBufferRef,
+        plane_index: usize,
+    ) -> *mut c_void;
+    pub fn CVPixelBufferGetBytesPerRowOfPlane(
+        pixel_buffer: CVPixelBufferRef,
+        plane_index: usize,
+    ) -> usize;
+    pub fn CVPixelBufferGetPixelFormatType(pixel_buffer: CVPixelBufferRef) -> u32;
+    pub fn CVPixelBufferLockBaseAddress(pixel_buffer: CVPixelBufferRef, flags: u64) -> i32;
+    pub fn CVPixelBufferUnlockBaseAddress(pixel_buffer: CVPixelBufferRef, flags: u64) -> i32;
 
     pub fn CVMetalTextureCacheCreate(
         allocator: *const c_void,

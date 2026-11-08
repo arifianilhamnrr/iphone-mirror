@@ -9,7 +9,7 @@ use idevice::{
 };
 use iphone_mirror_rs::{
     audio::{AacEldDecoder, AudioPlayer},
-    codec::{decoder::HardwareDecoder, format_desc::FormatDescription},
+    codec::{decoder::HardwareDecoder, format_desc::FormatDescription, screenshot::save_frame_png},
     input::{clipboard::SystemClipboard, coordinate_mapper::CoordinateMapper},
     media::nal_parser::ParameterSetCache,
     media::{h265_depacketizer::H265Depacketizer, rtp::RtpPacket},
@@ -100,6 +100,9 @@ struct MirrorApp {
     input_tx: tokio::sync::mpsc::UnboundedSender<InputCommand>,
     button_tx: tokio::sync::mpsc::UnboundedSender<HardwareButton>,
     audio_muted: Arc<AtomicBool>,
+    screenshot_requested: bool,
+    always_on_top: bool,
+    fullscreen: bool,
     pressed_keys: BTreeSet<u16>,
     modifiers: winit::keyboard::ModifiersState,
     clipboard: SystemClipboard,
@@ -151,6 +154,17 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                     );
                 }
                 if let Some(renderer) = &self.renderer {
+                    if std::mem::take(&mut self.screenshot_requested) {
+                        match default_screenshot_path() {
+                            Ok(path) => match save_frame_png(&frame, &path) {
+                                Ok(()) => info!(path = %path.display(), "Saved screenshot"),
+                                Err(error) => warn!(%error, "Failed to save screenshot"),
+                            },
+                            Err(error) => {
+                                warn!(%error, "Failed to prepare the screenshot directory")
+                            }
+                        }
+                    }
                     if let Err(error) = renderer.render_frame(&frame) {
                         warn!(%error, "Failed to present decoded frame");
                     }
@@ -244,6 +258,35 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                             if code == winit::keyboard::KeyCode::KeyM {
                                 let was_muted = self.audio_muted.fetch_xor(true, Ordering::Relaxed);
                                 info!(muted = !was_muted, "Toggled host audio mute");
+                                return;
+                            }
+                            if code == winit::keyboard::KeyCode::KeyS {
+                                self.screenshot_requested = true;
+                                return;
+                            }
+                            if code == winit::keyboard::KeyCode::KeyT {
+                                self.always_on_top = !self.always_on_top;
+                                if let Some(window) = &self.window {
+                                    window.set_window_level(if self.always_on_top {
+                                        winit::window::WindowLevel::AlwaysOnTop
+                                    } else {
+                                        winit::window::WindowLevel::Normal
+                                    });
+                                }
+                                info!(always_on_top = self.always_on_top, "Toggled always-on-top");
+                                return;
+                            }
+                            if code == winit::keyboard::KeyCode::KeyF && self.modifiers.super_key()
+                            {
+                                self.fullscreen = !self.fullscreen;
+                                if let Some(window) = &self.window {
+                                    window.set_fullscreen(if self.fullscreen {
+                                        Some(winit::window::Fullscreen::Borderless(None))
+                                    } else {
+                                        None
+                                    });
+                                }
+                                info!(fullscreen = self.fullscreen, "Toggled fullscreen");
                                 return;
                             }
                             let button = match code {
@@ -409,6 +452,19 @@ impl MirrorApp {
             (y * u16::MAX as f32).round() as u16,
         ))
     }
+}
+
+fn default_screenshot_path() -> Result<std::path::PathBuf> {
+    let home = env::var_os("HOME").context("HOME is not set")?;
+    let directory = std::path::PathBuf::from(home)
+        .join("Pictures")
+        .join("iPhone Mirror");
+    std::fs::create_dir_all(&directory)
+        .with_context(|| format!("Failed to create {}", directory.display()))?;
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis();
+    Ok(directory.join(format!("iphone-mirror-{millis}.png")))
 }
 
 fn parse_command() -> Result<Command> {
@@ -848,6 +904,9 @@ async fn run_mirror() -> Result<()> {
         input_tx,
         button_tx,
         audio_muted,
+        screenshot_requested: false,
+        always_on_top: false,
+        fullscreen: false,
         pressed_keys: BTreeSet::new(),
         modifiers: winit::keyboard::ModifiersState::empty(),
         clipboard: SystemClipboard::new(),
