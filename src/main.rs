@@ -34,7 +34,7 @@ use tracing::{debug, info, warn};
 
 enum Command {
     Mirror,
-    Devices,
+    Devices { json: bool },
     Diagnose { udid: Option<String> },
     Help,
 }
@@ -739,7 +739,10 @@ fn parse_command() -> Result<Command> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
         None | Some("mirror") => Ok(Command::Mirror),
-        Some("devices") => Ok(Command::Devices),
+        Some("devices") => {
+            let json = args.any(|arg| arg == "--json");
+            Ok(Command::Devices { json })
+        }
         Some("diagnose") => {
             let mut udid = None;
             while let Some(arg) = args.next() {
@@ -778,7 +781,7 @@ async fn main() -> Result<()> {
 
     match parse_command()? {
         Command::Mirror => supervise_mirror().await,
-        Command::Devices => list_devices().await,
+        Command::Devices { json } => list_devices(json).await,
         Command::Diagnose { udid } => diagnose(udid.as_deref()).await,
         Command::Help => {
             print_help();
@@ -787,11 +790,15 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn list_devices() -> Result<()> {
+async fn list_devices(json: bool) -> Result<()> {
     let devices = DeviceScanner::list_devices()
         .await
         .context("Could not scan usbmuxd devices")?;
 
+    if json {
+        println!("{}", serde_json::to_string(&devices)?);
+        return Ok(());
+    }
     if devices.is_empty() {
         println!("No connected iPhones found.");
         return Ok(());
@@ -922,7 +929,12 @@ async fn run_mirror() -> Result<()> {
         },
         auto_rotate: env::var("IPHONE_MIRROR_AUTO_ROTATE").as_deref() != Ok("0"),
     };
-    let device = DeviceScanner::select_device_with_transport(None, settings.transport).await?;
+    let selected_udid = env::var("IPHONE_MIRROR_UDID").ok();
+    let device = DeviceScanner::select_device_with_transport(
+        selected_udid.as_deref(),
+        settings.transport,
+    )
+    .await?;
     info!(udid = %device.udid, conn = %device.connection_type, "iPhone detected");
 
     let mut tunnel = RsdTunnel::connect(Box::new(device.provider())).await?;

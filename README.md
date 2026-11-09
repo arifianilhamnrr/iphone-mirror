@@ -67,9 +67,9 @@ The default `mirror` command establishes the CoreDevice tunnel and display-servi
 
 If the cable, tunnel, or display session drops, the supervisor waits two seconds and starts a fresh session automatically. The mirror window closes while disconnected and reappears after reconnection. Closing the window normally stops the supervisor.
 
-When no iPhone is available, the app shows a launcher dialog instead of leaving a blank mirror window. From there choose **Try Again**, **Settings…**, or **Quit**. Settings are also available while mirroring with the standard macOS shortcut `Cmd+,` and are persisted under `~/Library/Application Support/iPhone Mirror/settings.json`.
+The app bundle opens a native SwiftUI launcher instead of starting with an empty mirror window. It continuously scans for ready USB/Finder Wi-Fi devices, shows nearby Bonjour iPhones that still need pairing, lets you select a device and transport, and starts the Rust media backend only after **Start Mirroring**. Settings use the standard macOS `Cmd+,` window and persist through `UserDefaults`.
 
-Connection mode can be **Auto**, **USB**, or **Wi-Fi**. Auto treats USB and Network records with the same UDID as one phone and prefers USB; Wi-Fi mode requires enabling **Show this iPhone when on Wi-Fi** in Finder while the phone is paired. The selected mode is used on the next connection/reconnect.
+Connection mode can be **Auto**, **USB**, or **Wi-Fi** from the launcher sidebar or Settings. Auto treats USB and Network records with the same UDID as one phone and prefers USB. Bonjour scans `_remotepairing._tcp` and `_apple-mobdev2._tcp`; a Bonjour-only result is labeled as nearby and must be paired/enabled in Finder before it becomes connectable. Finder-ready Network records can be mirrored directly over Wi-Fi.
 
 Click or drag inside the displayed phone image to send touchscreen input. Clicks in letterbox/pillarbox regions are ignored.
 

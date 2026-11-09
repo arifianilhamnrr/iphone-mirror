@@ -1,6 +1,7 @@
 APP_NAME := iPhone Mirror.app
 APP := dist/$(APP_NAME)
 TARGET := target/release/iphone-mirror
+LAUNCHER := build/iphone-mirror-launcher
 ICON := resources/AppIcon.icns
 VERSION := $(shell /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)
 ARCH := $(shell uname -m)
@@ -14,6 +15,8 @@ all: build
 
 build:
 	cargo build --release --locked
+	mkdir -p build
+	xcrun swiftc -O -parse-as-library launcher/main.swift -o "$(LAUNCHER)"
 
 icon:
 	python3 scripts/generate_icon.py
@@ -24,16 +27,18 @@ bundle: build
 	mkdir -p "$(APP)/Contents/MacOS" "$(APP)/Contents/Resources"
 	cp Info.plist "$(APP)/Contents/Info.plist"
 	cp "$(ICON)" "$(APP)/Contents/Resources/AppIcon.icns"
-	cp "$(TARGET)" "$(APP)/Contents/MacOS/iphone-mirror"
-	chmod +x "$(APP)/Contents/MacOS/iphone-mirror"
+	cp "$(LAUNCHER)" "$(APP)/Contents/MacOS/iphone-mirror-launcher"
+	cp "$(TARGET)" "$(APP)/Contents/MacOS/iphone-mirror-backend"
+	chmod +x "$(APP)/Contents/MacOS/iphone-mirror-launcher" "$(APP)/Contents/MacOS/iphone-mirror-backend"
 	plutil -lint "$(APP)/Contents/Info.plist"
 	codesign --force --deep --sign - "$(APP)"
 	@echo "Build complete: $(APP)"
 
 verify: bundle
 	codesign --verify --deep --strict --verbose=2 "$(APP)"
-	@test "$$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$(APP)/Contents/Info.plist")" = "iphone-mirror"
-	@test -x "$(APP)/Contents/MacOS/iphone-mirror"
+	@test "$$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$(APP)/Contents/Info.plist")" = "iphone-mirror-launcher"
+	@test -x "$(APP)/Contents/MacOS/iphone-mirror-launcher"
+	@test -x "$(APP)/Contents/MacOS/iphone-mirror-backend"
 
 package: verify installer
 	rm -f "$(ZIP)"

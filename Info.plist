@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key>
-    <string>iphone-mirror</string>
+    <string>iphone-mirror-launcher</string>
     <key>CFBundleIdentifier</key>
     <string>id.web.projectar.iphone-mirror</string>
     <key>CFBundleName</key>
@@ -28,5 +28,12 @@
     <true/>
     <key>NSHumanReadableCopyright</key>
     <string>Copyright © 2026 iphone-mirror-rs contributors</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>iPhone Mirror scans the local network for paired iPhones available over Wi-Fi.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_remotepairing._tcp</string>
+        <string>_apple-mobdev2._tcp</string>
+    </array>
 </dict>
 </plist>

@@ -5,7 +5,8 @@ use idevice::usbmuxd::{Connection, UsbmuxdAddr};
 use std::fmt;
 use std::path::Path;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ConnectionType {
     Usb,
     Network,
@@ -31,7 +32,7 @@ impl fmt::Display for ConnectionType {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ConnectedDevice {
     pub udid: String,
     pub connection_type: ConnectionType,
