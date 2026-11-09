@@ -81,7 +81,9 @@ final class LauncherModel: ObservableObject {
     private var nearbyByService: [String: Set<String>] = [:]
 
     var backendURL: URL {
-        Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/iphone-mirror-backend")
+        Bundle.main.bundleURL.appendingPathComponent(
+            "Contents/Helpers/iPhone Mirror Stream.app/Contents/MacOS/iphone-mirror-backend"
+        )
     }
 
     var filteredDevices: [Device] {
@@ -194,12 +196,25 @@ final class LauncherModel: ObservableObject {
         environment["IPHONE_MIRROR_TRANSPORT"] = device.connection_type == .network ? "wifi" : "usb"
         environment["IPHONE_MIRROR_AUTO_ROTATE"] = autoRotate ? "1" : "0"
         process.environment = environment
+        let logURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("iphone-mirror-backend.log")
+        FileManager.default.createFile(atPath: logURL.path, contents: nil)
+        if let handle = try? FileHandle(forWritingTo: logURL) {
+            process.standardOutput = handle
+            process.standardError = handle
+        }
         process.terminationHandler = { [weak self] process in
             Task { @MainActor in
                 self?.backend = nil
                 self?.backendRunning = false
                 if process.terminationStatus != 0 {
-                    self?.error = "The mirror session ended. Keep the iPhone unlocked, trusted, and on the same network, then reconnect."
+                    let detail = (try? String(contentsOf: logURL, encoding: .utf8))?
+                        .split(separator: "\n")
+                        .suffix(2)
+                        .joined(separator: " ")
+                    self?.error = detail?.isEmpty == false
+                        ? detail!
+                        : "The mirror session ended. Keep the iPhone unlocked, trusted, and on the same network, then reconnect."
                 }
             }
         }
@@ -208,6 +223,8 @@ final class LauncherModel: ObservableObject {
             backend = process
             backendRunning = true
             error = nil
+            NSRunningApplication(processIdentifier: process.processIdentifier)?
+                .activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
         } catch {
             self.error = "Couldn’t start the mirror session."
         }

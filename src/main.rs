@@ -770,7 +770,7 @@ fn print_help() {
     );
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -930,11 +930,9 @@ async fn run_mirror() -> Result<()> {
         auto_rotate: env::var("IPHONE_MIRROR_AUTO_ROTATE").as_deref() != Ok("0"),
     };
     let selected_udid = env::var("IPHONE_MIRROR_UDID").ok();
-    let device = DeviceScanner::select_device_with_transport(
-        selected_udid.as_deref(),
-        settings.transport,
-    )
-    .await?;
+    let device =
+        DeviceScanner::select_device_with_transport(selected_udid.as_deref(), settings.transport)
+            .await?;
     info!(udid = %device.udid, conn = %device.connection_type, "iPhone detected");
 
     let mut tunnel = RsdTunnel::connect(Box::new(device.provider())).await?;
@@ -948,24 +946,44 @@ async fn run_mirror() -> Result<()> {
         .await
         .context("Failed to start the display service stream")?;
     info!("Stream session negotiated; awaiting H.265 RTP packets");
-    let mut hid =
-        UniversalHidServiceClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake)
-            .await
-            .context("Failed to connect to the universal HID service")?;
-    let mut indigo_hid = IndigoHidClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake)
-        .await
-        .context("Failed to connect to the Indigo HID service")?;
-    let mut keyboard = hid.create_main_keyboard().await.map_err(|error| {
-        anyhow::anyhow!("Failed to create the iPhone keyboard surface: {error}")
-    })?;
-    let mut clipboard_writer =
-        PasteboardServiceClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake)
-            .await
-            .context("Failed to connect to the pasteboard service")?;
-    let mut clipboard_watcher =
-        PasteboardServiceClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake)
-            .await
-            .context("Failed to open the pasteboard notification channel")?;
+    let mut hid = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        UniversalHidServiceClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake),
+    )
+    .await
+    .context("Timed out connecting to the universal HID service")?
+    .context("Failed to connect to the universal HID service")?;
+    info!("Universal HID service connected");
+    let mut indigo_hid = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        IndigoHidClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake),
+    )
+    .await
+    .context("Timed out connecting to the Indigo HID service")?
+    .context("Failed to connect to the Indigo HID service")?;
+    info!("Indigo HID service connected");
+    let mut keyboard = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        hid.create_main_keyboard(),
+    )
+    .await
+    .context("Timed out creating the iPhone keyboard surface")?
+    .map_err(|error| anyhow::anyhow!("Failed to create the iPhone keyboard surface: {error}"))?;
+    info!("Virtual keyboard surface created");
+    let mut clipboard_writer = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        PasteboardServiceClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake),
+    )
+    .await
+    .context("Timed out connecting to the pasteboard service")?
+    .context("Failed to connect to the pasteboard service")?;
+    let mut clipboard_watcher = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        PasteboardServiceClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake),
+    )
+    .await
+    .context("Timed out opening the pasteboard notification channel")?
+    .context("Failed to open the pasteboard notification channel")?;
     clipboard_watcher
         .set_change_notifications(
             true,
@@ -974,10 +992,12 @@ async fn run_mirror() -> Result<()> {
         )
         .await
         .context("Failed to subscribe to iPhone clipboard changes")?;
+    info!("Pasteboard services connected");
 
     let event_loop = winit::event_loop::EventLoop::<UiEvent>::with_user_event()
         .build()
         .context("Failed to create the macOS event loop")?;
+    info!("Mirror window event loop created");
     let proxy = event_loop.create_proxy();
     let stream_proxy = proxy.clone();
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel(3);

@@ -1,5 +1,6 @@
 APP_NAME := iPhone Mirror.app
 APP := dist/$(APP_NAME)
+HELPER := $(APP)/Contents/Helpers/iPhone Mirror Stream.app
 TARGET := target/release/iphone-mirror
 LAUNCHER := build/iphone-mirror-launcher
 ICON := resources/AppIcon.icns
@@ -24,12 +25,13 @@ icon:
 bundle: build
 	@echo "Bundling $(APP)..."
 	rm -rf "$(APP)"
-	mkdir -p "$(APP)/Contents/MacOS" "$(APP)/Contents/Resources"
+	mkdir -p "$(APP)/Contents/MacOS" "$(APP)/Contents/Resources" "$(HELPER)/Contents/MacOS"
 	cp Info.plist "$(APP)/Contents/Info.plist"
 	cp "$(ICON)" "$(APP)/Contents/Resources/AppIcon.icns"
 	cp "$(LAUNCHER)" "$(APP)/Contents/MacOS/iphone-mirror-launcher"
-	cp "$(TARGET)" "$(APP)/Contents/MacOS/iphone-mirror-backend"
-	chmod +x "$(APP)/Contents/MacOS/iphone-mirror-launcher" "$(APP)/Contents/MacOS/iphone-mirror-backend"
+	cp "$(TARGET)" "$(HELPER)/Contents/MacOS/iphone-mirror-backend"
+	python3 -c 'import plistlib; plistlib.dump({"CFBundleExecutable":"iphone-mirror-backend","CFBundleIdentifier":"id.web.projectar.iphone-mirror.stream","CFBundleName":"iPhone Mirror Stream","CFBundlePackageType":"APPL","CFBundleShortVersionString":"$(VERSION)","CFBundleVersion":"1","LSMinimumSystemVersion":"15.0","LSUIElement":True,"NSHighResolutionCapable":True}, open("$(HELPER)/Contents/Info.plist", "wb"))'
+	chmod +x "$(APP)/Contents/MacOS/iphone-mirror-launcher" "$(HELPER)/Contents/MacOS/iphone-mirror-backend"
 	plutil -lint "$(APP)/Contents/Info.plist"
 	codesign --force --deep --sign - "$(APP)"
 	@echo "Build complete: $(APP)"
@@ -38,7 +40,8 @@ verify: bundle
 	codesign --verify --deep --strict --verbose=2 "$(APP)"
 	@test "$$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$(APP)/Contents/Info.plist")" = "iphone-mirror-launcher"
 	@test -x "$(APP)/Contents/MacOS/iphone-mirror-launcher"
-	@test -x "$(APP)/Contents/MacOS/iphone-mirror-backend"
+	@test -x "$(HELPER)/Contents/MacOS/iphone-mirror-backend"
+	@test "$$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$(HELPER)/Contents/Info.plist")" = "id.web.projectar.iphone-mirror.stream"
 
 package: verify installer
 	rm -f "$(ZIP)"
