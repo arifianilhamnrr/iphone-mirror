@@ -53,13 +53,15 @@ To create a LaunchServices-ready, ad-hoc-signed app bundle and distributable ZIP
 # Regenerate the checked-in icon only when its artwork changes (requires Pillow).
 make icon
 
-# Build, bundle, verify the signature, and create dist/iPhone-Mirror-macOS.zip.
+# Build, bundle, verify the signature, and create ZIP + DMG installer artifacts.
 make package
 
 open "dist/iPhone Mirror.app"
 ```
 
-`make package` itself only needs the Xcode command-line tools and Rust; the generated `resources/AppIcon.icns` is tracked so end users do not need Python/Pillow.
+The DMG presents `iPhone Mirror.app` next to an Applications shortcut: drag the app onto Applications to install it. `make package` also writes `dist/SHA256SUMS.txt`. Packaging itself only needs the Xcode command-line tools and Rust; the generated `resources/AppIcon.icns` is tracked so end users do not need Python/Pillow.
+
+Current release artifacts are built for Intel (`x86_64`) macOS. The app is ad-hoc signed but not Apple-notarized, so first launch may require right-clicking the app and choosing **Open**.
 
 The default `mirror` command establishes the CoreDevice tunnel and display-service session, decodes HEVC with VideoToolbox, and displays it in a native Metal window.
 
