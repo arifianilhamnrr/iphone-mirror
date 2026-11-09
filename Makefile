@@ -47,6 +47,7 @@ installer: verify
 	cp -R "$(APP)" "$(DMG_ROOT)/$(APP_NAME)"
 	ln -s /Applications "$(DMG_ROOT)/Applications"
 	hdiutil create -volname "iPhone Mirror $(VERSION)" -srcfolder "$(DMG_ROOT)" -ov -format UDZO "$(DMG)"
+	rm -rf "$(DMG_ROOT)"
 
 checksums:
 	cd dist && shasum -a 256 "$$(basename "$(ZIP)")" "$$(basename "$(DMG)")" > SHA256SUMS.txt
