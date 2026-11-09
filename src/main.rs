@@ -63,6 +63,8 @@ fn default_true() -> bool {
 enum UiEvent {
     Frame(iphone_mirror_rs::codec::decoder::DecodedFrame),
     Clipboard(ClipboardContent),
+    ShutdownRequested,
+    ShutdownComplete,
     StreamError(String),
 }
 
@@ -143,6 +145,7 @@ struct MirrorApp {
     clipboard_tx: tokio::sync::mpsc::UnboundedSender<ClipboardContent>,
     last_device_clipboard: Option<String>,
     stream_error: Option<String>,
+    shutting_down: bool,
 }
 
 impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
@@ -230,6 +233,11 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                 self.stream_error = Some(error);
                 event_loop.exit();
             }
+            UiEvent::ShutdownRequested => self.begin_shutdown(),
+            UiEvent::ShutdownComplete => {
+                info!("Mirror session cleanup complete");
+                event_loop.exit();
+            }
             UiEvent::Clipboard(content) => match content {
                 ClipboardContent::Text(text) => {
                     if self.clipboard.current_text().as_deref() != Some(text.as_str()) {
@@ -260,14 +268,13 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
 
     fn window_event(
         &mut self,
-        event_loop: &winit::event_loop::ActiveEventLoop,
+        _event_loop: &winit::event_loop::ActiveEventLoop,
         _window_id: winit::window::WindowId,
         event: winit::event::WindowEvent,
     ) {
         match event {
             winit::event::WindowEvent::CloseRequested => {
-                let _ = self.shutdown_tx.send(true);
-                event_loop.exit();
+                self.begin_shutdown();
             }
             winit::event::WindowEvent::Resized(size) => {
                 if let Some(renderer) = &self.renderer {
@@ -600,6 +607,18 @@ fn key_code_to_hid_usage(code: winit::keyboard::KeyCode) -> Option<u16> {
 }
 
 impl MirrorApp {
+    fn begin_shutdown(&mut self) {
+        if self.shutting_down {
+            return;
+        }
+        self.shutting_down = true;
+        info!("Gracefully stopping the mirror session");
+        let _ = self.shutdown_tx.send(true);
+        if let Some(window) = &self.window {
+            window.set_visible(false);
+        }
+    }
+
     fn touch_coordinates(&self, position: winit::dpi::PhysicalPosition<f64>) -> Option<(u16, u16)> {
         let window = self.window.as_ref()?;
         let (frame_width, frame_height) = self.frame_size?;
@@ -1009,6 +1028,26 @@ async fn run_mirror() -> Result<()> {
     let audio_muted = Arc::new(AtomicBool::new(false));
     let audio_muted_stream = audio_muted.clone();
 
+    let signal_proxy = stream_proxy.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            let mut terminate =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(signal) => signal,
+                    Err(error) => {
+                        warn!(%error, "Could not install the graceful SIGTERM handler");
+                        return;
+                    }
+                };
+            tokio::select! {
+                _ = terminate.recv() => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+            let _ = signal_proxy.send_event(UiEvent::ShutdownRequested);
+        }
+    });
+
     tokio::spawn(async move {
         while let Some(button) = button_rx.recv().await {
             let (usage_page, usage_code) = button.usage();
@@ -1359,16 +1398,27 @@ async fn run_mirror() -> Result<()> {
                     }
                 }
             }
-            if let Err(error) = hid.remove_main_keyboard(&mut keyboard).await {
-                warn!(%error, "Failed to remove the virtual keyboard service");
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                hid.remove_main_keyboard(&mut keyboard),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!(%error, "Failed to remove the virtual keyboard service"),
+                Err(_) => warn!("Timed out removing the virtual keyboard service"),
             }
-            if let Err(error) = client.stop().await {
-                warn!(%error, "Display stream shutdown was not acknowledged");
+            match tokio::time::timeout(std::time::Duration::from_secs(5), client.stop()).await {
+                Ok(Ok(())) => info!("Display stream stop acknowledged by iPhone"),
+                Ok(Err(error)) => warn!(%error, "Display stream shutdown was not acknowledged"),
+                Err(_) => warn!("Timed out waiting for display stream shutdown acknowledgement"),
             }
             Ok(())
         }.await;
         if let Err(error) = result {
             let _ = stream_proxy.send_event(UiEvent::StreamError(error.to_string()));
+        } else {
+            let _ = stream_proxy.send_event(UiEvent::ShutdownComplete);
         }
     });
 
@@ -1397,6 +1447,7 @@ async fn run_mirror() -> Result<()> {
         clipboard_tx,
         last_device_clipboard: None,
         stream_error: None,
+        shutting_down: false,
     };
     event_loop
         .run_app(&mut app)

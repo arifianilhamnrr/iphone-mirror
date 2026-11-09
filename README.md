@@ -67,6 +67,8 @@ The default `mirror` command establishes the CoreDevice tunnel and display-servi
 
 If the cable, tunnel, or display session drops, the supervisor waits two seconds and starts a fresh session automatically. The mirror window closes while disconnected and reappears after reconnection. Closing the window normally stops the supervisor.
 
+Disconnecting from the SwiftUI launcher, closing the mirror window, sending SIGTERM, or pressing Ctrl-C all use the same graceful shutdown path. The backend releases the virtual keyboard and waits for the iPhone to acknowledge `stop_media_stream` before exiting, so protected camera previews and view-once messages are no longer left blocked by a stale mirroring session.
+
 The app bundle opens a native SwiftUI launcher instead of starting with an empty mirror window. It continuously scans for ready USB/Finder Wi-Fi devices, shows nearby Bonjour iPhones that still need pairing, lets you select a device and transport, and starts the Rust media backend only after **Start Mirroring**. Settings use the standard macOS `Cmd+,` window and persist through `UserDefaults`.
 
 Connection mode can be **Auto**, **USB**, or **Wi-Fi** from the launcher sidebar or Settings. Auto treats USB and Network records with the same UDID as one phone and prefers USB. Bonjour scans `_remotepairing._tcp` and `_apple-mobdev2._tcp`; a Bonjour-only result is labeled as nearby and must be paired/enabled in Finder before it becomes connectable. Finder-ready Network records can be mirrored directly over Wi-Fi.
