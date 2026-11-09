@@ -17,7 +17,10 @@ use iphone_mirror_rs::{
     media::nal_parser::ParameterSetCache,
     media::{h265_depacketizer::H265Depacketizer, rtp::RtpPacket},
     protocol::display_client::DisplayClient,
-    transport::{device_scanner::DeviceScanner, rsd_tunnel::RsdTunnel},
+    transport::{
+        device_scanner::{DeviceScanner, TransportPreference},
+        rsd_tunnel::RsdTunnel,
+    },
     ui::metal_renderer::MetalRenderer,
 };
 use std::collections::BTreeSet;
@@ -34,6 +37,27 @@ enum Command {
     Devices,
     Diagnose { udid: Option<String> },
     Help,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AppSettings {
+    #[serde(default)]
+    transport: TransportPreference,
+    #[serde(default = "default_true")]
+    auto_rotate: bool,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            transport: TransportPreference::Auto,
+            auto_rotate: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 enum UiEvent {
@@ -111,6 +135,8 @@ struct MirrorApp {
     screenshot_requested: bool,
     always_on_top: bool,
     fullscreen: bool,
+    auto_rotate: bool,
+    frame_is_landscape: Option<bool>,
     pressed_keys: BTreeSet<u16>,
     modifiers: winit::keyboard::ModifiersState,
     clipboard: SystemClipboard,
@@ -154,6 +180,26 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
             UiEvent::Frame(frame) => {
                 self.frame_count += 1;
                 self.frame_size = Some((frame.width(), frame.height()));
+                let landscape = frame.width() > frame.height();
+                if self.auto_rotate
+                    && self.frame_is_landscape != Some(landscape)
+                    && !self.fullscreen
+                {
+                    self.frame_is_landscape = Some(landscape);
+                    if let Some(window) = &self.window {
+                        let current = window.inner_size();
+                        let (width, height) =
+                            rotated_window_size(current.width, current.height, landscape);
+                        let target = winit::dpi::PhysicalSize::new(width, height);
+                        let _ = window.request_inner_size(target);
+                        info!(
+                            landscape,
+                            width = target.width,
+                            height = target.height,
+                            "Auto-rotated mirror window"
+                        );
+                    }
+                }
                 if self.frame_count == 1 || self.frame_count % 300 == 0 {
                     info!(
                         frame_count = self.frame_count,
@@ -335,6 +381,20 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
             winit::event::WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == winit::event::ElementState::Pressed && !event.repeat {
                     if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
+                        if self.modifiers.super_key() && code == winit::keyboard::KeyCode::Comma {
+                            let mut settings = load_settings();
+                            if let Err(error) = edit_settings(&mut settings) {
+                                warn!(%error, "Failed to save settings");
+                            } else {
+                                self.auto_rotate = settings.auto_rotate;
+                                info!(
+                                    transport = settings.transport.label(),
+                                    auto_rotate = settings.auto_rotate,
+                                    "Updated application settings"
+                                );
+                            }
+                            return;
+                        }
                         let control = self.modifiers.control_key()
                             || self.pressed_keys.contains(&0xE0)
                             || self.pressed_keys.contains(&0xE4);
@@ -579,6 +639,102 @@ fn offset_touch_position(position: (u16, u16), delta: (i32, i32)) -> (u16, u16) 
     )
 }
 
+fn rotated_window_size(width: u32, height: u32, landscape: bool) -> (u32, u32) {
+    let long = width.max(height).max(500);
+    let short = width.min(height).max(280);
+    if landscape {
+        (long, short)
+    } else {
+        (short, long)
+    }
+}
+
+fn settings_path() -> Result<std::path::PathBuf> {
+    let home = env::var_os("HOME").context("HOME is not set")?;
+    Ok(std::path::PathBuf::from(home)
+        .join("Library/Application Support/iPhone Mirror/settings.json"))
+}
+
+fn load_settings() -> AppSettings {
+    settings_path()
+        .ok()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_settings(settings: &AppSettings) -> Result<()> {
+    let path = settings_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_vec_pretty(settings)?)?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LauncherAction {
+    Retry,
+    Settings,
+    Quit,
+}
+
+fn launcher_alert(message: &str, detail: &str) -> LauncherAction {
+    const SCRIPT: &str = r#"
+on run argv
+  set result to display dialog (item 2 of argv) with title (item 1 of argv) buttons {"Quit", "Settings…", "Try Again"} default button "Try Again" cancel button "Quit" with icon caution
+  return button returned of result
+end run
+"#;
+    match std::process::Command::new("osascript")
+        .args(["-e", SCRIPT, "--", message, detail])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            match String::from_utf8_lossy(&output.stdout).trim() {
+                "Try Again" => LauncherAction::Retry,
+                "Settings…" => LauncherAction::Settings,
+                _ => LauncherAction::Quit,
+            }
+        }
+        _ => LauncherAction::Quit,
+    }
+}
+
+fn edit_settings(settings: &mut AppSettings) -> Result<()> {
+    loop {
+        let transport = format!("Connection: {}", settings.transport.label());
+        let rotation = format!(
+            "Auto-Rotate: {}",
+            if settings.auto_rotate { "On" } else { "Off" }
+        );
+        const SCRIPT: &str = r#"
+on run argv
+  set result to display dialog "Auto prefers USB when the same iPhone is also available over Wi-Fi." with title "iPhone Mirror Settings" buttons {"Done", item 2 of argv, item 1 of argv} default button "Done"
+  return button returned of result
+end run
+"#;
+        let output = std::process::Command::new("osascript")
+            .args(["-e", SCRIPT, "--", &transport, &rotation])
+            .output()?;
+        if !output.status.success() {
+            break;
+        }
+        match String::from_utf8_lossy(&output.stdout).trim() {
+            value if value == transport => {
+                settings.transport = match settings.transport {
+                    TransportPreference::Auto => TransportPreference::Usb,
+                    TransportPreference::Usb => TransportPreference::Wifi,
+                    TransportPreference::Wifi => TransportPreference::Auto,
+                };
+            }
+            value if value == rotation => settings.auto_rotate = !settings.auto_rotate,
+            _ => break,
+        }
+    }
+    save_settings(settings)
+}
+
 fn parse_command() -> Result<Command> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
@@ -611,7 +767,7 @@ fn print_help() {
     );
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -689,6 +845,7 @@ async fn supervise_mirror() -> Result<()> {
     }
 
     let executable = env::current_exe().context("Could not locate the iphone-mirror executable")?;
+    let mut settings = load_settings();
     let mut attempt = 0_u64;
     loop {
         attempt += 1;
@@ -699,6 +856,18 @@ async fn supervise_mirror() -> Result<()> {
         let mut child = tokio::process::Command::new(&executable)
             .arg("mirror")
             .env(WORKER_ENV, "1")
+            .env(
+                "IPHONE_MIRROR_TRANSPORT",
+                match settings.transport {
+                    TransportPreference::Auto => "auto",
+                    TransportPreference::Usb => "usb",
+                    TransportPreference::Wifi => "wifi",
+                },
+            )
+            .env(
+                "IPHONE_MIRROR_AUTO_ROTATE",
+                if settings.auto_rotate { "1" } else { "0" },
+            )
             .kill_on_drop(true)
             .spawn()
             .context("Failed to launch the mirror session worker")?;
@@ -717,10 +886,23 @@ async fn supervise_mirror() -> Result<()> {
 
         warn!(
             ?status,
-            "Mirror session ended; waiting for the iPhone before reconnecting"
+            "Mirror session ended; showing the connection launcher"
         );
+        match launcher_alert(
+            "No iPhone Connection",
+            &format!(
+                "iPhone Mirror could not start over {}.\n\nConnect and trust the iPhone. For Wi-Fi, enable ‘Show this iPhone when on Wi-Fi’ in Finder first.",
+                settings.transport.label()
+            ),
+        ) {
+            LauncherAction::Retry => {}
+            LauncherAction::Settings => {
+                edit_settings(&mut settings)?;
+            }
+            LauncherAction::Quit => return Ok(()),
+        }
         tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
             signal = tokio::signal::ctrl_c() => {
                 signal.context("Failed to listen for Ctrl-C")?;
                 return Ok(());
@@ -732,7 +914,15 @@ async fn supervise_mirror() -> Result<()> {
 async fn run_mirror() -> Result<()> {
     info!("Starting iphone-mirror-rs (Native 60fps macOS/Hackintosh Mirror)...");
 
-    let device = DeviceScanner::select_device(None).await?;
+    let settings = AppSettings {
+        transport: match env::var("IPHONE_MIRROR_TRANSPORT").as_deref() {
+            Ok("usb") => TransportPreference::Usb,
+            Ok("wifi") => TransportPreference::Wifi,
+            _ => TransportPreference::Auto,
+        },
+        auto_rotate: env::var("IPHONE_MIRROR_AUTO_ROTATE").as_deref() != Ok("0"),
+    };
+    let device = DeviceScanner::select_device_with_transport(None, settings.transport).await?;
     info!(udid = %device.udid, conn = %device.connection_type, "iPhone detected");
 
     let mut tunnel = RsdTunnel::connect(Box::new(device.provider())).await?;
@@ -1167,6 +1357,8 @@ async fn run_mirror() -> Result<()> {
         screenshot_requested: false,
         always_on_top: false,
         fullscreen: false,
+        auto_rotate: settings.auto_rotate,
+        frame_is_landscape: None,
         pressed_keys: BTreeSet::new(),
         modifiers: winit::keyboard::ModifiersState::empty(),
         clipboard: SystemClipboard::new(),
@@ -1185,7 +1377,7 @@ async fn run_mirror() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::offset_touch_position;
+    use super::{offset_touch_position, rotated_window_size};
 
     #[test]
     fn scroll_position_moves_and_clamps_to_touchscreen_bounds() {
@@ -1198,5 +1390,12 @@ mod tests {
             offset_touch_position((65_000, 65_000), (10_000, 10_000)),
             (u16::MAX, u16::MAX)
         );
+    }
+
+    #[test]
+    fn auto_rotate_swaps_window_axes_and_preserves_minimums() {
+        assert_eq!(rotated_window_size(420, 750, true), (750, 420));
+        assert_eq!(rotated_window_size(750, 420, false), (420, 750));
+        assert_eq!(rotated_window_size(100, 200, true), (500, 280));
     }
 }

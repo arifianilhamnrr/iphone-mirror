@@ -12,6 +12,15 @@ pub enum ConnectionType {
     Unknown(String),
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransportPreference {
+    #[default]
+    Auto,
+    Usb,
+    Wifi,
+}
+
 impl fmt::Display for ConnectionType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -89,21 +98,75 @@ impl DeviceScanner {
     }
 
     pub async fn select_device(udid: Option<&str>) -> Result<ConnectedDevice> {
-        let devices = Self::list_devices().await?;
+        Self::select_device_with_transport(udid, TransportPreference::Auto).await
+    }
+
+    pub async fn select_device_with_transport(
+        udid: Option<&str>,
+        transport: TransportPreference,
+    ) -> Result<ConnectedDevice> {
+        let mut devices = Self::list_devices().await?;
+
+        devices.retain(|device| match transport {
+            TransportPreference::Auto => true,
+            TransportPreference::Usb => device.connection_type == ConnectionType::Usb,
+            TransportPreference::Wifi => device.connection_type == ConnectionType::Network,
+        });
 
         if let Some(udid) = udid {
-            return devices
-                .into_iter()
-                .find(|device| device.udid == udid)
-                .with_context(|| format!("No connected iPhone matches UDID {udid}"));
+            devices.retain(|device| device.udid == udid);
         }
 
-        match devices.len() {
-            0 => anyhow::bail!("No iPhone detected. Connect and trust an iPhone first."),
-            1 => Ok(devices.into_iter().next().expect("length checked")),
+        // Finder Wi-Fi sync can expose one UDID over USB and Network at the
+        // same time. Treat that as one phone, preferring USB in Auto mode.
+        devices.sort_by_key(|device| match device.connection_type {
+            ConnectionType::Usb => 0,
+            ConnectionType::Network => 1,
+            ConnectionType::Unknown(_) => 2,
+        });
+        let unique_udids = devices
+            .iter()
+            .map(|device| device.udid.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        if unique_udids.len() == 1 {
+            return Ok(devices.remove(0));
+        }
+
+        match unique_udids.len() {
+            0 if udid.is_some() => anyhow::bail!(
+                "No connected iPhone matches UDID {} over {}",
+                udid.expect("checked"),
+                transport.label()
+            ),
+            0 => anyhow::bail!(
+                "No iPhone detected over {}. Connect and trust an iPhone first.",
+                transport.label()
+            ),
             count => anyhow::bail!(
                 "Found {count} iPhones. Select one with `iphone-mirror diagnose --udid <UDID>`."
             ),
         }
+    }
+}
+
+impl TransportPreference {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "USB or Wi-Fi",
+            Self::Usb => "USB",
+            Self::Wifi => "Wi-Fi",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TransportPreference;
+
+    #[test]
+    fn transport_labels_are_human_readable() {
+        assert_eq!(TransportPreference::Auto.label(), "USB or Wi-Fi");
+        assert_eq!(TransportPreference::Wifi.label(), "Wi-Fi");
     }
 }

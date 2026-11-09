@@ -67,6 +67,10 @@ The default `mirror` command establishes the CoreDevice tunnel and display-servi
 
 If the cable, tunnel, or display session drops, the supervisor waits two seconds and starts a fresh session automatically. The mirror window closes while disconnected and reappears after reconnection. Closing the window normally stops the supervisor.
 
+When no iPhone is available, the app shows a launcher dialog instead of leaving a blank mirror window. From there choose **Try Again**, **Settings…**, or **Quit**. Settings are also available while mirroring with the standard macOS shortcut `Cmd+,` and are persisted under `~/Library/Application Support/iPhone Mirror/settings.json`.
+
+Connection mode can be **Auto**, **USB**, or **Wi-Fi**. Auto treats USB and Network records with the same UDID as one phone and prefers USB; Wi-Fi mode requires enabling **Show this iPhone when on Wi-Fi** in Finder while the phone is paired. The selected mode is used on the next connection/reconnect.
+
 Click or drag inside the displayed phone image to send touchscreen input. Clicks in letterbox/pillarbox regions are ignored.
 
 Use a two-finger trackpad gesture (or a mouse wheel) while the pointer is over the mirrored phone to scroll. The wheel stream is translated into a continuous touchscreen drag beginning at the pointer position, so it works with ordinary iOS lists and web views rather than relying on a digital-crown HID event.
@@ -89,6 +93,9 @@ Keyboard shortcuts (hold Control):
 | `Ctrl+S` | Save a PNG to `~/Pictures/iPhone Mirror` |
 | `Ctrl+T` | Toggle always-on-top |
 | `Ctrl+Cmd+F` | Toggle borderless fullscreen |
+| `Cmd+,` | Open connection and auto-rotate settings |
+
+Auto-Rotate is enabled by default. When the incoming frame changes between portrait and landscape, the window swaps its dimensions while preserving aspect-fit rendering and touch/scroll mapping. Fullscreen size is not changed.
 
 ---
 
