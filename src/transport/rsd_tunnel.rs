@@ -16,6 +16,24 @@ pub struct RsdTunnel {
 }
 
 impl RsdTunnel {
+    /// Build a tunnel from an already-established adapter and RSD handshake
+    /// (used by the Wi-Fi RemotePairing path).
+    pub fn from_parts(adapter: idevice::tcp::handle::AdapterHandle, handshake: RsdHandshake) -> Self {
+        let services: Vec<String> = handshake.services.keys().cloned().collect();
+        info!(available_services = ?services, "RSD Handshake succeeded");
+        if !services.iter().any(|s| s == DISPLAY_SERVICE) {
+            warn!(
+                service = DISPLAY_SERVICE,
+                "Display service not found in RSD catalog. DDI (DeveloperDiskImage) may need mounting."
+            );
+        }
+        Self {
+            adapter,
+            handshake,
+            services,
+        }
+    }
+
     /// Connect to device proxy, start software tunnel, and perform RSD handshake
     pub async fn connect(provider: Box<dyn IdeviceProvider>) -> Result<Self> {
         info!("Connecting to CoreDeviceProxy...");

@@ -6,7 +6,13 @@ struct Device: Codable, Identifiable, Hashable {
     let udid: String
     let connection_type: ConnectionType
     let device_id: UInt32
+    let host: String?
+    let port: UInt16?
+    let name: String?
+
     var id: String { "\(udid)-\(connection_type.id)" }
+    var isRemote: Bool { host != nil && port != nil }
+    var displayName: String { name ?? (connection_type == .usb ? "iPhone (USB)" : "iPhone (Wi-Fi)") }
 }
 
 struct NearbyDevice: Identifiable, Hashable {
@@ -109,7 +115,8 @@ final class LauncherModel: ObservableObject {
         scanTask = Task {
             while !Task.isCancelled {
                 await scan()
-                try? await Task.sleep(for: .seconds(2))
+                // Wi-Fi discovery runs dns-sd browse + resolve, so scan less often.
+                try? await Task.sleep(for: .seconds(4))
             }
         }
     }
@@ -195,6 +202,17 @@ final class LauncherModel: ObservableObject {
         environment["IPHONE_MIRROR_UDID"] = device.udid
         environment["IPHONE_MIRROR_TRANSPORT"] = device.connection_type == .network ? "wifi" : "usb"
         environment["IPHONE_MIRROR_AUTO_ROTATE"] = autoRotate ? "1" : "0"
+        if device.isRemote, let host = device.host, let port = device.port {
+            environment["IPHONE_MIRROR_WIFI_HOST"] = host
+            environment["IPHONE_MIRROR_WIFI_PORT"] = String(port)
+            environment["IPHONE_MIRROR_WIFI_NAME"] = device.name ?? device.udid
+            environment["IPHONE_MIRROR_WIFI_IDENTIFIER"] = device.udid
+        } else {
+            environment.removeValue(forKey: "IPHONE_MIRROR_WIFI_HOST")
+            environment.removeValue(forKey: "IPHONE_MIRROR_WIFI_PORT")
+            environment.removeValue(forKey: "IPHONE_MIRROR_WIFI_NAME")
+            environment.removeValue(forKey: "IPHONE_MIRROR_WIFI_IDENTIFIER")
+        }
         process.environment = environment
         let logURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("iphone-mirror-backend.log")
@@ -246,8 +264,9 @@ struct DeviceRow: View {
                 .frame(width: 28, height: 28)
                 .foregroundStyle(selected ? Color.white : Color.accentColor)
             VStack(alignment: .leading, spacing: 3) {
-                Text("iPhone")
+                Text(device.displayName)
                     .font(.system(size: 14, weight: .semibold))
+                    .lineLimit(1)
                 Text(device.connection_type.label)
                     .font(.system(size: 12))
                     .foregroundStyle(selected ? Color.white.opacity(0.78) : Color.secondary)
@@ -303,8 +322,8 @@ struct ContentView: View {
                         Text("No iPhone found")
                             .font(.system(size: 14, weight: .semibold))
                         Text(model.transport == "wifi"
-                            ? "Pair once by cable, then enable “Show this iPhone when on Wi-Fi” in Finder."
-                            : "Connect by USB, or choose Wi-Fi after pairing in Finder.")
+                            ? "Run `iphone-mirror pair` once with the cable connected, then enable “Show this iPhone when on Wi-Fi” in Finder."
+                            : "Connect by USB, or pair once with `iphone-mirror pair` for Wi-Fi.")
                             .font(.system(size: 12))
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)

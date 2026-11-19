@@ -18,6 +18,7 @@ Experimental native iPhone screen mirroring client in Rust for **macOS 26 Tahoe*
 - Hardware-tested: full-resolution PNG screenshots, fullscreen, and always-on-top window controls.
 - Implemented: automatic session restart after a stream/tunnel failure; each retry recreates CoreDevice, VideoToolbox, AudioToolbox, HID, and clipboard state cleanly.
 - Implemented: automatic DeveloperDiskImage repair when `com.apple.coredevice.displayservice` is missing from the RSD catalog. iOS 27+ devices get a compatible Cryptex1 DDI downloaded and installed through `cryptexd` (including unmounting a stale Xcode 26 image), so an iOS update or a reboot no longer leaves mirroring broken.
+- Implemented: direct Wi-Fi mirroring over a RemotePairing TLS-PSK tunnel with Bonjour discovery and one-time USB pairing.
 - In progress: file clipboard payloads and drag-and-drop transfer.
 - Planned: app-bundle polish and performance hardening.
 - Performance and zero-copy behavior have not been benchmarked yet.
@@ -44,6 +45,9 @@ cargo build --release
 
 # Select a device when multiple iPhones are connected
 ./target/release/iphone-mirror diagnose --udid <UDID>
+
+# Pair once over USB so Wi-Fi mirroring works without a cable afterwards
+./target/release/iphone-mirror pair
 ```
 
 Set `IPHONE_MIRROR_LIST_SERVICES=1` to include the full RSD service catalog in diagnostic output. Use `RUST_LOG=debug` for detailed logs.
@@ -74,7 +78,7 @@ Disconnecting from the SwiftUI launcher, closing the mirror window, sending SIGT
 
 The app bundle opens a native SwiftUI launcher instead of starting with an empty mirror window. It continuously scans for ready USB/Finder Wi-Fi devices, shows nearby Bonjour iPhones that still need pairing, lets you select a device and transport, and starts the Rust media backend only after **Start Mirroring**. Settings use the standard macOS `Cmd+,` window and persist through `UserDefaults`.
 
-Connection mode can be **Auto**, **USB**, or **Wi-Fi** from the launcher sidebar or Settings. Auto treats USB and Network records with the same UDID as one phone and prefers USB. Bonjour scans `_remotepairing._tcp` and `_apple-mobdev2._tcp`; a Bonjour-only result is labeled as nearby and must be paired/enabled in Finder before it becomes connectable. Finder-ready Network records can be mirrored directly over Wi-Fi.
+Connection mode can be **Auto**, **USB**, or **Wi-Fi** from the launcher sidebar or Settings. Auto treats USB and Network records with the same UDID as one phone and prefers USB. Wi-Fi uses a direct RemotePairing TLS-PSK tunnel: the backend discovers `_remotepairing._tcp` with `dns-sd`, pairs once over USB (`iphone-mirror pair`, or accept the on-device prompt on first connection), and stores the identity in `~/Library/Application Support/iPhone Mirror/rppairing.plist`. After that, mirroring over Wi-Fi needs no cable and no usbmuxd Network record. Finder Wi-Fi sync still works as before for the USB/Auto path.
 
 Click or drag inside the displayed phone image to send touchscreen input. Clicks in letterbox/pillarbox regions are ignored.
 

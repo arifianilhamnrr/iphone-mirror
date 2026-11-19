@@ -21,6 +21,7 @@ use iphone_mirror_rs::{
         ddi_mounter::DdiMounter,
         device_scanner::{ConnectedDevice, DeviceScanner, TransportPreference},
         rsd_tunnel::RsdTunnel,
+        wifi::{self, WifiDevice},
     },
     ui::metal_renderer::MetalRenderer,
 };
@@ -37,6 +38,7 @@ enum Command {
     Mirror,
     Devices { json: bool },
     Diagnose { udid: Option<String> },
+    Pair { udid: Option<String> },
     Help,
 }
 
@@ -826,6 +828,18 @@ fn parse_command() -> Result<Command> {
             }
             Ok(Command::Diagnose { udid })
         }
+        Some("pair") => {
+            let mut udid = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--udid" => {
+                        udid = Some(args.next().context("--udid requires a value")?);
+                    }
+                    _ => anyhow::bail!("Unknown pair option: {arg}"),
+                }
+            }
+            Ok(Command::Pair { udid })
+        }
         Some("help" | "--help" | "-h") => Ok(Command::Help),
         Some(command) => anyhow::bail!("Unknown command: {command}. Run with --help for usage."),
     }
@@ -837,7 +851,8 @@ fn print_help() {
          Usage:\n  \
            iphone-mirror [mirror]\n  \
            iphone-mirror devices\n  \
-           iphone-mirror diagnose [--udid <UDID>]\n"
+           iphone-mirror diagnose [--udid <UDID>]\n  \
+           iphone-mirror pair [--udid <UDID>]\n"
     );
 }
 
@@ -854,6 +869,7 @@ async fn main() -> Result<()> {
         Command::Mirror => supervise_mirror().await,
         Command::Devices { json } => list_devices(json).await,
         Command::Diagnose { udid } => diagnose(udid.as_deref()).await,
+        Command::Pair { udid } => pair_device(udid.as_deref()).await,
         Command::Help => {
             print_help();
             Ok(())
@@ -861,10 +877,54 @@ async fn main() -> Result<()> {
     }
 }
 
+#[derive(serde::Serialize)]
+struct DeviceJson {
+    udid: String,
+    connection_type: &'static str,
+    device_id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+}
+
 async fn list_devices(json: bool) -> Result<()> {
-    let devices = DeviceScanner::list_devices()
+    let mut devices: Vec<DeviceJson> = DeviceScanner::list_devices()
         .await
-        .context("Could not scan usbmuxd devices")?;
+        .context("Could not scan usbmuxd devices")?
+        .into_iter()
+        .map(|device| DeviceJson {
+            udid: device.udid,
+            connection_type: match device.connection_type {
+                iphone_mirror_rs::transport::device_scanner::ConnectionType::Usb => "usb",
+                iphone_mirror_rs::transport::device_scanner::ConnectionType::Network => "network",
+                iphone_mirror_rs::transport::device_scanner::ConnectionType::Unknown(_) => "unknown",
+            },
+            device_id: device.device_id,
+            host: None,
+            port: None,
+            name: None,
+        })
+        .collect();
+
+    match wifi::WifiDiscovery::discover().await {
+        Ok(remote) => {
+            for device in remote {
+                debug!(name = %device.name, host = %device.host, port = device.port, "Found Wi-Fi iPhone");
+                devices.push(DeviceJson {
+                    udid: device.identifier,
+                    connection_type: "network",
+                    device_id: 0,
+                    host: Some(device.host),
+                    port: Some(device.port),
+                    name: Some(device.name),
+                });
+            }
+        }
+        Err(error) => debug!(%error, "Wi-Fi discovery failed"),
+    }
 
     if json {
         println!("{}", serde_json::to_string(&devices)?);
@@ -876,22 +936,48 @@ async fn list_devices(json: bool) -> Result<()> {
     }
 
     for device in devices {
-        println!(
-            "{}\t{}\tdevice-id={}",
-            device.udid, device.connection_type, device.device_id
-        );
+        match (device.host, device.port) {
+            (Some(host), Some(port)) => println!(
+                "{}\t{}\t{host}:{port}",
+                device.udid, device.connection_type
+            ),
+            _ => println!(
+                "{}\t{}\tdevice-id={}",
+                device.udid, device.connection_type, device.device_id
+            ),
+        }
     }
     Ok(())
 }
 
-async fn diagnose(udid: Option<&str>) -> Result<()> {
+async fn pair_device(udid: Option<&str>) -> Result<()> {
     let device = DeviceScanner::select_device(udid).await?;
-    println!("Device: {} ({})", device.udid, device.connection_type);
-    println!("usbmuxd: connected");
+    println!(
+        "Pairing with {} over USB. Accept the prompt on the iPhone if it appears.",
+        device.udid
+    );
+    wifi::pair_via_usb(&device.provider()).await?;
+    println!("Paired. Wi-Fi mirroring is now available for this Mac.");
+    Ok(())
+}
 
-    let tunnel = RsdTunnel::connect(Box::new(device.provider()))
-        .await
-        .context("CoreDevice/RSD diagnostics failed")?;
+async fn diagnose(udid: Option<&str>) -> Result<()> {
+    let wifi_device = wifi::endpoint_from_env();
+    let usb_device = if wifi_device.is_none() {
+        Some(DeviceScanner::select_device(udid).await?)
+    } else {
+        None
+    };
+    let source = if let Some(wifi_device) = &wifi_device {
+        println!("Device: {} (Wi-Fi)", wifi_device.identifier);
+        TunnelSource::Wifi(wifi_device)
+    } else {
+        let device = usb_device.as_ref().expect("USB device selected above");
+        println!("Device: {} ({})", device.udid, device.connection_type);
+        TunnelSource::Usb(device)
+    };
+
+    let tunnel = source.connect().await.context("CoreDevice/RSD diagnostics failed")?;
 
     println!("RSD: connected ({} services)", tunnel.services.len());
     println!(
@@ -989,11 +1075,30 @@ async fn supervise_mirror() -> Result<()> {
     }
 }
 
+/// Where the RSD tunnel comes from. USB goes through usbmuxd; Wi-Fi uses a
+/// RemotePairing TLS-PSK tunnel and already provides an adapter/handshake.
+enum TunnelSource<'a> {
+    Usb(&'a ConnectedDevice),
+    Wifi(&'a WifiDevice),
+}
+
+impl TunnelSource<'_> {
+    async fn connect(&self) -> Result<RsdTunnel> {
+        match self {
+            Self::Usb(device) => RsdTunnel::connect(Box::new(device.provider())).await,
+            Self::Wifi(device) => {
+                let (adapter, handshake) = wifi::connect(device).await?;
+                Ok(RsdTunnel::from_parts(adapter, handshake))
+            }
+        }
+    }
+}
+
 /// Connect to the device's RSD services, repairing the DeveloperDiskImage when
 /// the display service is missing from the catalog. Installing the DDI changes
 /// the advertised service list, so a fresh tunnel is opened to pick it up.
-async fn connect_tunnel_with_ddi(device: &ConnectedDevice) -> Result<RsdTunnel> {
-    let mut tunnel = RsdTunnel::connect(Box::new(device.provider())).await?;
+async fn connect_tunnel_with_ddi(source: &TunnelSource<'_>) -> Result<RsdTunnel> {
+    let mut tunnel = source.connect().await?;
     if tunnel.has_display_service() {
         return Ok(tunnel);
     }
@@ -1012,7 +1117,7 @@ async fn connect_tunnel_with_ddi(device: &ConnectedDevice) -> Result<RsdTunnel> 
 
     for attempt in 1..=4 {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        tunnel = RsdTunnel::connect(Box::new(device.provider())).await?;
+        tunnel = source.connect().await?;
         if tunnel.has_display_service() {
             info!(attempt, "Display service available after DDI install");
             return Ok(tunnel);
@@ -1038,12 +1143,28 @@ async fn run_mirror() -> Result<()> {
         auto_rotate: env::var("IPHONE_MIRROR_AUTO_ROTATE").as_deref() != Ok("0"),
     };
     let selected_udid = env::var("IPHONE_MIRROR_UDID").ok();
-    let device =
-        DeviceScanner::select_device_with_transport(selected_udid.as_deref(), settings.transport)
-            .await?;
-    info!(udid = %device.udid, conn = %device.connection_type, "iPhone detected");
+    let wifi_device = wifi::endpoint_from_env();
+    let usb_device = if wifi_device.is_none() {
+        Some(
+            DeviceScanner::select_device_with_transport(
+                selected_udid.as_deref(),
+                settings.transport,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let source = if let Some(wifi_device) = &wifi_device {
+        info!(host = %wifi_device.host, port = wifi_device.port, name = %wifi_device.name, "Wi-Fi iPhone selected");
+        TunnelSource::Wifi(wifi_device)
+    } else {
+        let device = usb_device.as_ref().expect("USB device selected above");
+        info!(udid = %device.udid, conn = %device.connection_type, "iPhone detected");
+        TunnelSource::Usb(device)
+    };
 
-    let mut tunnel = connect_tunnel_with_ddi(&device).await?;
+    let mut tunnel = connect_tunnel_with_ddi(&source).await?;
     if !tunnel.has_display_service() {
         anyhow::bail!(
             "Display service is unavailable. Enable Developer Mode and ensure the developer image is mounted."

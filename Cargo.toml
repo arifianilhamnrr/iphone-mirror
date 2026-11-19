@@ -24,6 +24,7 @@ idevice = { git = "https://github.com/jkcoxson/idevice", rev = "89702099f4d7552f
     "cryptexd",
     "display_stream",
     "mobile_image_mounter",
+    "remote_pairing",
     "ring",
     "tunnel_tcp_stack",
     "usbmuxd",
