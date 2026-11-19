@@ -10,6 +10,9 @@ pub struct H265Depacketizer {
     fu_buffer: Vec<u8>,
     is_assembling_fu: bool,
     expected_seq: Option<u16>,
+    /// Set when an RTP sequence gap is seen; the caller should send a RTCP
+    /// Picture Loss Indication so the device emits a fresh keyframe.
+    pub sequence_gap: bool,
 }
 
 impl H265Depacketizer {
@@ -18,6 +21,7 @@ impl H265Depacketizer {
             fu_buffer: Vec::with_capacity(65536),
             is_assembling_fu: false,
             expected_seq: None,
+            sequence_gap: false,
         }
     }
 
@@ -35,6 +39,7 @@ impl H265Depacketizer {
                     received = pkt.sequence_number,
                     expected, "RTP sequence gap detected, discarding partial FU buffer"
                 );
+                self.sequence_gap = true;
                 self.fu_buffer.clear();
                 self.is_assembling_fu = false;
             }

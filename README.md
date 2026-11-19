@@ -19,6 +19,7 @@ Experimental native iPhone screen mirroring client in Rust for **macOS 26 Tahoe*
 - Implemented: automatic session restart after a stream/tunnel failure; each retry recreates CoreDevice, VideoToolbox, AudioToolbox, HID, and clipboard state cleanly.
 - Implemented: automatic DeveloperDiskImage repair when `com.apple.coredevice.displayservice` is missing from the RSD catalog. iOS 27+ devices get a compatible Cryptex1 DDI downloaded and installed through `cryptexd` (including unmounting a stale Xcode 26 image), so an iOS update or a reboot no longer leaves mirroring broken.
 - Implemented: direct Wi-Fi mirroring over a RemotePairing TLS-PSK tunnel with Bonjour discovery and one-time USB pairing.
+- Implemented: RTCP receiver reports and Picture Loss Indication for both media streams, plus automatic media-session restart when the decoded video stalls, so a burst of RTP loss no longer leaves the picture frozen permanently.
 - In progress: file clipboard payloads and drag-and-drop transfer.
 - Planned: app-bundle polish and performance hardening.
 - Performance and zero-copy behavior have not been benchmarked yet.
@@ -88,7 +89,7 @@ Text and image clipboard contents synchronize automatically in both directions w
 
 Focus the mirror window and type while an editable field is active on the iPhone. Keyboard input uses physical USB HID usages, including Shift, Control, Option, and Command modifiers. The current implementation follows the physical key layout rather than macOS text composition, so IME/dead-key input is not supported yet.
 
-While a mirror session is active, the iPhone's system audio is decoded (AAC-ELD, 48 kHz stereo) and played through the host Mac's current output device. Audio starts automatically and is kept alive with RTCP receiver reports; press `Ctrl+M` to mute playback locally. While muted, the queue receives 10 ms silent PCM frames instead of changing native AudioQueue volume/state. On unmute the host output queue is recreated before live PCM resumes, avoiding output units that remain silent on some Hackintosh audio drivers without disturbing RTP or AAC decoder state. Set `IPHONE_MIRROR_AUDIO_DUMP=/some/directory` to write `au.bin` (length-prefixed access units) and `pcm.raw` for diagnostics.
+While a mirror session is active, the iPhone's system audio is decoded (AAC-ELD, 48 kHz stereo) and played through the host Mac's current output device. Audio starts automatically and is kept alive with RTCP receiver reports sent to the `RTCPRemotePort` from the negotiation answer; press `Ctrl+M` to mute playback locally. While muted, the queue receives 10 ms silent PCM frames instead of changing native AudioQueue volume/state. On unmute the host output queue is recreated before live PCM resumes, avoiding output units that remain silent on some Hackintosh audio drivers without disturbing RTP or AAC decoder state. Set `IPHONE_MIRROR_AUDIO_DUMP=/some/directory` to write `au.bin` (length-prefixed access units) and `pcm.raw` for diagnostics.
 
 Keyboard shortcuts (hold Control):
 

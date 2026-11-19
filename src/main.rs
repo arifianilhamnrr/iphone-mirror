@@ -29,7 +29,7 @@ use std::collections::BTreeSet;
 use std::env;
 use std::io::Write;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use tracing::{debug, info, warn};
@@ -1325,11 +1325,22 @@ async fn run_mirror() -> Result<()> {
 
     tokio::spawn(async move {
         let result: Result<()> = async {
+            let mut tunnel = tunnel;
             let mut depacketizer = H265Depacketizer::new();
             let mut parameter_sets = ParameterSetCache::new();
             let mut decoder: Option<HardwareDecoder> = None;
+            let mut decoder_sets: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = None;
+            let decoded_frames = Arc::new(AtomicU64::new(0));
+            let mut frames_at_check = 0_u64;
+            let mut last_nal_at_check = 0_u64;
+            let mut decoder_stalled_ticks = 0_u32;
+            let mut decoder_check = tokio::time::interval(std::time::Duration::from_secs(1));
+            decoder_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut decode_failures = 0_u32;
             let mut nal_count = 0_u64;
             let mut audio_packet_count = 0_u64;
+            let mut video_highest_sequence = 0_u32;
+            let mut last_pli = std::time::Instant::now();
             let mut audio_highest_sequence = 0_u32;
             let mut audio_decode_errors = 0_u32;
             let mut audio_decoder = AacEldDecoder::new()?;
@@ -1360,27 +1371,102 @@ async fn run_mirror() -> Result<()> {
                         if RtpPacket::is_rtcp(&packet) {
                             continue;
                         }
-                        match RtpPacket::parse(&packet).and_then(|packet| depacketizer.process_packet(&packet)) {
+                        match RtpPacket::parse(&packet) {
+                            Ok(rtp) => {
+                            let seq = rtp.sequence_number as u32;
+                            let cycles = video_highest_sequence >> 16;
+                            let last = video_highest_sequence & 0xFFFF;
+                            let cycles = if seq < last && last - seq > 0x8000 { cycles + 1 } else { cycles };
+                            let extended = (cycles << 16) | seq;
+                            if video_highest_sequence == 0
+                                || extended.wrapping_sub(video_highest_sequence) < 0x8000_0000
+                            {
+                                video_highest_sequence = extended;
+                            }
+                            match depacketizer.process_packet(&rtp) {
                             Ok(nals) => for nal in nals {
                                 nal_count += 1;
                                 parameter_sets.inspect_and_cache(&nal);
-                                if decoder.is_none() && parameter_sets.is_complete() {
-                                    let format = FormatDescription::from_hevc_parameter_sets(
-                                        parameter_sets.vps.as_deref().expect("cache complete"),
-                                        parameter_sets.sps.as_deref().expect("cache complete"),
-                                        parameter_sets.pps.as_deref().expect("cache complete"),
-                                    )?;
-                                    decoder = Some(HardwareDecoder::new(format, frame_tx.clone())?);
+
+                                // iOS can change VPS/SPS/PPS mid-stream (rotation,
+                                // resolution change, encoder reset). A decoder built
+                                // from the old set then silently rejects every frame,
+                                // which looks like a frozen window while RTP keeps
+                                // arriving. Rebuild it whenever the sets change.
+                                let current_sets = match (
+                                    parameter_sets.vps.as_ref(),
+                                    parameter_sets.sps.as_ref(),
+                                    parameter_sets.pps.as_ref(),
+                                ) {
+                                    (Some(vps), Some(sps), Some(pps)) => {
+                                        Some((vps.clone(), sps.clone(), pps.clone()))
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(sets) = current_sets {
+                                    if decoder_sets.as_ref() != Some(&sets) {
+                                        let format = FormatDescription::from_hevc_parameter_sets(
+                                            &sets.0, &sets.1, &sets.2,
+                                        )?;
+                                        decoder = Some(HardwareDecoder::new(format, frame_tx.clone(), decoded_frames.clone())?);
+                                        decoder_sets = Some(sets);
+                                        decode_failures = 0;
+                                        info!(nal_count, "VideoToolbox decoder ready for current HEVC parameter sets");
+                                    }
                                 }
+
+                                let mut recreate_decoder = false;
                                 if let Some(decoder) = decoder.as_mut() {
                                     if let Err(error) = decoder.decode_nal(&nal) {
-                                        debug!(%error, "VideoToolbox rejected a NAL unit");
+                                        decode_failures += 1;
+                                        if decode_failures == 1 || decode_failures % 100 == 0 {
+                                            debug!(%error, decode_failures, "VideoToolbox rejected a NAL unit");
+                                        }
+                                        // A sustained run of rejections means the
+                                        // decoder no longer matches the stream even
+                                        // if the parameter sets looked unchanged.
+                                        if decode_failures >= 500 {
+                                            recreate_decoder = true;
+                                        }
+                                    } else {
+                                        decode_failures = 0;
+                                    }
+                                }
+                                if recreate_decoder {
+                                    if let Some(sets) = decoder_sets.take() {
+                                        warn!(decode_failures, "Recreating VideoToolbox decoder after repeated rejections");
+                                        let format = FormatDescription::from_hevc_parameter_sets(
+                                            &sets.0, &sets.1, &sets.2,
+                                        )?;
+                                        decoder = Some(HardwareDecoder::new(format, frame_tx.clone(), decoded_frames.clone())?);
+                                        decoder_sets = Some(sets);
+                                        decode_failures = 0;
                                     }
                                 }
                                 if nal_count % 300 == 0 {
                                     info!(nal_count, "Receiving active HEVC stream");
                                 }
                             },
+                            Err(error) => debug!(%error, "Dropped malformed video NAL"),
+                            }
+
+                            if depacketizer.sequence_gap {
+                                depacketizer.sequence_gap = false;
+                                if last_pli.elapsed() >= std::time::Duration::from_millis(500) {
+                                    if let Some(pli) = client.video_pli() {
+                                        match client.send_video_rtcp(pli).await {
+                                            Ok(()) => {
+                                                info!("Sent RTCP PLI after video packet loss");
+                                                last_pli = std::time::Instant::now();
+                                            }
+                                            Err(error) => {
+                                                debug!(%error, "Failed to send video PLI")
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            }
                             Err(error) => debug!(%error, "Dropped malformed media packet"),
                         }
                     }
@@ -1504,6 +1590,45 @@ async fn run_mirror() -> Result<()> {
                             if let Err(error) = client.send_audio_rtcp(report).await {
                                 debug!(%error, "Failed to send the audio RTCP keepalive");
                             }
+                        }
+                        if let Some(report) = client.video_rtcp_report(video_highest_sequence) {
+                            if let Err(error) = client.send_video_rtcp(report).await {
+                                debug!(%error, "Failed to send the video RTCP keepalive");
+                            }
+                        }
+                    }
+                    _ = decoder_check.tick() => {
+                        let frames = decoded_frames.load(Ordering::Relaxed);
+                        if frames > frames_at_check {
+                            frames_at_check = frames;
+                            last_nal_at_check = nal_count;
+                            decoder_stalled_ticks = 0;
+                        } else {
+                            decoder_stalled_ticks += 1;
+                        }
+                        if decoder_stalled_ticks >= 3
+                            && nal_count > last_nal_at_check + 30
+                            && decoder_sets.is_some()
+                        {
+                            // RTP keeps arriving but VideoToolbox has stopped
+                            // emitting frames (e.g. after a burst of lost
+                            // reference frames). A fresh session recovers it.
+                            warn!(
+                                nal_count,
+                                frames, "Video decoder stopped producing frames; restarting media session"
+                            );
+                            client.restart(&mut tunnel, 1).await?;
+                            depacketizer = H265Depacketizer::new();
+                            parameter_sets = ParameterSetCache::new();
+                            decoder = None;
+                            decoder_sets = None;
+                            video_highest_sequence = 0;
+                            audio_highest_sequence = 0;
+                            decode_failures = 0;
+                            decoder_stalled_ticks = 0;
+                            frames_at_check = frames;
+                            last_nal_at_check = nal_count;
+                            info!("Media session restarted after video stall");
                         }
                     }
                     changed = shutdown_rx.changed() => {

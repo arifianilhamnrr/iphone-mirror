@@ -2,7 +2,14 @@
 use crate::codec::format_desc::FormatDescription;
 use crate::codec::videotoolbox_sys::*;
 use anyhow::{bail, Result};
-use std::{ffi::c_void, ptr};
+use std::{
+    ffi::c_void,
+    ptr,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -51,6 +58,7 @@ impl Drop for DecodedFrame {
 
 struct CallbackContext {
     frame_tx: mpsc::Sender<DecodedFrame>,
+    frame_count: Arc<AtomicU64>,
 }
 
 pub struct HardwareDecoder {
@@ -80,6 +88,7 @@ impl HardwareDecoder {
         }
 
         let context = unsafe { &*(decompression_output_ref_con as *const CallbackContext) };
+        context.frame_count.fetch_add(1, Ordering::Relaxed);
         let retained = unsafe { CVPixelBufferRetain(image_buffer) };
         let frame = DecodedFrame {
             pixel_buffer: retained,
@@ -95,10 +104,14 @@ impl HardwareDecoder {
     pub fn new(
         format_desc: FormatDescription,
         frame_tx: mpsc::Sender<DecodedFrame>,
+        frame_count: Arc<AtomicU64>,
     ) -> Result<Self> {
         #[cfg(target_os = "macos")]
         {
-            let mut callback_context = Box::new(CallbackContext { frame_tx });
+            let mut callback_context = Box::new(CallbackContext {
+                frame_tx,
+                frame_count,
+            });
             let callback_record = VTDecompressionOutputCallbackRecord {
                 decompression_output_callback: Some(Self::decode_callback),
                 decompression_output_ref_con: (&mut *callback_context as *mut CallbackContext)
@@ -131,7 +144,7 @@ impl HardwareDecoder {
 
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (format_desc, frame_tx);
+            let _ = (format_desc, frame_tx, frame_count);
             bail!("Hardware VideoToolbox decoding is only available on macOS");
         }
     }

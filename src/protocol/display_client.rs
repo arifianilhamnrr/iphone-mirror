@@ -16,20 +16,21 @@ const CLIENT_SUPPORTED_FEATURES: u64 = 140;
 const SERVICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 #[derive(Debug, Clone, Copy)]
-pub struct AudioSession {
+pub struct RtcpSession {
     /// SSRC the device expects in our RTCP sender field.
     local_ssrc: u32,
     /// SSRC carried by the device's RTP stream.
     remote_ssrc: u32,
-    /// Device source port where RTCP reports are delivered.
+    /// Port from the negotiation answer where RTCP reports must be delivered.
     rtcp_port: u16,
 }
 
 pub struct DisplayClient {
     client: DisplayServiceClient<Box<dyn ReadWrite>>,
     audio_udp: UdpSocketHandle,
-    audio_session: Option<AudioSession>,
+    audio_session: Option<RtcpSession>,
     video_udp: UdpSocketHandle,
+    video_session: Option<RtcpSession>,
 }
 
 impl DisplayClient {
@@ -43,6 +44,37 @@ impl DisplayClient {
         .context("Timed out connecting to displayservice")?
         .context("Failed to connect to displayservice")?;
 
+        let (audio_udp, audio_session, video_udp, video_session) =
+            Self::negotiate(&mut client, tunnel, display_id).await?;
+
+        Ok(Self {
+            client,
+            audio_udp,
+            audio_session,
+            video_udp,
+            video_session,
+        })
+    }
+
+    /// Stop and renegotiate a stalled media session. This makes the device
+    /// start a fresh encoder stream with new parameter sets and an IDR frame,
+    /// which is the only reliable recovery from a burst of lost video packets.
+    pub async fn restart(&mut self, tunnel: &mut RsdTunnel, display_id: i64) -> Result<()> {
+        let _ = tokio::time::timeout(SERVICE_TIMEOUT, self.client.stop_media_stream()).await;
+        let (audio_udp, audio_session, video_udp, video_session) =
+            Self::negotiate(&mut self.client, tunnel, display_id).await?;
+        self.audio_udp = audio_udp;
+        self.audio_session = audio_session;
+        self.video_udp = video_udp;
+        self.video_session = video_session;
+        Ok(())
+    }
+
+    async fn negotiate(
+        client: &mut DisplayServiceClient<Box<dyn ReadWrite>>,
+        tunnel: &mut RsdTunnel,
+        display_id: i64,
+    ) -> Result<(UdpSocketHandle, Option<RtcpSession>, UdpSocketHandle, Option<RtcpSession>)> {
         let audio_udp = tunnel
             .adapter
             .bind_udp(0)
@@ -78,7 +110,7 @@ impl DisplayClient {
                 .context("Display service rejected the audio media stream")?;
         dump_answer("audio", &audio_answer);
         log_audio_negotiation(&audio_answer);
-        let audio_session = audio_session_from_answer(&audio_answer);
+        let audio_session = rtcp_session_from_answer(&audio_answer);
         if audio_session.is_none() {
             tracing::warn!("Audio streamConfig is missing SSRC/RTCP fields; keepalive disabled");
         }
@@ -110,6 +142,10 @@ impl DisplayClient {
                 }
             };
         dump_answer("video", &video_answer);
+        let video_session = rtcp_session_from_answer(&video_answer);
+        if video_session.is_none() {
+            tracing::warn!("Video streamConfig is missing SSRC/RTCP fields; loss recovery disabled");
+        }
 
         info!(
             %session_id,
@@ -118,18 +154,12 @@ impl DisplayClient {
             "Display stream negotiated"
         );
 
-        Ok(Self {
-            client,
-            audio_udp,
-            audio_session,
-            video_udp,
-        })
+        Ok((audio_udp, audio_session, video_udp, video_session))
     }
 
-    /// Build a compound RTCP Receiver Report + SDES for the audio stream.
-    /// The device stops emitting audio after `RTCPTimeoutInterval` without it.
-    pub fn audio_rtcp_report(&self, highest_sequence: u32) -> Option<Vec<u8>> {
-        let session = self.audio_session?;
+    /// Build a compound RTCP Receiver Report + SDES. The device uses these to
+    /// keep both media streams alive (RTCPTimeoutInterval).
+    fn receiver_report(session: &RtcpSession, highest_sequence: u32) -> Vec<u8> {
         let mut packet = Vec::with_capacity(48);
         packet.extend_from_slice(&[
             0x81, 0xC9, 0x00, 0x07, // V=2, RC=1, PT=RR, length=7 words
@@ -146,6 +176,30 @@ impl DisplayClient {
         ]);
         packet.extend_from_slice(&session.local_ssrc.to_be_bytes());
         packet.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // empty CNAME + END
+        packet
+    }
+
+    pub fn audio_rtcp_report(&self, highest_sequence: u32) -> Option<Vec<u8>> {
+        self.audio_session
+            .map(|session| Self::receiver_report(&session, highest_sequence))
+    }
+
+    pub fn video_rtcp_report(&self, highest_sequence: u32) -> Option<Vec<u8>> {
+        self.video_session
+            .map(|session| Self::receiver_report(&session, highest_sequence))
+    }
+
+    /// RTCP Picture Loss Indication (RFC 4585, PT=206/FMT=1). Without this the
+    /// iPhone's encoder never resends a keyframe after RTP loss and the decoded
+    /// picture stays frozen forever.
+    pub fn video_pli(&self) -> Option<Vec<u8>> {
+        let session = self.video_session?;
+        let mut packet = Vec::with_capacity(12);
+        packet.extend_from_slice(&[
+            0x81, 0xCE, 0x00, 0x02, // V=2, FMT=1, PT=PSFB, length=2 words
+        ]);
+        packet.extend_from_slice(&session.local_ssrc.to_be_bytes());
+        packet.extend_from_slice(&session.remote_ssrc.to_be_bytes());
         Some(packet)
     }
 
@@ -157,6 +211,17 @@ impl DisplayClient {
             .send_to(session.rtcp_port, packet)
             .await
             .context("Failed to send the audio RTCP receiver report")?;
+        Ok(())
+    }
+
+    pub async fn send_video_rtcp(&self, packet: Vec<u8>) -> Result<()> {
+        let Some(session) = self.video_session else {
+            return Ok(());
+        };
+        self.video_udp
+            .send_to(session.rtcp_port, packet)
+            .await
+            .context("Failed to send the video RTCP feedback")?;
         Ok(())
     }
 
@@ -225,7 +290,7 @@ fn log_audio_negotiation(answer: &plist::Value) {
     }
 }
 
-fn audio_session_from_answer(answer: &plist::Value) -> Option<AudioSession> {
+fn rtcp_session_from_answer(answer: &plist::Value) -> Option<RtcpSession> {
     let config = answer
         .as_dictionary()?
         .get("connection")?
@@ -233,10 +298,14 @@ fn audio_session_from_answer(answer: &plist::Value) -> Option<AudioSession> {
         .get("streamConfig")?
         .as_dictionary()?;
     let number = |key: &str| config.get(key).and_then(plist::Value::as_unsigned_integer);
-    Some(AudioSession {
+    Some(RtcpSession {
         local_ssrc: number("RemoteSSRC")? as u32,
         remote_ssrc: number("LocalSSRC")? as u32,
-        rtcp_port: number("SourcePort")? as u16,
+        // RTCPRemotePort (== DestPort) is where the device actually listens.
+        // SourcePort is its RTP source and silently discarded our audio reports.
+        rtcp_port: number("RTCPRemotePort")
+            .or_else(|| number("DestPort"))
+            .or_else(|| number("SourcePort"))? as u16,
     })
 }
 
