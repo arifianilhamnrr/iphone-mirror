@@ -84,6 +84,7 @@ enum InputCommand {
 #[derive(Debug, Clone, Copy)]
 enum HardwareButton {
     Home,
+    Back,
     Lock,
     VolumeUp,
     VolumeDown,
@@ -94,6 +95,8 @@ impl HardwareButton {
     fn usage(self) -> (u64, u64) {
         match self {
             Self::Home => (0x0C, 0x40),
+            // Consumer page "AC Back", the standard hardware back-button usage.
+            Self::Back => (0x0C, 0x224),
             Self::Lock => (0x0C, 0x30),
             Self::VolumeUp => (0x0C, 0xE9),
             Self::VolumeDown => (0x0C, 0xEA),
@@ -113,6 +116,7 @@ impl HardwareButton {
     fn label(self) -> &'static str {
         match self {
             Self::Home => "home",
+            Self::Back => "back",
             Self::Lock => "lock",
             Self::VolumeUp => "volume-up",
             Self::VolumeDown => "volume-down",
@@ -325,11 +329,7 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                         let _ = self.input_tx.send(InputCommand::Up(x, y));
                     }
                 }
-                if self.scroll_active {
-                    self.scroll_active = false;
-                    self.scroll_deadline = None;
-                    let _ = self.input_tx.send(InputCommand::ScrollEnd);
-                }
+                self.end_scroll();
             }
             winit::event::WindowEvent::MouseWheel { delta, phase, .. } => {
                 let (x, y) = match delta {
@@ -387,6 +387,33 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                 self.modifiers = modifiers.state();
             }
             winit::event::WindowEvent::KeyboardInput { event, .. } => {
+                if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
+                    match code {
+                        winit::keyboard::KeyCode::ArrowUp
+                        | winit::keyboard::KeyCode::ArrowDown => {
+                            match event.state {
+                                winit::event::ElementState::Pressed => {
+                                    let direction = if code == winit::keyboard::KeyCode::ArrowUp {
+                                        1
+                                    } else {
+                                        -1
+                                    };
+                                    self.arrow_scroll(direction);
+                                }
+                                winit::event::ElementState::Released => self.end_scroll(),
+                            }
+                            return;
+                        }
+                        winit::keyboard::KeyCode::Escape => {
+                            if event.state == winit::event::ElementState::Pressed && !event.repeat
+                            {
+                                let _ = self.button_tx.send(HardwareButton::Back);
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
                 if event.state == winit::event::ElementState::Pressed && !event.repeat {
                     if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
                         if self.modifiers.super_key() && code == winit::keyboard::KeyCode::Comma {
@@ -481,11 +508,7 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                     self.pressed_keys.clear();
                     let _ = self.input_tx.send(InputCommand::SetKeys(Vec::new()));
                 }
-                if self.scroll_active {
-                    self.scroll_active = false;
-                    self.scroll_deadline = None;
-                    let _ = self.input_tx.send(InputCommand::ScrollEnd);
-                }
+                self.end_scroll();
             }
             _ => {}
         }
@@ -617,6 +640,34 @@ impl MirrorApp {
         let _ = self.shutdown_tx.send(true);
         if let Some(window) = &self.window {
             window.set_visible(false);
+        }
+    }
+
+    /// Scroll the mirrored iPhone with a synthetic touchscreen drag. The finger
+    /// moves opposite to the content: ArrowUp reveals content above (finger
+    /// drags down), ArrowDown reveals content below (finger drags up).
+    fn arrow_scroll(&mut self, direction: i32) {
+        let anchor = self
+            .cursor_position
+            .and_then(|position| self.touch_coordinates(position))
+            .unwrap_or((u16::MAX / 2, u16::MAX / 2));
+        if !self.scroll_active {
+            self.scroll_active = true;
+            let _ = self
+                .input_tx
+                .send(InputCommand::ScrollStart(anchor.0, anchor.1));
+        }
+        let step = (u16::MAX as f32 * 0.22 * direction as f32).round() as i32;
+        let _ = self.input_tx.send(InputCommand::ScrollMove(0, step));
+        self.scroll_deadline =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(200));
+    }
+
+    fn end_scroll(&mut self) {
+        if self.scroll_active {
+            self.scroll_active = false;
+            self.scroll_deadline = None;
+            let _ = self.input_tx.send(InputCommand::ScrollEnd);
         }
     }
 

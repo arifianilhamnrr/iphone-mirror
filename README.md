@@ -78,7 +78,7 @@ Connection mode can be **Auto**, **USB**, or **Wi-Fi** from the launcher sidebar
 
 Click or drag inside the displayed phone image to send touchscreen input. Clicks in letterbox/pillarbox regions are ignored.
 
-Use a two-finger trackpad gesture (or a mouse wheel) while the pointer is over the mirrored phone to scroll. The wheel stream is translated into a continuous touchscreen drag beginning at the pointer position, so it works with ordinary iOS lists and web views rather than relying on a digital-crown HID event.
+Use a two-finger trackpad gesture (or a mouse wheel) while the pointer is over the mirrored phone to scroll. The wheel stream is translated into a continuous touchscreen drag beginning at the pointer position, so it works with ordinary iOS lists and web views rather than relying on a digital-crown HID event. The `↑` / `↓` arrow keys drive the same synthetic drag from the pointer position (or the screen centre when the pointer is outside the image), including OS key repeat. `Esc` sends the consumer-page "AC Back" hardware button.
 
 Text and image clipboard contents synchronize automatically in both directions while a mirror session is active. PNG and TIFF are accepted from macOS; PNG, JPEG, and TIFF snapshots are accepted from iPhone. Images larger than 20 MiB are ignored to keep memory and tunnel usage bounded. File clipboard payloads are not synchronized yet.
 
@@ -99,6 +99,8 @@ Keyboard shortcuts (hold Control):
 | `Ctrl+T` | Toggle always-on-top |
 | `Ctrl+Cmd+F` | Toggle borderless fullscreen |
 | `Cmd+,` | Open connection and auto-rotate settings |
+| `↑` / `↓` | Scroll the mirrored screen (synthetic touch drag, works with key repeat) |
+| `Esc` | Back (hardware "AC Back" button) |
 
 Auto-Rotate is enabled by default. When the incoming frame changes between portrait and landscape, the window swaps its dimensions while preserving aspect-fit rendering and touch/scroll mapping. Fullscreen size is not changed.
 
