@@ -17,6 +17,7 @@ Experimental native iPhone screen mirroring client in Rust for **macOS 26 Tahoe*
 - Implemented: hardware-button shortcuts (Home, Lock, volume, mute) through the Indigo HID service.
 - Hardware-tested: full-resolution PNG screenshots, fullscreen, and always-on-top window controls.
 - Implemented: automatic session restart after a stream/tunnel failure; each retry recreates CoreDevice, VideoToolbox, AudioToolbox, HID, and clipboard state cleanly.
+- Implemented: automatic DeveloperDiskImage repair when `com.apple.coredevice.displayservice` is missing from the RSD catalog. iOS 27+ devices get a compatible Cryptex1 DDI downloaded and installed through `cryptexd` (including unmounting a stale Xcode 26 image), so an iOS update or a reboot no longer leaves mirroring broken.
 - In progress: file clipboard payloads and drag-and-drop transfer.
 - Planned: app-bundle polish and performance hardening.
 - Performance and zero-copy behavior have not been benchmarked yet.
@@ -64,6 +65,8 @@ The DMG presents `iPhone Mirror.app` next to an Applications shortcut: drag the 
 Current release artifacts are built for Intel (`x86_64`) macOS. The app is ad-hoc signed but not Apple-notarized, so first launch may require right-clicking the app and choosing **Open**.
 
 The default `mirror` command establishes the CoreDevice tunnel and display-service session, decodes HEVC with VideoToolbox, and displays it in a native Metal window.
+
+The display service is provided by the mounted DeveloperDiskImage, not by iOS itself. If it is missing from the RSD catalog, the app automatically downloads the pinned Cryptex1 DDI (`27B52`, cached under `~/Library/Application Support/iPhone Mirror/DDI`), unmounts any stale image at `/System/Developer`, installs the new cryptex through `cryptexd`, and reconnects the tunnel. This needs internet access on first use (for the DDI download and Apple's TSS signing service) and Developer Mode enabled.
 
 If the cable, tunnel, or display session drops, the supervisor waits two seconds and starts a fresh session automatically. The mirror window closes while disconnected and reappears after reconnection. Closing the window normally stops the supervisor.
 

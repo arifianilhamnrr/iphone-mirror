@@ -21,7 +21,9 @@ uuid = { version = "1.18", features = ["v4"] }
 # Pure Rust stack interfacing with lockdownd, usbmuxd & CoreDevice
 idevice = { git = "https://github.com/jkcoxson/idevice", rev = "89702099f4d7552f704f93b4526756abda319ceb", default-features = false, features = [
     "core_device_proxy",
+    "cryptexd",
     "display_stream",
+    "mobile_image_mounter",
     "ring",
     "tunnel_tcp_stack",
     "usbmuxd",

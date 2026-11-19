@@ -18,7 +18,8 @@ use iphone_mirror_rs::{
     media::{h265_depacketizer::H265Depacketizer, rtp::RtpPacket},
     protocol::display_client::DisplayClient,
     transport::{
-        device_scanner::{DeviceScanner, TransportPreference},
+        ddi_mounter::DdiMounter,
+        device_scanner::{ConnectedDevice, DeviceScanner, TransportPreference},
         rsd_tunnel::RsdTunnel,
     },
     ui::metal_renderer::MetalRenderer,
@@ -937,6 +938,43 @@ async fn supervise_mirror() -> Result<()> {
     }
 }
 
+/// Connect to the device's RSD services, repairing the DeveloperDiskImage when
+/// the display service is missing from the catalog. Installing the DDI changes
+/// the advertised service list, so a fresh tunnel is opened to pick it up.
+async fn connect_tunnel_with_ddi(device: &ConnectedDevice) -> Result<RsdTunnel> {
+    let mut tunnel = RsdTunnel::connect(Box::new(device.provider())).await?;
+    if tunnel.has_display_service() {
+        return Ok(tunnel);
+    }
+
+    warn!("Display service missing from RSD catalog; attempting automatic DDI repair");
+    let installed = DdiMounter::ensure_display_service(&mut tunnel.adapter, &mut tunnel.handshake)
+        .await
+        .context("Automatic DeveloperDiskImage repair failed")?;
+    if !installed {
+        anyhow::bail!(
+            "Display service is unavailable and no compatible DeveloperDiskImage could be \
+             prepared. Check your internet connection (needed to fetch the DDI) and that \
+             Developer Mode is enabled."
+        );
+    }
+
+    for attempt in 1..=4 {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        tunnel = RsdTunnel::connect(Box::new(device.provider())).await?;
+        if tunnel.has_display_service() {
+            info!(attempt, "Display service available after DDI install");
+            return Ok(tunnel);
+        }
+        warn!(attempt, "Display service still absent; waiting for DDI daemons");
+    }
+
+    anyhow::bail!(
+        "DeveloperDiskImage was installed but the display service is still not advertised. \
+         Unlock the iPhone and reconnect it once to let the developer daemons load."
+    )
+}
+
 async fn run_mirror() -> Result<()> {
     info!("Starting iphone-mirror-rs (Native 60fps macOS/Hackintosh Mirror)...");
 
@@ -954,7 +992,7 @@ async fn run_mirror() -> Result<()> {
             .await?;
     info!(udid = %device.udid, conn = %device.connection_type, "iPhone detected");
 
-    let mut tunnel = RsdTunnel::connect(Box::new(device.provider())).await?;
+    let mut tunnel = connect_tunnel_with_ddi(&device).await?;
     if !tunnel.has_display_service() {
         anyhow::bail!(
             "Display service is unavailable. Enable Developer Mode and ensure the developer image is mounted."
