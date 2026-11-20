@@ -3,7 +3,7 @@ use super::{
     afc::AfcTransfer,
     error::{Result, TransferError},
     metadata::{file_url, validate_paths},
-    pasteboard::UrlPasteboard,
+    pasteboard::{PasteboardFile, UrlPasteboard, uti_for_name},
 };
 use idevice::RsdService;
 use std::path::PathBuf;
@@ -106,7 +106,8 @@ async fn send_batch(
     let file_count = files.len();
     let _ = events.send(TransferEvent::Started { files: file_count });
 
-    let mut urls = Vec::with_capacity(file_count);
+    const INLINE_LIMIT: usize = 20 * 1024 * 1024;
+    let mut pasted = Vec::with_capacity(file_count);
     for (index, file) in files.iter().enumerate() {
         let name = file.name.clone();
         let remote = afc
@@ -122,7 +123,14 @@ async fn send_batch(
             .await?;
 
         let url = file_url(&remote);
-        urls.push(url.clone());
+        let bytes = tokio::fs::read(&file.path).await.unwrap_or_default();
+        let data = if bytes.len() <= INLINE_LIMIT { bytes } else { Vec::new() };
+        pasted.push(PasteboardFile {
+            url: url.clone(),
+            name: name.clone(),
+            data,
+            content_uti: uti_for_name(&name).to_string(),
+        });
         let _ = events.send(TransferEvent::FileStaged {
             name,
             remote_path: remote,
@@ -132,9 +140,12 @@ async fn send_batch(
     }
 
     pasteboard
-        .set_file_urls(&urls)
+        .set_files(&pasted)
         .await
         .map_err(TransferError::Device)?;
+    // Give the daemon a moment to commit the SET before the owning task (and
+    // its XPC connection) goes away.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let _ = events.send(TransferEvent::Published { files: file_count });
     let _ = events.send(TransferEvent::Completed { files: file_count });
     Ok(())

@@ -99,8 +99,20 @@ fn unique_name(base: &str, used: &mut std::collections::HashSet<String>) -> Stri
 }
 
 /// Remote staging root used for transferred files.
+///
+/// AFC's namespace is rooted at `/var/mobile/Media`, so `/Downloads` here maps
+/// to the real path `/var/mobile/Media/Downloads` that iOS apps can resolve.
 pub fn staging_root() -> &'static str {
-    "/tmp/iphone-mirror-transfers"
+    "/Downloads/iphone-mirror-transfers"
+}
+
+/// Absolute on-device path that must be used in a `file://` URL.
+pub fn device_path(remote_path: &str) -> String {
+    if let Some(suffix) = remote_path.strip_prefix('/') {
+        format!("/var/mobile/Media/{suffix}")
+    } else {
+        format!("/var/mobile/Media/{remote_path}")
+    }
 }
 
 pub fn remote_path(name: &str) -> String {
@@ -108,7 +120,7 @@ pub fn remote_path(name: &str) -> String {
 }
 
 pub fn file_url(remote_path: &str) -> String {
-    let encoded = percent_encode_path(remote_path);
+    let encoded = percent_encode_path(&device_path(remote_path));
     format!("file://{encoded}")
 }
 
@@ -145,6 +157,9 @@ mod tests {
 
     #[test]
     fn file_url_format() {
-        assert_eq!(file_url("/tmp/a b.txt"), "file:///tmp/a%20b.txt");
+        assert_eq!(
+            file_url("/tmp/a b.txt"),
+            "file:///var/mobile/Media/tmp/a%20b.txt"
+        );
     }
 }

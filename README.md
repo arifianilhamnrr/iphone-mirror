@@ -2,7 +2,7 @@
 
 Experimental native iPhone screen mirroring client in Rust for **macOS 26 Tahoe** and **macOS 15 Sequoia**, with Intel Mac/Hackintosh support as a primary goal.
 
-Current build: **0.1.0-beta.2 (build 6)**. The launcher shows this in the sidebar footer and in Settings → General, so you can tell which experimental build is running.
+Current build: **0.1.0-beta.2 (build 7)**. The launcher shows this in the sidebar footer and in Settings → General, so you can tell which experimental build is running.
 
 ### Drag-and-drop: Phase 0/1 (file-transfer foundation)
 
@@ -14,7 +14,7 @@ An early transfer probe is available from the CLI:
 
 It stages a small text file on the iPhone over AFC, verifies the bytes, publishes its `file://` URL on the device pasteboard, then removes the temporary file. Open Files or Notes on the iPhone and paste to check whether the URL is accepted.
 
-Real files can be sent with `iphone-mirror send-files <path>...`. The same pipeline is used when you drag files from Finder onto the mirror window: the window title shows progress, the file is staged on the iPhone, and its URL is published on the device pasteboard. Paste on the iPhone (⌘V or the app's Paste action) to import it. Limits for this beta: 10 files, 100 MiB per file, 250 MiB per batch; directories and symlinks are rejected.
+Real files can be sent with `iphone-mirror send-files <path>...`. The same pipeline is used when you drag files from Finder onto the mirror window: the window title shows progress, and the file is staged under `/var/mobile/Media/Downloads/iphone-mirror-transfers` on the iPhone. The device pasteboard then gets **two representations** of the file: a `file://` URL and the file's inline content under its content UTI (for example `public.png` or `public.data`). Paste on the iPhone (⌘V or the app's Paste action) to import it. Limits for this beta: 10 files, 100 MiB per file, 250 MiB per batch; files above 20 MiB skip the inline-content representation. Directories and symlinks are rejected.
 
 > [!IMPORTANT]
 > This project is under active development. End-to-end display streaming, Metal rendering, touch forwarding, text clipboard sync, keyboard input, and iPhone system audio playback work on tested hardware. Reconnect and release hardening are not complete yet.
