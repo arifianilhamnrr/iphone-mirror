@@ -1344,7 +1344,10 @@ async fn run_mirror() -> Result<()> {
             let mut audio_highest_sequence = 0_u32;
             let mut audio_decode_errors = 0_u32;
             let mut audio_decoder = AacEldDecoder::new()?;
-            let mut audio_player = AudioPlayer::new()?;
+            let audio_buffers_returned = Arc::new(AtomicU64::new(0));
+            let mut audio_player = AudioPlayer::new(audio_buffers_returned.clone())?;
+            let mut audio_returned_at_check = 0_u64;
+            let mut audio_stalled_ticks = 0_u32;
             let mut audio_was_muted = false;
             let mut audio_rtcp = tokio::time::interval(std::time::Duration::from_secs(1));
             audio_rtcp.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1565,7 +1568,7 @@ async fn run_mirror() -> Result<()> {
                             // Some Hackintosh CoreAudio drivers leave an output unit silent
                             // after a prolonged run of zero-valued frames. Recreating only the
                             // host output queue is cheap and leaves RTP/AAC state untouched.
-                            match AudioPlayer::new() {
+                            match AudioPlayer::new(audio_buffers_returned.clone()) {
                                 Ok(player) => {
                                     audio_player = player;
                                     info!("Recreated host audio output after unmute");
@@ -1595,6 +1598,25 @@ async fn run_mirror() -> Result<()> {
                             if let Err(error) = client.send_video_rtcp(report).await {
                                 debug!(%error, "Failed to send the video RTCP keepalive");
                             }
+                        }
+
+                        // AudioToolbox can leave an output queue silently
+                        // stopped after an underrun. Recreating it is exactly
+                        // what the manual mute/unmute path already does, so do
+                        // it automatically when no buffer comes back.
+                        let returned = audio_buffers_returned.load(Ordering::Relaxed);
+                        if returned > audio_returned_at_check {
+                            audio_returned_at_check = returned;
+                            audio_stalled_ticks = 0;
+                        } else if audio_stalled_ticks < 3 {
+                            audio_stalled_ticks += 1;
+                        }
+                        if audio_stalled_ticks >= 3 {
+                            warn!("Host audio output stopped; recreating AudioQueue");
+                            audio_player = AudioPlayer::new(audio_buffers_returned.clone())?;
+                            audio_returned_at_check = returned;
+                            audio_stalled_ticks = 0;
+                            info!("Host audio output recreated");
                         }
                     }
                     _ = decoder_check.tick() => {

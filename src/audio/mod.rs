@@ -1,6 +1,15 @@
 // language: Rust, file: src/audio/mod.rs, target: macOS AudioToolbox
 use anyhow::{bail, Result};
-use std::{collections::VecDeque, ffi::c_void, ptr, sync::Mutex};
+use std::{
+    collections::VecDeque,
+    ffi::c_void,
+    ptr,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 const SAMPLE_RATE: f64 = 48_000.0;
 const CHANNELS: u32 = 2;
@@ -243,6 +252,9 @@ impl Drop for AacEldDecoder {
 
 struct QueueContext {
     free: Mutex<VecDeque<usize>>,
+    /// Incremented every time AudioToolbox returns a consumed buffer. A stalled
+    /// counter means the output queue stopped even while we keep enqueuing.
+    buffers_returned: Arc<AtomicU64>,
 }
 
 extern "C" fn queue_output(
@@ -251,6 +263,7 @@ extern "C" fn queue_output(
     buffer: AudioQueueBufferRef,
 ) {
     let context = unsafe { &*(user_data as *const QueueContext) };
+    context.buffers_returned.fetch_add(1, Ordering::Relaxed);
     if let Ok(mut free) = context.free.lock() {
         free.push_back(buffer as usize);
     }
@@ -264,9 +277,10 @@ pub struct AudioPlayer {
 unsafe impl Send for AudioPlayer {}
 
 impl AudioPlayer {
-    pub fn new() -> Result<Self> {
+    pub fn new(buffers_returned: Arc<AtomicU64>) -> Result<Self> {
         let mut context = Box::new(QueueContext {
             free: Mutex::new(VecDeque::new()),
+            buffers_returned,
         });
         let mut queue = ptr::null_mut();
         let status = unsafe {
@@ -390,7 +404,8 @@ mod tests {
 
     #[test]
     fn audio_queue_can_play_silence_then_resume_pcm() {
-        let mut player = AudioPlayer::new().expect("create AudioQueue");
+        let mut player =
+            AudioPlayer::new(Arc::new(AtomicU64::new(0))).expect("create AudioQueue");
         let silence = vec![0_u8; PCM_BYTES];
         player.play(&silence).expect("initial enqueue");
         player.play_silence().expect("software-muted enqueue");
