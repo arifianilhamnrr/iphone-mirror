@@ -39,6 +39,7 @@ enum Command {
     Devices { json: bool },
     Diagnose { udid: Option<String> },
     Pair { udid: Option<String> },
+    ProbeFiles { udid: Option<String> },
     Help,
 }
 
@@ -840,6 +841,18 @@ fn parse_command() -> Result<Command> {
             }
             Ok(Command::Pair { udid })
         }
+        Some("probe-files") => {
+            let mut udid = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--udid" => {
+                        udid = Some(args.next().context("--udid requires a value")?);
+                    }
+                    _ => anyhow::bail!("Unknown probe-files option: {arg}"),
+                }
+            }
+            Ok(Command::ProbeFiles { udid })
+        }
         Some("help" | "--help" | "-h") => Ok(Command::Help),
         Some(command) => anyhow::bail!("Unknown command: {command}. Run with --help for usage."),
     }
@@ -852,7 +865,8 @@ fn print_help() {
            iphone-mirror [mirror]\n  \
            iphone-mirror devices\n  \
            iphone-mirror diagnose [--udid <UDID>]\n  \
-           iphone-mirror pair [--udid <UDID>]\n"
+           iphone-mirror pair [--udid <UDID>]\n  \
+           iphone-mirror probe-files [--udid <UDID>]\n"
     );
 }
 
@@ -870,6 +884,7 @@ async fn main() -> Result<()> {
         Command::Devices { json } => list_devices(json).await,
         Command::Diagnose { udid } => diagnose(udid.as_deref()).await,
         Command::Pair { udid } => pair_device(udid.as_deref()).await,
+        Command::ProbeFiles { udid } => probe_files(udid.as_deref()).await,
         Command::Help => {
             print_help();
             Ok(())
@@ -958,6 +973,82 @@ async fn pair_device(udid: Option<&str>) -> Result<()> {
     );
     wifi::pair_via_usb(&device.provider()).await?;
     println!("Paired. Wi-Fi mirroring is now available for this Mac.");
+    Ok(())
+}
+
+/// Phase 0 probe: stage a small file over AFC, verify its bytes, publish its
+/// file URL on the device pasteboard, then clean up.
+async fn probe_files(udid: Option<&str>) -> Result<()> {
+    use iphone_mirror_rs::transfer::{
+        afc::AfcTransfer,
+        metadata::{file_url, sanitize_file_name},
+        pasteboard::UrlPasteboard,
+    };
+    use tokio::io::AsyncWriteExt;
+    use uuid::Uuid;
+
+    let mut wifi_device = wifi::endpoint_from_env();
+    if wifi_device.is_none() {
+        wifi_device = wifi::WifiDiscovery::discover()
+            .await
+            .ok()
+            .and_then(|devices| {
+                devices
+                    .into_iter()
+                    .find(|device| udid.is_none() || device.identifier == udid.unwrap_or_default())
+            });
+    }
+    let usb_device = if wifi_device.is_none() {
+        Some(DeviceScanner::select_device(udid).await?)
+    } else {
+        None
+    };
+    let source = if let Some(wifi_device) = &wifi_device {
+        info!(host = %wifi_device.host, port = wifi_device.port, "Probing over Wi-Fi");
+        TunnelSource::Wifi(wifi_device)
+    } else {
+        TunnelSource::Usb(usb_device.as_ref().expect("USB device selected"))
+    };
+
+    let mut tunnel = source.connect().await.context("CoreDevice/RSD connect failed")?;
+    let mut afc = AfcTransfer::connect(&mut tunnel.adapter, &mut tunnel.handshake)
+        .await
+        .context("AFC file service is unavailable on this device")?;
+
+    let name = sanitize_file_name(&format!("iphone-mirror-probe-{}.txt", Uuid::new_v4()));
+    let local = std::env::temp_dir().join(&name);
+    let payload = b"iphone-mirror file-transfer probe\n";
+    let mut file = tokio::fs::File::create(&local).await?;
+    file.write_all(payload).await?;
+    file.flush().await?;
+    drop(file);
+
+    println!("Uploading probe file to iPhone...");
+    let remote = afc
+        .upload_file(&local, &name, |sent, total| {
+            println!("  {sent}/{total} bytes");
+        })
+        .await
+        .context("Probe upload failed")?;
+
+    let downloaded = afc.read_file(&remote).await.context("Probe readback failed")?;
+    anyhow::ensure!(downloaded == payload, "probe file checksum mismatch");
+    println!("Upload verified: {remote} ({} bytes)", downloaded.len());
+
+    let url = file_url(&remote);
+    let mut pasteboard = UrlPasteboard::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake)
+        .await
+        .context("Pasteboard service is unavailable")?;
+    pasteboard
+        .set_file_urls(&[url.clone()])
+        .await
+        .context("Could not publish file URL on the device pasteboard")?;
+    println!("Published on iPhone pasteboard: {url}");
+    println!("Open Files or Notes on the iPhone and paste to check whether the file URL is accepted.");
+
+    afc.remove_file(&remote).await.ok();
+    tokio::fs::remove_file(&local).await.ok();
+    println!("Probe complete. Temporary files cleaned up.");
     Ok(())
 }
 

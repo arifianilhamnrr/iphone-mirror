@@ -4,6 +4,7 @@ pub mod codec;
 pub mod input;
 pub mod media;
 pub mod protocol;
+pub mod transfer;
 pub mod transport;
 pub mod ui;
 

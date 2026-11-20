@@ -1,6 +1,6 @@
 [package]
 name = "iphone-mirror-rs"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 edition = "2021"
 rust-version = "1.85"
 description = "Native zero-copy 60fps iPhone screen mirroring & HID touch control for macOS/Hackintosh"
@@ -20,6 +20,7 @@ uuid = { version = "1.18", features = ["v4"] }
 # Core iOS Device Interaction (usbmuxd, RemoteXPC, RSD tunnel)
 # Pure Rust stack interfacing with lockdownd, usbmuxd & CoreDevice
 idevice = { git = "https://github.com/jkcoxson/idevice", rev = "89702099f4d7552f704f93b4526756abda319ceb", default-features = false, features = [
+    "afc",
     "core_device_proxy",
     "cryptexd",
     "display_stream",
