@@ -884,7 +884,7 @@ dependencies = [
 
 [[package]]
 name = "iphone-mirror-rs"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "anyhow",
  "bytes",

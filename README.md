@@ -2,6 +2,8 @@
 
 Experimental native iPhone screen mirroring client in Rust for **macOS 26 Tahoe** and **macOS 15 Sequoia**, with Intel Mac/Hackintosh support as a primary goal.
 
+Current build: **0.1.0-beta.1 (build 2)**. The launcher shows this in the sidebar footer and in Settings → General, so you can tell which experimental build is running.
+
 > [!IMPORTANT]
 > This project is under active development. End-to-end display streaming, Metal rendering, touch forwarding, text clipboard sync, keyboard input, and iPhone system audio playback work on tested hardware. Reconnect and release hardening are not complete yet.
 

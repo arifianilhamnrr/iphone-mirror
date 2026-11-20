@@ -2,6 +2,12 @@ import AppKit
 import Network
 import SwiftUI
 
+private enum AppInfo {
+    static let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+    static let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+    static let label = "v\(version) (build \(build))"
+}
+
 struct Device: Codable, Identifiable, Hashable {
     let udid: String
     let connection_type: ConnectionType
@@ -363,11 +369,14 @@ struct ContentView: View {
                     }
                 }
                 Spacer()
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(model.error == nil ? Color.green : Color.orange)
-                        .frame(width: 6, height: 6)
-                    Text(model.isScanning ? "Scanning devices…" : "USB + Wi-Fi discovery active")
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(model.error == nil ? Color.green : Color.orange)
+                            .frame(width: 6, height: 6)
+                        Text(model.isScanning ? "Scanning devices…" : "USB + Wi-Fi discovery active")
+                    }
+                    Text(AppInfo.label)
                 }
                     .font(.system(size: 11))
                     .foregroundStyle(.tertiary)
@@ -443,6 +452,13 @@ struct SettingsView: View {
             }
             Toggle("Connect automatically when an iPhone appears", isOn: $autoConnect)
             Toggle("Resize the mirror window when orientation changes", isOn: $autoRotate)
+            HStack {
+                Spacer()
+                Text(AppInfo.label)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                Spacer()
+            }
         }
         .formStyle(.grouped)
         .padding(8)
