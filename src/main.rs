@@ -1453,7 +1453,27 @@ async fn run_mirror() -> Result<()> {
                             Err(error) => debug!(%error, "Dropped malformed video NAL"),
                             }
 
-                            if depacketizer.sequence_gap {
+                            if depacketizer.last_gap >= 100 {
+                                // A burst this large almost certainly swallowed
+                                // VPS/SPS/PPS or a whole IDR. The decoder cannot
+                                // recover on its own, so renegotiate immediately
+                                // instead of waiting for a multi-second stall.
+                                warn!(
+                                    gap = depacketizer.last_gap,
+                                    "Large RTP loss; restarting media session"
+                                );
+                                client.restart(&mut tunnel, 1).await?;
+                                depacketizer = H265Depacketizer::new();
+                                parameter_sets = ParameterSetCache::new();
+                                decoder = None;
+                                decoder_sets = None;
+                                video_highest_sequence = 0;
+                                audio_highest_sequence = 0;
+                                decoder_stalled_ticks = 0;
+                                frames_at_check = decoded_frames.load(Ordering::Relaxed);
+                                last_nal_at_check = nal_count;
+                                info!("Media session restarted after RTP loss burst");
+                            } else if depacketizer.sequence_gap {
                                 depacketizer.sequence_gap = false;
                                 if last_pli.elapsed() >= std::time::Duration::from_millis(500) {
                                     if let Some(pli) = client.video_pli() {

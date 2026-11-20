@@ -13,6 +13,9 @@ pub struct H265Depacketizer {
     /// Set when an RTP sequence gap is seen; the caller should send a RTCP
     /// Picture Loss Indication so the device emits a fresh keyframe.
     pub sequence_gap: bool,
+    /// Size of the most recent gap, used to decide between PLI and a full
+    /// media-session restart.
+    pub last_gap: u16,
 }
 
 impl H265Depacketizer {
@@ -22,6 +25,7 @@ impl H265Depacketizer {
             is_assembling_fu: false,
             expected_seq: None,
             sequence_gap: false,
+            last_gap: 0,
         }
     }
 
@@ -40,6 +44,7 @@ impl H265Depacketizer {
                     expected, "RTP sequence gap detected, discarding partial FU buffer"
                 );
                 self.sequence_gap = true;
+                self.last_gap = pkt.sequence_number.wrapping_sub(expected);
                 self.fu_buffer.clear();
                 self.is_assembling_fu = false;
             }
@@ -136,6 +141,10 @@ impl H265Depacketizer {
                 Ok(Vec::new())
             }
         }
+        .map(|nals| {
+            self.last_gap = 0;
+            nals
+        })
     }
 }
 

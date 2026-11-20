@@ -231,6 +231,9 @@ final class LauncherModel: ObservableObject {
             Task { @MainActor in
                 self?.backend = nil
                 self?.backendRunning = false
+                // The mirror session owns the screen now. Bring the launcher
+                // back as soon as the backend exits (or the user disconnects).
+                Self.showLauncher()
                 if process.terminationStatus != 0 {
                     let detail = (try? String(contentsOf: logURL, encoding: .utf8))?
                         .split(separator: "\n")
@@ -247,15 +250,30 @@ final class LauncherModel: ObservableObject {
             backend = process
             backendRunning = true
             error = nil
+            // Let the launcher leave the way so the mirror window owns the
+            // screen and shows up as a normal app in Cmd+Tab.
+            Self.hideLauncher()
             NSRunningApplication(processIdentifier: process.processIdentifier)?
                 .activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
         } catch {
+            Self.showLauncher()
             self.error = "Couldn’t start the mirror session."
         }
     }
 
     func disconnect() {
         backend?.terminate()
+    }
+
+    private static func hideLauncher() {
+        NSApp.setActivationPolicy(.accessory)
+        NSApp.hide(nil)
+    }
+
+    private static func showLauncher() {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.unhide(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 }
 

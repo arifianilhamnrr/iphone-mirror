@@ -31,7 +31,7 @@ bundle: build
 	cp "$(ICON)" "$(APP)/Contents/Resources/AppIcon.icns"
 	cp "$(LAUNCHER)" "$(APP)/Contents/MacOS/iphone-mirror-launcher"
 	cp "$(TARGET)" "$(HELPER)/Contents/MacOS/iphone-mirror-backend"
-	python3 -c 'import plistlib; plistlib.dump({"CFBundleExecutable":"iphone-mirror-backend","CFBundleIdentifier":"id.web.projectar.iphone-mirror.stream","CFBundleName":"iPhone Mirror Stream","CFBundlePackageType":"APPL","CFBundleShortVersionString":"$(VERSION)","CFBundleVersion":"$(BUILD)","LSMinimumSystemVersion":"15.0","LSUIElement":True,"NSHighResolutionCapable":True}, open("$(HELPER)/Contents/Info.plist", "wb"))'
+	python3 -c 'import plistlib; plistlib.dump({"CFBundleExecutable":"iphone-mirror-backend","CFBundleIdentifier":"id.web.projectar.iphone-mirror.stream","CFBundleName":"iPhone Mirror Stream","CFBundlePackageType":"APPL","CFBundleShortVersionString":"$(VERSION)","CFBundleVersion":"$(BUILD)","LSMinimumSystemVersion":"15.0","LSUIElement":False,"NSHighResolutionCapable":True}, open("$(HELPER)/Contents/Info.plist", "wb"))'
 	chmod +x "$(APP)/Contents/MacOS/iphone-mirror-launcher" "$(HELPER)/Contents/MacOS/iphone-mirror-backend"
 	plutil -lint "$(APP)/Contents/Info.plist"
 	codesign --force --deep --sign - "$(APP)"
