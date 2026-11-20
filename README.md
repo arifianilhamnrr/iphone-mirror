@@ -12,7 +12,9 @@ An early transfer probe is available from the CLI:
 ./target/release/iphone-mirror probe-files
 ```
 
-It stages a small text file on the iPhone over AFC, verifies the bytes, publishes its `file://` URL on the device pasteboard, then removes the temporary file. Open Files or Notes on the iPhone and paste to check whether the URL is accepted. This validates the transport and pasteboard path before Finder drag-and-drop is wired into the mirror window in a later phase.
+It stages a small text file on the iPhone over AFC, verifies the bytes, publishes its `file://` URL on the device pasteboard, then removes the temporary file. Open Files or Notes on the iPhone and paste to check whether the URL is accepted.
+
+Real files can be sent with `iphone-mirror send-files <path>...`. The same pipeline is used when you drag files from Finder onto the mirror window: the window title shows progress, the file is staged on the iPhone, and its URL is published on the device pasteboard. Paste on the iPhone (⌘V or the app's Paste action) to import it. Limits for this beta: 10 files, 100 MiB per file, 250 MiB per batch; directories and symlinks are rejected.
 
 > [!IMPORTANT]
 > This project is under active development. End-to-end display streaming, Metal rendering, touch forwarding, text clipboard sync, keyboard input, and iPhone system audio playback work on tested hardware. Reconnect and release hardening are not complete yet.

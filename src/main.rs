@@ -17,6 +17,10 @@ use iphone_mirror_rs::{
     media::nal_parser::ParameterSetCache,
     media::{h265_depacketizer::H265Depacketizer, rtp::RtpPacket},
     protocol::display_client::DisplayClient,
+    transfer::{
+        afc::AfcTransfer,
+        manager::{TransferCommand, TransferEvent, TransferManager},
+    },
     transport::{
         ddi_mounter::DdiMounter,
         device_scanner::{ConnectedDevice, DeviceScanner, TransportPreference},
@@ -40,6 +44,10 @@ enum Command {
     Diagnose { udid: Option<String> },
     Pair { udid: Option<String> },
     ProbeFiles { udid: Option<String> },
+    SendFiles {
+        udid: Option<String>,
+        paths: Vec<std::path::PathBuf>,
+    },
     Help,
 }
 
@@ -70,6 +78,7 @@ enum UiEvent {
     ShutdownRequested,
     ShutdownComplete,
     StreamError(String),
+    Transfer(TransferEvent),
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +161,10 @@ struct MirrorApp {
     clipboard: SystemClipboard,
     clipboard_tx: tokio::sync::mpsc::UnboundedSender<ClipboardContent>,
     last_device_clipboard: Option<String>,
+    transfer_tx: Option<tokio::sync::mpsc::UnboundedSender<TransferCommand>>,
+    drop_candidates: Vec<std::path::PathBuf>,
+    drop_deadline: Option<std::time::Instant>,
+    transfer_status: Option<String>,
     stream_error: Option<String>,
     shutting_down: bool,
 }
@@ -235,6 +248,46 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                         warn!(%error, "Failed to present decoded frame");
                     }
                 }
+            }
+            UiEvent::Transfer(event) => {
+                use TransferEvent::*;
+                match event {
+                    Started { files } => {
+                        self.transfer_status = Some(format!("Sending {files} file(s)…"));
+                    }
+                    Progress {
+                        name,
+                        sent,
+                        total,
+                        file_index,
+                        file_count,
+                    } => {
+                        let percent = if total == 0 {
+                            100
+                        } else {
+                            (sent * 100 / total).min(100)
+                        };
+                        self.transfer_status = Some(format!(
+                            "Sending {name} ({percent}%) — {file_index}/{file_count}"
+                        ));
+                    }
+                    FileStaged { name, .. } => {
+                        info!(%name, "File staged on iPhone");
+                    }
+                    Published { files } => {
+                        info!(files, "File URLs published on iPhone pasteboard");
+                    }
+                    Completed { files } => {
+                        self.transfer_status = Some(format!(
+                            "Sent {files} file(s) — paste on iPhone (⌘V)"
+                        ));
+                    }
+                    Failed { name, message } => {
+                        warn!(?name, %message, "File transfer failed");
+                        self.transfer_status = Some(format!("Transfer failed: {message}"));
+                    }
+                }
+                self.update_window_title();
             }
             UiEvent::StreamError(error) => {
                 tracing::error!(%error, "Display stream stopped");
@@ -513,6 +566,35 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                 }
                 self.end_scroll();
             }
+            winit::event::WindowEvent::HoveredFile(path) => {
+                if !self.drop_candidates.contains(&path) {
+                    self.drop_candidates.push(path);
+                }
+                self.transfer_status = Some(format!(
+                    "Drop {} file(s) to send to iPhone",
+                    self.drop_candidates.len()
+                ));
+                self.update_window_title();
+            }
+            winit::event::WindowEvent::HoveredFileCancelled => {
+                self.drop_candidates.clear();
+                self.drop_deadline = None;
+                self.transfer_status = None;
+                self.update_window_title();
+            }
+            winit::event::WindowEvent::DroppedFile(path) => {
+                if !self.drop_candidates.contains(&path) {
+                    self.drop_candidates.push(path);
+                }
+                // winit sends one event per file; batch a multi-file drop.
+                self.drop_deadline =
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
+                self.transfer_status = Some(format!(
+                    "Preparing {} file(s)…",
+                    self.drop_candidates.len()
+                ));
+                self.update_window_title();
+            }
             _ => {}
         }
     }
@@ -523,6 +605,23 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
             self.scroll_active = false;
             self.scroll_deadline = None;
             let _ = self.input_tx.send(InputCommand::ScrollEnd);
+        }
+        if self
+            .drop_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.drop_deadline = None;
+            let paths = std::mem::take(&mut self.drop_candidates);
+            if !paths.is_empty() {
+                if let Some(transfer_tx) = &self.transfer_tx {
+                    if transfer_tx.send(TransferCommand::SendFiles(paths)).is_ok() {
+                        info!("Queued dropped files for transfer");
+                    } else {
+                        self.transfer_status = Some("File transfer unavailable".to_string());
+                        self.update_window_title();
+                    }
+                }
+            }
         }
         if let Some(content) = self.clipboard.changed_content() {
             let is_device_text = matches!(
@@ -535,11 +634,12 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
             }
         }
         let clipboard_deadline = now + std::time::Duration::from_millis(250);
-        event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
-            self.scroll_deadline.map_or(clipboard_deadline, |deadline| {
-                deadline.min(clipboard_deadline)
-            }),
-        ));
+        let next = std::iter::once(clipboard_deadline)
+            .chain(self.scroll_deadline)
+            .chain(self.drop_deadline)
+            .min()
+            .unwrap_or(clipboard_deadline);
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(next));
     }
 }
 
@@ -634,6 +734,16 @@ fn key_code_to_hid_usage(code: winit::keyboard::KeyCode) -> Option<u16> {
 }
 
 impl MirrorApp {
+    fn update_window_title(&self) {
+        if let Some(window) = &self.window {
+            let title = match &self.transfer_status {
+                Some(status) => format!("iPhone Mirror — {status}"),
+                None => "iPhone Mirror".to_string(),
+            };
+            window.set_title(&title);
+        }
+    }
+
     fn begin_shutdown(&mut self) {
         if self.shutting_down {
             return;
@@ -853,6 +963,22 @@ fn parse_command() -> Result<Command> {
             }
             Ok(Command::ProbeFiles { udid })
         }
+        Some("send-files") => {
+            let mut udid = None;
+            let mut paths = Vec::new();
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--udid" => {
+                        udid = Some(args.next().context("--udid requires a value")?);
+                    }
+                    other => paths.push(std::path::PathBuf::from(other)),
+                }
+            }
+            if paths.is_empty() {
+                anyhow::bail!("send-files requires at least one path");
+            }
+            Ok(Command::SendFiles { udid, paths })
+        }
         Some("help" | "--help" | "-h") => Ok(Command::Help),
         Some(command) => anyhow::bail!("Unknown command: {command}. Run with --help for usage."),
     }
@@ -866,7 +992,8 @@ fn print_help() {
            iphone-mirror devices\n  \
            iphone-mirror diagnose [--udid <UDID>]\n  \
            iphone-mirror pair [--udid <UDID>]\n  \
-           iphone-mirror probe-files [--udid <UDID>]\n"
+           iphone-mirror probe-files [--udid <UDID>]\n  \
+           iphone-mirror send-files [--udid <UDID>] <path>...\n"
     );
 }
 
@@ -885,6 +1012,7 @@ async fn main() -> Result<()> {
         Command::Diagnose { udid } => diagnose(udid.as_deref()).await,
         Command::Pair { udid } => pair_device(udid.as_deref()).await,
         Command::ProbeFiles { udid } => probe_files(udid.as_deref()).await,
+        Command::SendFiles { udid, paths } => send_files(udid.as_deref(), paths).await,
         Command::Help => {
             print_help();
             Ok(())
@@ -1050,6 +1178,69 @@ async fn probe_files(udid: Option<&str>) -> Result<()> {
     tokio::fs::remove_file(&local).await.ok();
     println!("Probe complete. Temporary files cleaned up.");
     Ok(())
+}
+
+/// Send real files through the same pipeline used by drag-and-drop.
+async fn send_files(udid: Option<&str>, paths: Vec<std::path::PathBuf>) -> Result<()> {
+    use iphone_mirror_rs::transfer::afc::AfcTransfer;
+
+    let mut wifi_device = wifi::endpoint_from_env();
+    if wifi_device.is_none() {
+        wifi_device = wifi::WifiDiscovery::discover().await.ok().and_then(|devices| {
+            devices
+                .into_iter()
+                .find(|device| udid.is_none() || device.identifier == udid.unwrap_or_default())
+        });
+    }
+    let usb_device = if wifi_device.is_none() {
+        Some(DeviceScanner::select_device(udid).await?)
+    } else {
+        None
+    };
+    let source = if let Some(wifi_device) = &wifi_device {
+        TunnelSource::Wifi(wifi_device)
+    } else {
+        TunnelSource::Usb(usb_device.as_ref().expect("USB device selected"))
+    };
+
+    let mut tunnel = source.connect().await.context("CoreDevice/RSD connect failed")?;
+    let afc = AfcTransfer::connect(&mut tunnel.adapter, &mut tunnel.handshake)
+        .await
+        .context("AFC file service is unavailable")?;
+    let mut manager = TransferManager::spawn(afc, &mut tunnel.adapter, &mut tunnel.handshake)
+        .await
+        .context("Could not initialize file transfer")?;
+    let tx = manager.sender();
+    tx.send(TransferCommand::SendFiles(paths))
+        .context("Transfer queue closed")?;
+
+    while let Some(event) = manager.next_event().await {
+        match event {
+            TransferEvent::Started { files } => println!("Sending {files} file(s)"),
+            TransferEvent::Progress {
+                name,
+                sent,
+                total,
+                file_index,
+                file_count,
+            } => {
+                let percent = if total == 0 { 100 } else { sent * 100 / total };
+                println!("  [{file_index}/{file_count}] {name}: {percent}%");
+            }
+            TransferEvent::FileStaged { name, url, .. } => {
+                println!("  Staged {name}: {url}");
+            }
+            TransferEvent::Published { files } => println!("Published {files} file URL(s) on iPhone"),
+            TransferEvent::Completed { files } => {
+                println!("Done: {files} file(s) sent");
+                return Ok(());
+            }
+            TransferEvent::Failed { name, message } => {
+                anyhow::bail!("transfer failed for {:?}: {}", name, message);
+            }
+        }
+    }
+    anyhow::bail!("transfer ended without a result")
 }
 
 async fn diagnose(udid: Option<&str>) -> Result<()> {
@@ -1320,6 +1511,38 @@ async fn run_mirror() -> Result<()> {
     info!("Mirror window event loop created");
     let proxy = event_loop.create_proxy();
     let stream_proxy = proxy.clone();
+
+    // File-transfer pipeline. AFC and the pasteboard writer are independent
+    // tunnel connections, so the media task can keep owning the main tunnel.
+    let transfer_command_tx =
+        match AfcTransfer::connect(&mut tunnel.adapter, &mut tunnel.handshake).await {
+            Ok(afc) => {
+                match TransferManager::spawn(afc, &mut tunnel.adapter, &mut tunnel.handshake).await {
+                    Ok(mut manager) => {
+                        let tx = manager.sender();
+                        let transfer_proxy = proxy.clone();
+                        tokio::spawn(async move {
+                            while let Some(event) = manager.next_event().await {
+                                if transfer_proxy.send_event(UiEvent::Transfer(event)).is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                        info!("File transfer ready");
+                        Some(tx)
+                    }
+                    Err(error) => {
+                        warn!(%error, "Could not initialize the file transfer manager");
+                        None
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(%error, "AFC file service unavailable; drag-and-drop disabled");
+                None
+            }
+        };
+
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel(3);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1914,6 +2137,10 @@ async fn run_mirror() -> Result<()> {
         clipboard: SystemClipboard::new(),
         clipboard_tx,
         last_device_clipboard: None,
+        transfer_tx: transfer_command_tx,
+        drop_candidates: Vec::new(),
+        drop_deadline: None,
+        transfer_status: None,
         stream_error: None,
         shutting_down: false,
     };
