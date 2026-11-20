@@ -401,6 +401,7 @@ fn pcm_format() -> AudioStreamBasicDescription {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::{AudioPlayer, PCM_BYTES};
+    use std::sync::{Arc, atomic::AtomicU64};
 
     #[test]
     fn audio_queue_can_play_silence_then_resume_pcm() {
