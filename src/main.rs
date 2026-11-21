@@ -1507,6 +1507,15 @@ async fn run_mirror() -> Result<()> {
         .context("Failed to subscribe to iPhone clipboard changes")?;
     info!("Pasteboard services connected");
 
+    // Separate HID connection used only for the Cmd+V sent after a file drop.
+    let paste_hid = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        IndigoHidClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake),
+    )
+    .await
+    .context("Timed out connecting the auto-paste HID channel")?
+    .context("Failed to connect the auto-paste HID channel")?;
+
     let event_loop = winit::event_loop::EventLoop::<UiEvent>::with_user_event()
         .build()
         .context("Failed to create the macOS event loop")?;
@@ -1643,6 +1652,7 @@ async fn run_mirror() -> Result<()> {
     tokio::spawn(async move {
         let result: Result<()> = async {
             let mut tunnel = tunnel;
+            let mut paste_hid = paste_hid;
             let mut depacketizer = H265Depacketizer::new();
             let mut parameter_sets = ParameterSetCache::new();
             let mut decoder: Option<HardwareDecoder> = None;
@@ -1997,18 +2007,29 @@ async fn run_mirror() -> Result<()> {
                     }
                     Some(()) = paste_rx.recv() => {
                         // A dropped file was published on the device pasteboard.
-                        // Press Cmd+V on the virtual keyboard so the focused
-                        // iPhone app receives it without a manual paste step.
-                        let gui = idevice::core_device::KeyboardUsage::new(0xE3);
-                        let v = idevice::core_device::KeyboardUsage::new(0x19);
-                        if let (Ok(gui), Ok(v)) = (gui, v) {
-                            let _ = hid.set_main_keyboard_usages(
-                                &mut keyboard,
-                                vec![gui, v],
-                            ).await;
-                            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-                            let _ = hid.set_main_keyboard_usages(&mut keyboard, vec![]).await;
-                            info!("Sent Cmd+V after file drop");
+                        // Send Cmd+V as discrete Indigo keyboard events: the
+                        // modifier must go down before V and come up after it,
+                        // otherwise iOS only sees a bare "v".
+                        {
+                                let sequence: [(u64, ButtonState); 4] = [
+                                    (0xE3, ButtonState::Down), // Left GUI / Command
+                                    (0x19, ButtonState::Down), // V
+                                    (0x19, ButtonState::Up),
+                                    (0xE3, ButtonState::Up),
+                                ];
+                                let mut ok = true;
+                                for (usage, state) in sequence {
+                                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                                    if paste_hid.send_keyboard(usage, state).await.is_err() {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                                if ok {
+                                    info!("Sent Cmd+V after file drop");
+                                } else {
+                                    warn!("Could not send Cmd+V after file drop");
+                                }
                         }
                     }
                     Some(command) = input_rx.recv() => {
