@@ -8,7 +8,13 @@ use idevice::{
     RsdService,
 };
 use iphone_mirror_rs::{
-    audio::{AacEldDecoder, AudioPlayer},
+    audio::{
+        AacEldDecoder,
+        jitter::AudioJitter,
+        output::{
+            AudioOutput, AudioRestartReason, AudioTelemetry, create_output, diagnostics_enabled,
+        },
+    },
     codec::{decoder::HardwareDecoder, format_desc::FormatDescription, screenshot::save_frame_png},
     input::{
         clipboard::{ClipboardContent, SystemClipboard, MAX_CLIPBOARD_IMAGE_BYTES},
@@ -679,6 +685,13 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
             .unwrap_or(clipboard_deadline);
         event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(next));
     }
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn key_code_to_hid_usage(code: winit::keyboard::KeyCode) -> Option<u16> {
@@ -1723,17 +1736,23 @@ async fn run_mirror() -> Result<()> {
             let mut audio_highest_sequence = 0_u32;
             let mut audio_decode_errors = 0_u32;
             let mut audio_decoder = AacEldDecoder::new()?;
-            let audio_buffers_returned = Arc::new(AtomicU64::new(0));
-            let mut audio_player = AudioPlayer::new(audio_buffers_returned.clone())?;
+            // 300 ms at 48 kHz = 14,400 stereo sample-pairs.
+            let (mut audio_output, audio_ring, audio_mute) = create_output(14_400);
+            let audio_backend_name = audio_output.backend_name();
+            audio_output.prepare()?;
+            audio_output.start()?;
+            info!(backend = audio_backend_name, "Audio output started");
+            let telemetry = Arc::new(AudioTelemetry::new());
+            let mut audio_jitter = AudioJitter::new(8_000); // ~167 ms initial target
+            let mut ring_underflows_at_check = 0_u64;
+            let mut audio_was_muted = false;
             let mut audio_returned_at_check = 0_u64;
             let mut audio_stalled_ticks = 0_u32;
-            let mut audio_was_muted = false;
+            let mut last_audio_restart: Option<std::time::Instant> = None;
             let mut audio_rtcp = tokio::time::interval(std::time::Duration::from_secs(1));
             audio_rtcp.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            let mut audio_playback = tokio::time::interval(std::time::Duration::from_millis(10));
-            audio_playback.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut audio_jitter = std::collections::VecDeque::<Vec<u8>>::with_capacity(12);
-            let mut audio_jitter_drops = 0_u64;
+            let mut audio_diag = tokio::time::interval(std::time::Duration::from_secs(5));
+            audio_diag.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut audio_peak = 0_u16;
             let mut audio_pcm_bytes = 0_u64;
             let audio_stats_start = std::time::Instant::now();
@@ -1848,6 +1867,9 @@ async fn run_mirror() -> Result<()> {
                                 decoder_sets = None;
                                 video_highest_sequence = 0;
                                 audio_highest_sequence = 0;
+                                audio_ring.clear();
+                                audio_output
+                                    .restart(AudioRestartReason::MediaSessionRestarted)?;
                                 decoder_stalled_ticks = 0;
                                 frames_at_check = decoded_frames.load(Ordering::Relaxed);
                                 last_nal_at_check = nal_count;
@@ -1882,6 +1904,10 @@ async fn run_mirror() -> Result<()> {
                             continue;
                         }
                         audio_packet_count += 1;
+                        telemetry.rtp_packets.fetch_add(1, Ordering::Relaxed);
+                        telemetry
+                            .last_rtp_ms
+                            .store(now_millis(), Ordering::Relaxed);
                         let sequence = packet.sequence_number as u32;
                         let cycles = audio_highest_sequence >> 16;
                         let last_sequence = audio_highest_sequence & 0xFFFF;
@@ -1898,6 +1924,7 @@ async fn run_mirror() -> Result<()> {
                         {
                             audio_highest_sequence = extended;
                         }
+                        audio_jitter.observe(extended);
                         let payload_type = packet.payload_type;
                         if let Some((_, au_dump)) = audio_dump.as_mut() {
                             let _ = au_dump.write_all(&(packet.payload.len() as u32).to_le_bytes());
@@ -1906,30 +1933,28 @@ async fn run_mirror() -> Result<()> {
                         match audio_decoder.decode(&packet.payload) {
                             Ok(pcm) => {
                                 audio_decode_errors = 0;
+                                telemetry.decode_ok.fetch_add(1, Ordering::Relaxed);
                                 if let Some((pcm_dump, _)) = audio_dump.as_mut() {
                                     let _ = pcm_dump.write_all(&pcm);
                                 }
                                 audio_pcm_bytes += pcm.len() as u64;
-                                audio_peak = audio_peak.max(
-                                    pcm.chunks_exact(2)
-                                        .map(|sample| {
-                                            i16::from_le_bytes([sample[0], sample[1]]).unsigned_abs()
-                                        })
-                                        .max()
-                                        .unwrap_or(0),
-                                );
-                                // USB/tunnel delivery is bursty even though each AU represents
-                                // exactly 10 ms. Pace playback and cap queued latency at 120 ms;
-                                // dropping the oldest packet catches up instead of accumulating
-                                // seconds of stale audio.
-                                if audio_jitter.len() == 12 {
-                                    audio_jitter.pop_front();
-                                    audio_jitter_drops += 1;
-                                }
-                                audio_jitter.push_back(pcm);
+                                let samples: Vec<i16> = pcm
+                                    .chunks_exact(2)
+                                    .map(|s| i16::from_le_bytes([s[0], s[1]]))
+                                    .collect();
+                                audio_peak = audio_peak
+                                    .max(samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0));
+                                let written = audio_ring.write(&samples);
+                                telemetry
+                                    .frames_written
+                                    .fetch_add((written / 2) as u64, Ordering::Relaxed);
+                                telemetry
+                                    .last_pcm_ms
+                                    .store(now_millis(), Ordering::Relaxed);
                             }
                             Err(error) => {
                                 audio_decode_errors += 1;
+                                telemetry.decode_errors.fetch_add(1, Ordering::Relaxed);
                                 if audio_decode_errors == 1 {
                                     debug!(%error, payload_type, "AAC-ELD decode failed");
                                 }
@@ -1954,37 +1979,9 @@ async fn run_mirror() -> Result<()> {
                                 packets_per_second = audio_packet_count as f64 / elapsed,
                                 peak = audio_peak,
                                 pcm_bytes = audio_pcm_bytes,
-                                queue_dropped = audio_player.dropped(),
-                                jitter_dropped = audio_jitter_drops,
-                                jitter_depth = audio_jitter.len(),
+                                jitter_depth = audio_ring.frames_available(),
                                 "Playing iPhone system audio"
                             );
-                        }
-                    }
-                    _ = audio_playback.tick() => {
-                        let muted = audio_muted_stream.load(Ordering::Relaxed);
-                        if audio_was_muted && !muted {
-                            // Some Hackintosh CoreAudio drivers leave an output unit silent
-                            // after a prolonged run of zero-valued frames. Recreating only the
-                            // host output queue is cheap and leaves RTP/AAC state untouched.
-                            match AudioPlayer::new(audio_buffers_returned.clone()) {
-                                Ok(player) => {
-                                    audio_player = player;
-                                    info!("Recreated host audio output after unmute");
-                                }
-                                Err(error) => warn!(%error, "Failed to recreate host audio output after unmute"),
-                            }
-                        }
-                        audio_was_muted = muted;
-                        if let Some(pcm) = audio_jitter.pop_front() {
-                            let result = if muted {
-                                audio_player.play_silence()
-                            } else {
-                                audio_player.play(&pcm)
-                            };
-                            if let Err(error) = result {
-                                debug!(%error, "Audio queue rejected a decoded PCM packet");
-                            }
                         }
                     }
                     _ = audio_rtcp.tick() => {
@@ -1999,23 +1996,79 @@ async fn run_mirror() -> Result<()> {
                             }
                         }
 
-                        // AudioToolbox can leave an output queue silently
-                        // stopped after an underrun. Recreating it is exactly
-                        // what the manual mute/unmute path already does, so do
-                        // it automatically when no buffer comes back.
-                        let returned = audio_buffers_returned.load(Ordering::Relaxed);
-                        if returned > audio_returned_at_check {
-                            audio_returned_at_check = returned;
+                        // Mute changes are driven by the UI atomic; the backend
+                        // keeps its output alive and renders silence internally.
+                        let muted = audio_muted_stream.load(Ordering::Relaxed);
+                        if muted != audio_was_muted {
+                            audio_mute.set(muted);
+                            if !muted {
+                                // Never replay PCM captured while muted.
+                                audio_ring.clear();
+                            }
+                            audio_was_muted = muted;
+                            debug!(muted, "Audio mute state updated");
+                        }
+
+                        // A render callback that stops while RTP keeps arriving
+                        // means the output backend itself is wedged.
+                        let stats = audio_output.frame_stats();
+                        if stats.callbacks > audio_returned_at_check {
+                            audio_returned_at_check = stats.callbacks;
                             audio_stalled_ticks = 0;
                         } else if audio_stalled_ticks < 3 {
                             audio_stalled_ticks += 1;
                         }
-                        if audio_stalled_ticks >= 3 {
-                            warn!("Host audio output stopped; recreating AudioQueue");
-                            audio_player = AudioPlayer::new(audio_buffers_returned.clone())?;
-                            audio_returned_at_check = returned;
-                            audio_stalled_ticks = 0;
-                            info!("Host audio output recreated");
+                        if audio_stalled_ticks >= 3
+                            && telemetry.last_rtp_ms.load(Ordering::Relaxed) + 2000
+                                > now_millis()
+                        {
+                            let since = last_audio_restart
+                                .map(|t| t.elapsed())
+                                .unwrap_or(std::time::Duration::from_secs(3600));
+                            if since >= std::time::Duration::from_secs(2) {
+                                warn!("Audio render callback stopped; recreating backend");
+                                audio_output.restart(AudioRestartReason::RenderCallbackStalled)?;
+                                last_audio_restart = Some(std::time::Instant::now());
+                                audio_returned_at_check = audio_output.frame_stats().callbacks;
+                                audio_stalled_ticks = 0;
+                            }
+                        }
+                    }
+                    _ = audio_diag.tick() => {
+                        let stats = audio_output.frame_stats();
+                        if stats.underruns > ring_underflows_at_check {
+                            ring_underflows_at_check = stats.underruns;
+                            audio_jitter.on_underflow();
+                        } else {
+                            audio_jitter.tick_stable();
+                        }
+                        telemetry
+                            .callbacks
+                            .store(stats.callbacks, Ordering::Relaxed);
+                        telemetry
+                            .silence_frames
+                            .store(stats.silence_frames, Ordering::Relaxed);
+                        telemetry
+                            .underruns
+                            .store(stats.underruns, Ordering::Relaxed);
+                        telemetry
+                            .overruns
+                            .store(stats.overruns, Ordering::Relaxed);
+                        if diagnostics_enabled() {
+                            info!(
+                                backend = stats.backend,
+                                rtp = telemetry.rtp_packets.load(Ordering::Relaxed),
+                                decode_errors = telemetry.decode_errors.load(Ordering::Relaxed),
+                                ring_depth_ms = stats.frames_available / 48,
+                                target_ms = audio_jitter.stats().target_frames / 48,
+                                rtp_lost = audio_jitter.stats().lost,
+                                underruns = stats.underruns,
+                                overruns = stats.overruns,
+                                callbacks = stats.callbacks,
+                                silence_frames = stats.silence_frames,
+                                restarts = stats.restarts,
+                                "audio diagnostics"
+                            );
                         }
                     }
                     _ = decoder_check.tick() => {

@@ -2,7 +2,7 @@
 
 Native iPhone screen mirroring for macOS, written in Rust.
 
-- Version: **0.1.0-beta.2 (build 12)**
+- Version: **0.1.0-beta.3 (build 13)**
 - Host: **macOS 15 Sequoia** or **macOS 26 Tahoe**
 - Architecture: **x86_64** (Intel Mac and Hackintosh)
 - Tested device: **iPhone SE on iOS 27.2.1**
@@ -28,6 +28,8 @@ Native iPhone screen mirroring for macOS, written in Rust.
 - Full-resolution PNG screenshots.
 - Fullscreen, auto-rotate, and always-on-top controls.
 - Native SwiftUI connection launcher.
+- Hardware-clocked AudioUnit output with a lock-free PCM ring buffer, replacing the timer-driven AudioQueue path.
+- Selectable audio backend (`IPHONE_MIRROR_AUDIO_BACKEND=audiounit|audioqueue`) and opt-in diagnostics (`IPHONE_MIRROR_AUDIO_DIAGNOSTICS=1`).
 
 ## Installation
 
@@ -234,6 +236,13 @@ IPHONE_MIRROR_DUMP_NEGOTIATION=/path/to/directory
 
 # Disable Cmd+V after file transfer
 IPHONE_MIRROR_AUTO_PASTE=0
+
+# Select audio output backend (default: audiounit)
+IPHONE_MIRROR_AUDIO_BACKEND=audiounit
+IPHONE_MIRROR_AUDIO_BACKEND=audioqueue
+
+# Per-second audio sink diagnostics (RTP, ring depth, callbacks, restarts)
+IPHONE_MIRROR_AUDIO_DIAGNOSTICS=1
 ```
 
 The app-bundle backend log is written to the macOS temporary directory as:
@@ -267,9 +276,11 @@ iphone-mirror-backend.log
 
 ### Audio stops
 
-- Press `Ctrl+M` twice to manually recreate the output queue.
-- The app also recreates a stalled AudioQueue automatically.
-- Some Hackintosh audio drivers may still need additional testing.
+- Audio now runs through a hardware-clocked AudioUnit with a lock-free PCM ring buffer; short network gaps produce silence instead of stopping output.
+- Press `Ctrl+M` twice if a driver still needs a manual reset.
+- A wedged output backend is recreated automatically (with a cooldown).
+- Run with `IPHONE_MIRROR_AUDIO_DIAGNOSTICS=1` and check `callbacks`, `underruns`, and `restarts` in the log.
+- To compare against the legacy path, use `IPHONE_MIRROR_AUDIO_BACKEND=audioqueue`.
 
 ### Duplicate Launchpad icon
 

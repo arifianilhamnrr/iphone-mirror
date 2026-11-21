@@ -1,4 +1,10 @@
 // language: Rust, file: src/audio/mod.rs, target: macOS AudioToolbox
+pub mod audiounit;
+pub mod audioqueue;
+pub mod jitter;
+pub mod output;
+pub mod ring_buffer;
+
 use anyhow::{bail, Result};
 use std::{
     collections::VecDeque,
