@@ -1,141 +1,347 @@
-# iphone-mirror-rs
+# iPhone Mirror
 
-Experimental native iPhone screen mirroring client in Rust for **macOS 26 Tahoe** and **macOS 15 Sequoia**, with Intel Mac/Hackintosh support as a primary goal.
+Native iPhone screen mirroring for macOS, written in Rust.
 
-Current build: **0.1.0-beta.2 (build 12)**. The launcher shows this in the sidebar footer and in Settings → General, so you can tell which experimental build is running.
-
-### Drag-and-drop: Phase 0/1 (file-transfer foundation)
-
-An early transfer probe is available from the CLI:
-
-```bash
-./target/release/iphone-mirror probe-files
-```
-
-It stages a small text file on the iPhone over AFC, verifies the bytes, publishes its `file://` URL on the device pasteboard, then removes the temporary file. Open Files or Notes on the iPhone and paste to check whether the URL is accepted.
-
-Real files can be sent with `iphone-mirror send-files <path>...`. The same pipeline is used when you drag files from Finder onto the mirror window: the window title shows progress, and the file is staged under `/var/mobile/Media/Downloads/iphone-mirror-transfers` on the iPhone. The device pasteboard then gets **two representations** of the file: a `file://` URL and the file's inline content under its content UTI (for example `public.png` or `public.data`). After the drop, the app automatically sends ⌘V to the iPhone so the focused app receives the file without a manual paste. Set `IPHONE_MIRROR_AUTO_PASTE=0` to keep the manual paste step. Limits for this beta: 10 files, 100 MiB per file, 250 MiB per batch. If the device rejects a large inline payload, the transfer falls back to publishing the file URL only. Directories and symlinks are rejected.
+- Version: **0.1.0-beta.2 (build 12)**
+- Host: **macOS 15 Sequoia** or **macOS 26 Tahoe**
+- Architecture: **x86_64** (Intel Mac and Hackintosh)
+- Tested device: **iPhone SE on iOS 27.2.1**
+- Connections: **USB** and direct **Wi-Fi**
+- Status: experimental prerelease
 
 > [!IMPORTANT]
-> This project is under active development. End-to-end display streaming, Metal rendering, touch forwarding, text clipboard sync, keyboard input, and iPhone system audio playback work on tested hardware. Reconnect and release hardening are not complete yet.
+> This project uses private and undocumented Apple services. Compatibility may change after an iOS or macOS update.
 
----
+## Features
 
-## Current status
+- HEVC screen streaming through CoreDevice DisplayService.
+- VideoToolbox hardware decoding and native Metal rendering.
+- iPhone system audio playback through AudioToolbox.
+- Mouse click and drag translated to iPhone touchscreen input.
+- Two-finger trackpad and mouse-wheel scrolling.
+- Physical keyboard forwarding.
+- Text and image clipboard synchronization in both directions.
+- Finder drag-and-drop from Mac to iPhone.
+- Direct Wi-Fi mirroring through Bonjour and RemotePairing TLS-PSK.
+- Automatic compatible DeveloperDiskImage installation.
+- Automatic recovery after media stalls or RTP packet loss.
+- Full-resolution PNG screenshots.
+- Fullscreen, auto-rotate, and always-on-top controls.
+- Native SwiftUI connection launcher.
 
-- Working and hardware-tested: usbmuxd discovery, CoreDeviceProxy/RSD, display-service negotiation, tunneled RTP, HEVC depacketization, VideoToolbox decoding, and Metal presentation.
-- Implemented: aspect-fit mouse mapping and CoreDevice touchscreen down/move/up forwarding.
-- Hardware-tested: bidirectional text and image clipboard sharing between macOS and iPhone.
-- Implemented: physical laptop keyboard forwarding (letters, numbers, punctuation, navigation, function keys, and modifiers).
-- Hardware-tested: iPhone system audio playback on the host Mac (AAC-ELD, 48 kHz stereo, via AudioToolbox/AudioQueue), bounded 120 ms burst buffering, and RTCP receiver reports keeping the audio session alive.
-- Implemented: hardware-button shortcuts (Home, Lock, volume, mute) through the Indigo HID service.
-- Hardware-tested: full-resolution PNG screenshots, fullscreen, and always-on-top window controls.
-- Implemented: automatic session restart after a stream/tunnel failure; each retry recreates CoreDevice, VideoToolbox, AudioToolbox, HID, and clipboard state cleanly.
-- Implemented: automatic DeveloperDiskImage repair when `com.apple.coredevice.displayservice` is missing from the RSD catalog. iOS 27+ devices get a compatible Cryptex1 DDI downloaded and installed through `cryptexd` (including unmounting a stale Xcode 26 image), so an iOS update or a reboot no longer leaves mirroring broken.
-- Implemented: direct Wi-Fi mirroring over a RemotePairing TLS-PSK tunnel with Bonjour discovery and one-time USB pairing.
-- Implemented: RTCP receiver reports and Picture Loss Indication for both media streams, plus automatic media-session restart when the decoded video stalls, so a burst of RTP loss no longer leaves the picture frozen permanently.
-- In progress: file clipboard payloads and drag-and-drop transfer.
-- Planned: app-bundle polish and performance hardening.
-- Performance and zero-copy behavior have not been benchmarked yet.
+## Installation
 
----
+1. Open the [Releases](https://github.com/arifianilhamnrr/iphone-mirror/releases) page.
+2. Download `iPhone-Mirror-v0.1.0-beta.2-macOS-x86_64.dmg`.
+3. Open the DMG.
+4. Drag **iPhone Mirror.app** into **Applications**.
+5. Eject the DMG.
+6. Open `/Applications/iPhone Mirror.app`.
 
-## Build and diagnostics
+The app is ad-hoc signed and not notarized. If Gatekeeper blocks the first launch:
 
-Requirements: Xcode command-line tools and Rust 1.85 or newer.
+1. Open Finder and go to **Applications**.
+2. Right-click **iPhone Mirror**.
+3. Select **Open**.
+4. Confirm **Open** in the dialog.
+
+Install only one copy of the app. Running another copy from the DMG or a build directory can create duplicate Launchpad entries.
+
+## iPhone preparation
+
+- Enable **Developer Mode** on the iPhone.
+- Unlock the iPhone before the first connection.
+- Connect it to the Mac with a USB cable.
+- Accept the trust or pairing prompt when it appears.
+- Keep internet access available on first use so the app can download and personalize a compatible DeveloperDiskImage.
+
+## Using the app over USB
+
+1. Connect and unlock the iPhone.
+2. Open **iPhone Mirror**.
+3. Select **USB** or **Auto** in the launcher.
+4. Select the iPhone from the device list.
+5. Click **Start Mirroring**.
+6. The launcher hides and the mirror window opens.
+7. Close the mirror window to end the session; the launcher reappears automatically.
+
+## Enabling direct Wi-Fi mirroring
+
+Wi-Fi mirroring does not require Finder Wi-Fi Sync. One initial cable pairing is required to create the RemotePairing identity.
+
+1. Connect the iPhone by USB and unlock it.
+2. Open Terminal.
+3. Run:
 
 ```bash
-# 1. Clone repository
-git clone <your-repo-url>
-cd iphone-mirror-rs
-
-# 2. Build in release mode
-cargo build --release
-
-# 3. Connect and trust an iPhone, then list devices
-./target/release/iphone-mirror devices
-
-# 4. Verify CoreDevice/RSD and display-service availability
-./target/release/iphone-mirror diagnose
-
-# Select a device when multiple iPhones are connected
-./target/release/iphone-mirror diagnose --udid <UDID>
-
-# Pair once over USB so Wi-Fi mirroring works without a cable afterwards
-./target/release/iphone-mirror pair
+"/Applications/iPhone Mirror.app/Contents/Helpers/iPhone Mirror Stream.app/Contents/MacOS/iphone-mirror-backend" pair
 ```
 
-Set `IPHONE_MIRROR_LIST_SERVICES=1` to include the full RSD service catalog in diagnostic output. Use `RUST_LOG=debug` for detailed logs.
+4. Accept any pairing prompt on the iPhone.
+5. Wait for `Paired. Wi-Fi mirroring is now available for this Mac.`
+6. Disconnect the USB cable.
+7. Keep the Mac and iPhone on the same network.
+8. Open **iPhone Mirror**.
+9. Select **Wi-Fi** or **Auto**.
+10. Select the discovered iPhone and click **Start Mirroring**.
 
-To create a LaunchServices-ready, ad-hoc-signed app bundle and distributable ZIP:
+The pairing identity is stored at:
 
-```bash
-# Regenerate the checked-in icon only when its artwork changes (requires Pillow).
-make icon
-
-# Build, bundle, verify the signature, and create ZIP + DMG installer artifacts.
-make package
-
-open "dist/iPhone Mirror.app"
+```text
+~/Library/Application Support/iPhone Mirror/rppairing.plist
 ```
 
-The DMG presents `iPhone Mirror.app` next to an Applications shortcut: drag the app onto Applications to install it. `make package` also writes `dist/SHA256SUMS.txt`. Packaging itself only needs the Xcode command-line tools and Rust; the generated `resources/AppIcon.icns` is tracked so end users do not need Python/Pillow.
+Deleting that file requires pairing again by cable.
 
-Current release artifacts are built for Intel (`x86_64`) macOS. The app is ad-hoc signed but not Apple-notarized, so first launch may require right-clicking the app and choosing **Open**.
+## Controls
 
-The default `mirror` command establishes the CoreDevice tunnel and display-service session, decodes HEVC with VideoToolbox, and displays it in a native Metal window.
+### Pointer and trackpad
 
-The display service is provided by the mounted DeveloperDiskImage, not by iOS itself. If it is missing from the RSD catalog, the app automatically downloads the pinned Cryptex1 DDI (`27B52`, cached under `~/Library/Application Support/iPhone Mirror/DDI`), unmounts any stale image at `/System/Developer`, installs the new cryptex through `cryptexd`, and reconnects the tunnel. This needs internet access on first use (for the DDI download and Apple's TSS signing service) and Developer Mode enabled.
+- Click: tap the iPhone screen.
+- Click and drag: touchscreen drag.
+- Two-finger trackpad gesture: scroll.
+- Mouse wheel: scroll.
+- `↑` / `↓`: keyboard scrolling.
+- Clicks outside the displayed phone image are ignored.
 
-If the cable, tunnel, or display session drops, the supervisor waits two seconds and starts a fresh session automatically. The mirror window closes while disconnected and reappears after reconnection. Closing the window normally stops the supervisor.
-
-Disconnecting from the SwiftUI launcher, closing the mirror window, sending SIGTERM, or pressing Ctrl-C all use the same graceful shutdown path. The backend releases the virtual keyboard and waits for the iPhone to acknowledge `stop_media_stream` before exiting, so protected camera previews and view-once messages are no longer left blocked by a stale mirroring session.
-
-The app bundle opens a native SwiftUI launcher instead of starting with an empty mirror window. It continuously scans for ready USB/Finder Wi-Fi devices, shows nearby Bonjour iPhones that still need pairing, lets you select a device and transport, and starts the Rust media backend only after **Start Mirroring**. Settings use the standard macOS `Cmd+,` window and persist through `UserDefaults`.
-
-Connection mode can be **Auto**, **USB**, or **Wi-Fi** from the launcher sidebar or Settings. Auto treats USB and Network records with the same UDID as one phone and prefers USB. Wi-Fi uses a direct RemotePairing TLS-PSK tunnel: the backend discovers `_remotepairing._tcp` with `dns-sd`, pairs once over USB (`iphone-mirror pair`, or accept the on-device prompt on first connection), and stores the identity in `~/Library/Application Support/iPhone Mirror/rppairing.plist`. After that, mirroring over Wi-Fi needs no cable and no usbmuxd Network record. Finder Wi-Fi sync still works as before for the USB/Auto path.
-
-Click or drag inside the displayed phone image to send touchscreen input. Clicks in letterbox/pillarbox regions are ignored.
-
-Use a two-finger trackpad gesture (or a mouse wheel) while the pointer is over the mirrored phone to scroll. The wheel stream is translated into a continuous touchscreen drag beginning at the pointer position, so it works with ordinary iOS lists and web views rather than relying on a digital-crown HID event. The `↑` / `↓` arrow keys drive the same synthetic drag from the pointer position (or the screen centre when the pointer is outside the image), including OS key repeat. `Esc` sends the consumer-page "AC Back" hardware button.
-
-Text and image clipboard contents synchronize automatically in both directions while a mirror session is active. PNG and TIFF are accepted from macOS; PNG, JPEG, and TIFF snapshots are accepted from iPhone. Images larger than 20 MiB are ignored to keep memory and tunnel usage bounded. File clipboard payloads are not synchronized yet.
-
-Focus the mirror window and type while an editable field is active on the iPhone. Keyboard input uses physical USB HID usages, including Shift, Control, Option, and Command modifiers. The current implementation follows the physical key layout rather than macOS text composition, so IME/dead-key input is not supported yet.
-
-While a mirror session is active, the iPhone's system audio is decoded (AAC-ELD, 48 kHz stereo) and played through the host Mac's current output device. Audio starts automatically and is kept alive with RTCP receiver reports sent to the `RTCPRemotePort` from the negotiation answer; press `Ctrl+M` to mute playback locally. While muted, the queue receives 10 ms silent PCM frames instead of changing native AudioQueue volume/state. On unmute the host output queue is recreated before live PCM resumes, avoiding output units that remain silent on some Hackintosh audio drivers without disturbing RTP or AAC decoder state. The same recreation now happens automatically if AudioToolbox stops returning consumed buffers for three seconds, so the output no longer has to be muted and unmuted manually to recover. Set `IPHONE_MIRROR_AUDIO_DUMP=/some/directory` to write `au.bin` (length-prefixed access units) and `pcm.raw` for diagnostics.
-
-Keyboard shortcuts (hold Control):
+### Keyboard shortcuts
 
 | Shortcut | Action |
 | --- | --- |
 | `Ctrl+H` | Home |
-| `Ctrl+L` | Lock / sleep |
-| `Ctrl+[` / `Ctrl+]` | Volume down / up |
+| `Ctrl+L` | Lock or sleep |
+| `Ctrl+[` | Volume down |
+| `Ctrl+]` | Volume up |
 | `Ctrl+\` | Mute the iPhone |
-| `Ctrl+M` | Mute or unmute audio playback on the Mac (local only) |
-| `Ctrl+S` | Save a PNG to `~/Pictures/iPhone Mirror` |
+| `Ctrl+M` | Mute or unmute Mac audio playback |
+| `Ctrl+S` | Save a PNG screenshot |
 | `Ctrl+T` | Toggle always-on-top |
 | `Ctrl+Cmd+F` | Toggle borderless fullscreen |
-| `Cmd+,` | Open connection and auto-rotate settings |
-| `↑` / `↓` | Scroll the mirrored screen (synthetic touch drag, works with key repeat) |
-| `Esc` | Back (hardware "AC Back" button) |
+| `Cmd+,` | Open settings |
+| `↑` / `↓` | Scroll the mirrored screen |
+| `Esc` | Back |
 
-Auto-Rotate is enabled by default. When the incoming frame changes between portrait and landscape, the window swaps its dimensions while preserving aspect-fit rendering and touch/scroll mapping. Fullscreen size is not changed.
+Screenshots are saved to:
 
----
+```text
+~/Pictures/iPhone Mirror
+```
+
+## Clipboard
+
+- Text synchronizes automatically in both directions.
+- Images synchronize automatically in both directions.
+- macOS input formats: PNG and TIFF.
+- iPhone input formats: PNG, JPEG, and TIFF.
+- Clipboard images larger than 20 MiB are ignored.
+- IME composition and dead-key input are not currently supported.
+
+## Drag-and-drop files
+
+1. Open the destination app on the mirrored iPhone.
+2. Focus the destination field or conversation.
+3. Drag one or more files from Finder onto the mirror window.
+4. Wait for the transfer progress shown in the window title.
+5. The app stages the files on the iPhone and sends `Cmd+V` automatically.
+
+Transfer limits:
+
+- Maximum 10 files per batch.
+- Maximum 100 MiB per file.
+- Maximum 250 MiB per batch.
+- Directories are not supported.
+- Symbolic links are not supported.
+- Transfer currently works from Mac to iPhone only.
+- Some iPhone apps may not accept every pasteboard representation.
+- Unknown or large file types may fall back to a file URL.
+
+Disable automatic paste with:
+
+```bash
+IPHONE_MIRROR_AUTO_PASTE=0 \
+  "/Applications/iPhone Mirror.app/Contents/Helpers/iPhone Mirror Stream.app/Contents/MacOS/iphone-mirror-backend" mirror
+```
+
+Transferred files are staged under:
+
+```text
+/var/mobile/Media/Downloads/iphone-mirror-transfers
+```
+
+## Settings
+
+Open settings with `Cmd+,`.
+
+- **Automatic**: prefer USB when both USB and Wi-Fi are available.
+- **USB only**: list and use USB devices only.
+- **Wi-Fi only**: list and use direct RemotePairing devices only.
+- **Auto Connect**: start when a matching iPhone appears.
+- **Auto Rotate**: resize the mirror window when the incoming orientation changes.
+
+## Automatic DeveloperDiskImage repair
+
+- DisplayService is provided by the mounted DeveloperDiskImage, not directly by iOS.
+- If DisplayService is missing, the app downloads the pinned Cryptex1 DDI build `27B52`.
+- A stale image at `/System/Developer` is unmounted automatically.
+- The DDI is personalized through Apple's TSS service and installed through `cryptexd`.
+- The RSD tunnel is reopened after installation.
+- Downloaded assets are cached under:
+
+```text
+~/Library/Application Support/iPhone Mirror/DDI
+```
+
+Developer Mode and internet access are required for the first repair.
+
+## Diagnostics
+
+Build the project first, then use these commands from the repository root:
+
+```bash
+# List USB/usbmuxd and Bonjour Wi-Fi devices
+./target/release/iphone-mirror devices
+
+# Verify CoreDevice, RSD, and DisplayService
+./target/release/iphone-mirror diagnose
+
+# Diagnose a specific USB device
+./target/release/iphone-mirror diagnose --udid <UDID>
+
+# Create the one-time Wi-Fi pairing identity
+./target/release/iphone-mirror pair
+
+# Test AFC upload, readback, and device pasteboard publication
+./target/release/iphone-mirror probe-files
+
+# Send files through the drag-and-drop transfer pipeline
+./target/release/iphone-mirror send-files /path/to/file ...
+```
+
+Useful environment variables:
+
+```bash
+# Detailed logging
+RUST_LOG=debug
+
+# Include the full RSD service catalog in diagnose output
+IPHONE_MIRROR_LIST_SERVICES=1
+
+# Dump decoded audio data
+IPHONE_MIRROR_AUDIO_DUMP=/path/to/directory
+
+# Dump media negotiation replies
+IPHONE_MIRROR_DUMP_NEGOTIATION=/path/to/directory
+
+# Disable Cmd+V after file transfer
+IPHONE_MIRROR_AUTO_PASTE=0
+```
+
+The app-bundle backend log is written to the macOS temporary directory as:
+
+```text
+iphone-mirror-backend.log
+```
+
+## Troubleshooting
+
+### No device appears
+
+- Unlock and reconnect the iPhone.
+- Accept the trust prompt.
+- Confirm Apple Mobile Device services are running.
+- For Wi-Fi, run the one-time `pair` command again.
+- Confirm the Mac and iPhone are on the same network.
+
+### DisplayService is unavailable
+
+- Confirm Developer Mode is enabled.
+- Connect to the internet.
+- Restart the app and allow automatic DDI repair to finish.
+- Run `diagnose` and check `Display service: available`.
+
+### Video freezes
+
+- The app sends RTCP feedback and restarts a stalled media session automatically.
+- Wi-Fi RTP packet loss can still cause a short interruption before recovery.
+- Use USB for the lowest latency and highest stability.
+
+### Audio stops
+
+- Press `Ctrl+M` twice to manually recreate the output queue.
+- The app also recreates a stalled AudioQueue automatically.
+- Some Hackintosh audio drivers may still need additional testing.
+
+### Duplicate Launchpad icon
+
+- Keep only `/Applications/iPhone Mirror.app` installed.
+- Eject mounted installer DMGs.
+- Do not run a loose `.app` copy from another directory.
+- Restart Dock after removing duplicate copies:
+
+```bash
+killall Dock
+```
+
+## Building from source
+
+Requirements:
+
+- Xcode command-line tools.
+- Rust 1.85 or newer.
+- Python and Pillow only when regenerating the icon.
+
+```bash
+git clone https://github.com/arifianilhamnrr/iphone-mirror.git
+cd iphone-mirror
+cargo build --release
+```
+
+Create and verify an app bundle:
+
+```bash
+make verify
+open "dist/iPhone Mirror.app"
+```
+
+Create release packages:
+
+```bash
+make package
+```
+
+Generated artifacts:
+
+```text
+dist/iPhone-Mirror-v0.1.0-beta.2-macOS-x86_64.dmg
+dist/iPhone-Mirror-v0.1.0-beta.2-macOS-x86_64.zip
+dist/SHA256SUMS.txt
+```
+
+`make package` removes the loose app bundle from `dist/` after packaging to prevent duplicate Launchpad entries.
 
 ## Architecture
 
-```
+```text
 src/
-├── audio/           # AAC-ELD decode (AudioConverter) & PCM playback (AudioQueue)
-├── codec/           # Hardware VideoToolbox FFI & CMFormatDescription bindings
-├── input/           # CoreDevice HID Touch serialization & coordinate mapper
-├── media/           # RFC 7798 RTP parser, H.265 depacketizer & UDP receiver
-├── protocol/        # displayservice client & AVConference zlib offer negotiator
-├── transport/       # usbmuxd device scanner & RemoteXPC RSD software tunnel
-├── ui/              # macOS windowing & Metal rendering surface
+├── audio/       # AAC-ELD decoding and AudioQueue playback
+├── codec/       # VideoToolbox decoding and screenshots
+├── input/       # Touch, keyboard, shortcuts, and clipboard
+├── media/       # RTP parsing and HEVC depacketization
+├── protocol/    # DisplayService negotiation and RTCP feedback
+├── transfer/    # AFC staging, pasteboard publication, and file limits
+├── transport/   # usbmuxd, CoreDeviceProxy, RSD, DDI, and Wi-Fi pairing
+├── ui/          # macOS window and Metal renderer
 ├── lib.rs
 └── main.rs
 ```
+
+## Known limitations
+
+- Tested hardware coverage is currently limited.
+- Release artifacts are x86_64 only.
+- The app is not notarized.
+- The software TCP tunnel may lose RTP bursts over Wi-Fi.
+- File transfer is Mac to iPhone only.
+- Folder transfer is not implemented.
+- Performance and zero-copy behavior have not been benchmarked.
+- Sustained throughput, roaming, and sleep/wake reliability need more testing.
