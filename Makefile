@@ -25,6 +25,9 @@ icon:
 
 bundle: build
 	@echo "Bundling $(APP)..."
+	# Keep the built .app in dist/ from being indexed by Spotlight/LaunchServices;
+	# otherwise Launchpad shows a duplicate next to the installed /Applications copy.
+	@touch dist/.metadata_never_index
 	rm -rf "$(APP)"
 	mkdir -p "$(APP)/Contents/MacOS" "$(APP)/Contents/Resources" "$(HELPER)/Contents/MacOS" "$(HELPER)/Contents/Resources"
 	cp Info.plist "$(APP)/Contents/Info.plist"
