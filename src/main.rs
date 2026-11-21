@@ -1207,9 +1207,11 @@ async fn send_files(udid: Option<&str>, paths: Vec<std::path::PathBuf>) -> Resul
     let afc = AfcTransfer::connect(&mut tunnel.adapter, &mut tunnel.handshake)
         .await
         .context("AFC file service is unavailable")?;
-    let mut manager = TransferManager::spawn(afc, &mut tunnel.adapter, &mut tunnel.handshake)
-        .await
-        .context("Could not initialize file transfer")?;
+    let (paste_tx, _paste_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut manager =
+        TransferManager::spawn(afc, &mut tunnel.adapter, &mut tunnel.handshake, paste_tx)
+            .await
+            .context("Could not initialize file transfer")?;
     let tx = manager.sender();
     tx.send(TransferCommand::SendFiles(paths))
         .context("Transfer queue closed")?;
@@ -1514,10 +1516,11 @@ async fn run_mirror() -> Result<()> {
 
     // File-transfer pipeline. AFC and the pasteboard writer are independent
     // tunnel connections, so the media task can keep owning the main tunnel.
+    let (paste_tx, mut paste_rx) = tokio::sync::mpsc::unbounded_channel();
     let transfer_command_tx =
         match AfcTransfer::connect(&mut tunnel.adapter, &mut tunnel.handshake).await {
             Ok(afc) => {
-                match TransferManager::spawn(afc, &mut tunnel.adapter, &mut tunnel.handshake).await {
+                match TransferManager::spawn(afc, &mut tunnel.adapter, &mut tunnel.handshake, paste_tx).await {
                     Ok(mut manager) => {
                         let tx = manager.sender();
                         let transfer_proxy = proxy.clone();
@@ -1990,6 +1993,22 @@ async fn run_mirror() -> Result<()> {
                     changed = shutdown_rx.changed() => {
                         if changed.is_err() || *shutdown_rx.borrow() {
                             break;
+                        }
+                    }
+                    Some(()) = paste_rx.recv() => {
+                        // A dropped file was published on the device pasteboard.
+                        // Press Cmd+V on the virtual keyboard so the focused
+                        // iPhone app receives it without a manual paste step.
+                        let gui = idevice::core_device::KeyboardUsage::new(0xE3);
+                        let v = idevice::core_device::KeyboardUsage::new(0x19);
+                        if let (Ok(gui), Ok(v)) = (gui, v) {
+                            let _ = hid.set_main_keyboard_usages(
+                                &mut keyboard,
+                                vec![gui, v],
+                            ).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                            let _ = hid.set_main_keyboard_usages(&mut keyboard, vec![]).await;
+                            info!("Sent Cmd+V after file drop");
                         }
                     }
                     Some(command) = input_rx.recv() => {

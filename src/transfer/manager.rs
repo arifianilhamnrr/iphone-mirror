@@ -2,7 +2,7 @@
 use super::{
     afc::AfcTransfer,
     error::{Result, TransferError},
-    metadata::{file_url, validate_paths},
+    metadata::{MAX_FILE_BYTES, file_url, validate_paths},
     pasteboard::{PasteboardFile, UrlPasteboard, uti_for_name},
 };
 use idevice::RsdService;
@@ -46,6 +46,7 @@ impl TransferManager {
         mut afc: AfcTransfer,
         provider: &mut impl idevice::provider::RsdProvider,
         handshake: &mut idevice::rsd::RsdHandshake,
+        paste_request: mpsc::UnboundedSender<()>,
     ) -> Result<Self> {
         let pasteboard = UrlPasteboard::connect_rsd(provider, handshake)
             .await
@@ -59,7 +60,8 @@ impl TransferManager {
                 match command {
                     TransferCommand::SendFiles(paths) => {
                         if let Err(error) =
-                            send_batch(&mut afc, &mut pasteboard, &event_tx, paths).await
+                            send_batch(&mut afc, &mut pasteboard, &event_tx, &paste_request, paths)
+                                .await
                         {
                             let _ = event_tx.send(TransferEvent::Failed {
                                 name: None,
@@ -96,17 +98,27 @@ impl TransferManager {
     }
 }
 
+fn auto_paste_enabled() -> bool {
+    !matches!(
+        std::env::var("IPHONE_MIRROR_AUTO_PASTE").as_deref(),
+        Ok("0") | Ok("false")
+    )
+}
+
 async fn send_batch(
     afc: &mut AfcTransfer,
     pasteboard: &mut UrlPasteboard,
     events: &mpsc::UnboundedSender<TransferEvent>,
+    paste_request: &mpsc::UnboundedSender<()>,
     paths: Vec<PathBuf>,
 ) -> Result<()> {
     let files = validate_paths(&paths)?;
     let file_count = files.len();
     let _ = events.send(TransferEvent::Started { files: file_count });
 
-    const INLINE_LIMIT: usize = 20 * 1024 * 1024;
+    // Match the per-file limit: the pasteboard can usually hold larger inline
+    // payloads than the old conservative 20 MiB cap assumed.
+    let inline_limit = MAX_FILE_BYTES as usize;
     let mut pasted = Vec::with_capacity(file_count);
     for (index, file) in files.iter().enumerate() {
         let name = file.name.clone();
@@ -124,7 +136,7 @@ async fn send_batch(
 
         let url = file_url(&remote);
         let bytes = tokio::fs::read(&file.path).await.unwrap_or_default();
-        let data = if bytes.len() <= INLINE_LIMIT { bytes } else { Vec::new() };
+        let data = if bytes.len() <= inline_limit { bytes } else { Vec::new() };
         pasted.push(PasteboardFile {
             url: url.clone(),
             name: name.clone(),
@@ -139,14 +151,24 @@ async fn send_batch(
         info!(file_index = index + 1, file_count, "staged transfer file");
     }
 
-    pasteboard
-        .set_files(&pasted)
-        .await
-        .map_err(TransferError::Device)?;
+    if let Err(error) = pasteboard.set_files(&pasted).await {
+        tracing::warn!(%error, "inline pasteboard payload rejected; retrying with URLs only");
+        for file in &mut pasted {
+            file.data.clear();
+        }
+        pasteboard
+            .set_files(&pasted)
+            .await
+            .map_err(TransferError::Device)?;
+    }
     // Give the daemon a moment to commit the SET before the owning task (and
     // its XPC connection) goes away.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let _ = events.send(TransferEvent::Published { files: file_count });
+    // Simulate Cmd+V so a drop lands directly in the focused iPhone app.
+    if auto_paste_enabled() {
+        let _ = paste_request.send(());
+    }
     let _ = events.send(TransferEvent::Completed { files: file_count });
     Ok(())
 }
