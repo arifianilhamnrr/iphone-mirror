@@ -346,8 +346,8 @@ struct ContentView: View {
                         Text("No iPhone found")
                             .font(.system(size: 14, weight: .semibold))
                         Text(model.transport == "wifi"
-                            ? "Run `iphone-mirror pair` once with the cable connected, then enable “Show this iPhone when on Wi-Fi” in Finder."
-                            : "Connect by USB, or pair once with `iphone-mirror pair` for Wi-Fi.")
+                            ? "Connect the iPhone once by cable and accept the pairing prompt, then it will mirror directly over Wi-Fi."
+                            : "Connect by USB, or pair once by cable to enable Wi-Fi mirroring.")
                             .font(.system(size: 12))
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -366,7 +366,7 @@ struct ContentView: View {
 
                 if model.transport != "usb", !model.nearbyDevices.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Nearby on Wi-Fi")
+                        Text("Discovered on Wi-Fi")
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(.secondary)
                         ForEach(model.nearbyDevices) { device in
@@ -377,7 +377,7 @@ struct ContentView: View {
                                     Text(device.displayName)
                                         .font(.system(size: 12, weight: .medium))
                                         .lineLimit(1)
-                                    Text("Pair in Finder to enable mirroring")
+                                    Text("Ready for direct Wi-Fi mirroring")
                                         .font(.system(size: 10))
                                         .foregroundStyle(.tertiary)
                                 }
@@ -431,7 +431,7 @@ struct ContentView: View {
                         .padding(.bottom, 24)
                     Text("Connect an iPhone")
                         .font(.system(size: 25, weight: .semibold))
-                    Text("Use USB for the lowest latency, or pair once in Finder to mirror over Wi-Fi.")
+                    Text("Use USB for the lowest latency, or pair once by cable to mirror directly over Wi-Fi.")
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                         .frame(maxWidth: 370)
