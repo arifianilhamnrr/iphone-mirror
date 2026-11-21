@@ -2,7 +2,7 @@
 
 Experimental native iPhone screen mirroring client in Rust for **macOS 26 Tahoe** and **macOS 15 Sequoia**, with Intel Mac/Hackintosh support as a primary goal.
 
-Current build: **0.1.0-beta.2 (build 11)**. The launcher shows this in the sidebar footer and in Settings → General, so you can tell which experimental build is running.
+Current build: **0.1.0-beta.2 (build 12)**. The launcher shows this in the sidebar footer and in Settings → General, so you can tell which experimental build is running.
 
 ### Drag-and-drop: Phase 0/1 (file-transfer foundation)
 

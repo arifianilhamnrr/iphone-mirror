@@ -147,6 +147,15 @@ struct MirrorApp {
     touch_active: bool,
     scroll_active: bool,
     scroll_deadline: Option<std::time::Instant>,
+    /// Synthetic touch is only started after enough movement accumulated, so a
+    /// tiny scroll flick does not become a tap on the iPhone.
+    scroll_started: bool,
+    scroll_accum: (f64, f64),
+    scroll_anchor: (u16, u16),
+    /// A two-finger scroll may end with the trackpad registering a small tap
+    /// (especially on Hackintosh touchpads). Ignore left clicks briefly after
+    /// a scroll so lifting the fingers does not fire an accidental tap.
+    suppress_click_until: Option<std::time::Instant>,
     last_touch_position: Option<(u16, u16)>,
     input_tx: tokio::sync::mpsc::UnboundedSender<InputCommand>,
     button_tx: tokio::sync::mpsc::UnboundedSender<HardwareButton>,
@@ -357,6 +366,14 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                 ..
             } => match state {
                 winit::event::ElementState::Pressed => {
+                    if self.scroll_active
+                        || self
+                            .suppress_click_until
+                            .is_some_and(|deadline| std::time::Instant::now() < deadline)
+                    {
+                        debug!("Ignoring click during/after a trackpad scroll");
+                        return;
+                    }
                     if let Some(position) = self.cursor_position {
                         if let Some((x, y)) = self.touch_coordinates(position) {
                             self.touch_active = true;
@@ -399,19 +416,44 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                     }
                 };
                 if phase == winit::event::TouchPhase::Started || !self.scroll_active {
-                    let anchor = self
+                    self.scroll_anchor = self
                         .cursor_position
                         .and_then(|position| self.touch_coordinates(position))
                         .unwrap_or((u16::MAX / 2, u16::MAX / 2));
                     self.scroll_active = true;
-                    let _ = self
-                        .input_tx
-                        .send(InputCommand::ScrollStart(anchor.0, anchor.1));
+                    self.scroll_started = false;
+                    self.scroll_accum = (0.0, 0.0);
                 }
                 if x != 0.0 || y != 0.0 {
+                    self.scroll_accum.0 += x;
+                    self.scroll_accum.1 += y;
+
+                    const START_THRESHOLD: f64 = 6.0; // screen pixels
+                    if !self.scroll_started {
+                        let magnitude = self.scroll_accum.0.hypot(self.scroll_accum.1);
+                        if magnitude < START_THRESHOLD {
+                            // Let the gesture gather momentum first; a touch down
+                            // here would read as a tap when the fingers lift.
+                            if matches!(
+                                phase,
+                                winit::event::TouchPhase::Ended | winit::event::TouchPhase::Cancelled
+                            ) {
+                                self.end_scroll();
+                            }
+                            return;
+                        }
+                        let _ = self.input_tx.send(InputCommand::ScrollStart(
+                            self.scroll_anchor.0,
+                            self.scroll_anchor.1,
+                        ));
+                        self.scroll_started = true;
+                    }
+
                     // Scale trackpad pixels into the 0...65535 touchscreen
                     // coordinate domain. Positive wheel motion is positive
                     // finger motion, preserving the macOS natural-scroll setting.
+                    let (ax, ay) = self.scroll_accum;
+                    self.scroll_accum = (0.0, 0.0);
                     let scale = self
                         .window
                         .as_ref()
@@ -424,19 +466,17 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                         })
                         .unwrap_or((100.0, 100.0));
                     let _ = self.input_tx.send(InputCommand::ScrollMove(
-                        (x * scale.0).round() as i32,
-                        (y * scale.1).round() as i32,
+                        (ax * scale.0).round() as i32,
+                        (ay * scale.1).round() as i32,
                     ));
                     self.scroll_deadline =
-                        Some(std::time::Instant::now() + std::time::Duration::from_millis(120));
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(250));
                 }
                 if matches!(
                     phase,
                     winit::event::TouchPhase::Ended | winit::event::TouchPhase::Cancelled
                 ) {
-                    self.scroll_active = false;
-                    self.scroll_deadline = None;
-                    let _ = self.input_tx.send(InputCommand::ScrollEnd);
+                    self.end_scroll();
                 }
             }
             winit::event::WindowEvent::ModifiersChanged(modifiers) => {
@@ -602,9 +642,7 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
     fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         let now = std::time::Instant::now();
         if self.scroll_active && self.scroll_deadline.is_some_and(|deadline| now >= deadline) {
-            self.scroll_active = false;
-            self.scroll_deadline = None;
-            let _ = self.input_tx.send(InputCommand::ScrollEnd);
+            self.end_scroll();
         }
         if self
             .drop_deadline
@@ -766,6 +804,9 @@ impl MirrorApp {
             .unwrap_or((u16::MAX / 2, u16::MAX / 2));
         if !self.scroll_active {
             self.scroll_active = true;
+            self.scroll_started = true;
+            self.scroll_accum = (0.0, 0.0);
+            self.scroll_anchor = anchor;
             let _ = self
                 .input_tx
                 .send(InputCommand::ScrollStart(anchor.0, anchor.1));
@@ -780,7 +821,18 @@ impl MirrorApp {
         if self.scroll_active {
             self.scroll_active = false;
             self.scroll_deadline = None;
-            let _ = self.input_tx.send(InputCommand::ScrollEnd);
+            // Only lift a synthetic finger if one was actually placed. A tiny
+            // scroll that never crossed the threshold becomes a no-op instead
+            // of a tap.
+            if self.scroll_started {
+                let _ = self.input_tx.send(InputCommand::ScrollEnd);
+            }
+            self.scroll_started = false;
+            self.scroll_accum = (0.0, 0.0);
+            // Suppress the phantom click some trackpads emit when the fingers
+            // are lifted at the end of a two-finger scroll.
+            self.suppress_click_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(400));
         }
     }
 
@@ -2163,6 +2215,10 @@ async fn run_mirror() -> Result<()> {
         touch_active: false,
         scroll_active: false,
         scroll_deadline: None,
+        scroll_started: false,
+        scroll_accum: (0.0, 0.0),
+        scroll_anchor: (u16::MAX / 2, u16::MAX / 2),
+        suppress_click_until: None,
         last_touch_position: None,
         input_tx,
         button_tx,
