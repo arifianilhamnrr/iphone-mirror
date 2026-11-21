@@ -52,6 +52,9 @@ package: verify installer
 	rm -f "$(ZIP)"
 	ditto -c -k --sequesterRsrc --keepParent "$(APP)" "$(ZIP)"
 	$(MAKE) checksums
+	# Remove the loose .app after packaging: a second copy with the same bundle
+	# ID in dist/ makes Launchpad show a duplicate of the installed app.
+	rm -rf "$(APP)"
 	@echo "Packages complete: $(ZIP) and $(DMG)"
 
 installer: verify
