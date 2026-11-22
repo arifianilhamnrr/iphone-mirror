@@ -2,7 +2,7 @@
 
 Native iPhone screen mirroring for macOS, written in Rust.
 
-- Version: **0.1.0-beta.3 (build 13)**
+- Version: **0.1.0-beta.3 (build 14)**
 - Host: **macOS 15 Sequoia** or **macOS 26 Tahoe**
 - Architecture: **x86_64** (Intel Mac and Hackintosh)
 - Tested device: **iPhone SE on iOS 27.2.1**
@@ -29,6 +29,9 @@ Native iPhone screen mirroring for macOS, written in Rust.
 - Fullscreen, auto-rotate, and always-on-top controls.
 - Native SwiftUI connection launcher.
 - Hardware-clocked AudioUnit output with a lock-free PCM ring buffer, replacing the timer-driven AudioQueue path.
+- Audio RTP reorder buffer with silence concealment for lost packets.
+- Output-device change detection with automatic backend recreation.
+- Accurate RTCP receiver reports (loss fraction, cumulative loss, jitter, LSR/DLSR).
 - Selectable audio backend (`IPHONE_MIRROR_AUDIO_BACKEND=audiounit|audioqueue`) and opt-in diagnostics (`IPHONE_MIRROR_AUDIO_DIAGNOSTICS=1`).
 
 ## Installation

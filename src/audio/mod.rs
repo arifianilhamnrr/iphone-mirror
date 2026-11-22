@@ -3,6 +3,7 @@ pub mod audiounit;
 pub mod audioqueue;
 pub mod jitter;
 pub mod output;
+pub mod reorder;
 pub mod ring_buffer;
 
 use anyhow::{bail, Result};

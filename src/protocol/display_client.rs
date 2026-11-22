@@ -159,18 +159,24 @@ impl DisplayClient {
 
     /// Build a compound RTCP Receiver Report + SDES. The device uses these to
     /// keep both media streams alive (RTCPTimeoutInterval).
-    fn receiver_report(session: &RtcpSession, highest_sequence: u32) -> Vec<u8> {
+    fn receiver_report(
+        session: &RtcpSession,
+        highest_sequence: u32,
+        stats: &super::rtcp_stats::RtcpReportStats,
+    ) -> Vec<u8> {
         let mut packet = Vec::with_capacity(48);
         packet.extend_from_slice(&[
             0x81, 0xC9, 0x00, 0x07, // V=2, RC=1, PT=RR, length=7 words
         ]);
         packet.extend_from_slice(&session.local_ssrc.to_be_bytes());
         packet.extend_from_slice(&session.remote_ssrc.to_be_bytes());
-        packet.extend_from_slice(&[0, 0, 0, 0]); // fraction lost + cumulative loss
+        let cumulative = stats.cumulative_lost.clamp(0, 0x00FF_FFFF) as u32;
+        let lost_word = ((stats.fraction_lost as u32) << 24) | cumulative;
+        packet.extend_from_slice(&lost_word.to_be_bytes());
         packet.extend_from_slice(&highest_sequence.to_be_bytes());
-        packet.extend_from_slice(&[0, 0, 0, 0]); // jitter
-        packet.extend_from_slice(&[0, 0, 0, 0]); // last SR
-        packet.extend_from_slice(&[0, 0, 0, 0]); // delay since last SR
+        packet.extend_from_slice(&stats.jitter.to_be_bytes());
+        packet.extend_from_slice(&stats.lsr.to_be_bytes());
+        packet.extend_from_slice(&stats.dlsr.to_be_bytes());
         packet.extend_from_slice(&[
             0x81, 0xCA, 0x00, 0x02, // V=2, SC=1, PT=SDES, length=2 words
         ]);
@@ -179,14 +185,20 @@ impl DisplayClient {
         packet
     }
 
-    pub fn audio_rtcp_report(&self, highest_sequence: u32) -> Option<Vec<u8>> {
+    pub fn audio_rtcp_report(
+        &self,
+        stats: &super::rtcp_stats::RtcpReportStats,
+    ) -> Option<Vec<u8>> {
         self.audio_session
-            .map(|session| Self::receiver_report(&session, highest_sequence))
+            .map(|session| Self::receiver_report(&session, stats.extended_highest(), stats))
     }
 
-    pub fn video_rtcp_report(&self, highest_sequence: u32) -> Option<Vec<u8>> {
+    pub fn video_rtcp_report(
+        &self,
+        stats: &super::rtcp_stats::RtcpReportStats,
+    ) -> Option<Vec<u8>> {
         self.video_session
-            .map(|session| Self::receiver_report(&session, highest_sequence))
+            .map(|session| Self::receiver_report(&session, stats.extended_highest(), stats))
     }
 
     /// RTCP Picture Loss Indication (RFC 4585, PT=206/FMT=1). Without this the

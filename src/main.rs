@@ -14,6 +14,7 @@ use iphone_mirror_rs::{
         output::{
             AudioOutput, AudioRestartReason, AudioTelemetry, create_output, diagnostics_enabled,
         },
+        reorder::{AudioPacket, AudioReorder, ReorderedAudio},
     },
     codec::{decoder::HardwareDecoder, format_desc::FormatDescription, screenshot::save_frame_png},
     input::{
@@ -22,7 +23,7 @@ use iphone_mirror_rs::{
     },
     media::nal_parser::ParameterSetCache,
     media::{h265_depacketizer::H265Depacketizer, rtp::RtpPacket},
-    protocol::display_client::DisplayClient,
+    protocol::{display_client::DisplayClient, rtcp_stats::RtcpReportStats},
     transfer::{
         afc::AfcTransfer,
         manager::{TransferCommand, TransferEvent, TransferManager},
@@ -1744,11 +1745,15 @@ async fn run_mirror() -> Result<()> {
             info!(backend = audio_backend_name, "Audio output started");
             let telemetry = Arc::new(AudioTelemetry::new());
             let mut audio_jitter = AudioJitter::new(8_000); // ~167 ms initial target
+            let mut audio_reorder = AudioReorder::new(8, std::time::Duration::from_millis(25));
+            let mut audio_rtcp_stats = RtcpReportStats::new();
+            let mut video_rtcp_stats = RtcpReportStats::new();
             let mut ring_underflows_at_check = 0_u64;
             let mut audio_was_muted = false;
             let mut audio_returned_at_check = 0_u64;
             let mut audio_stalled_ticks = 0_u32;
             let mut last_audio_restart: Option<std::time::Instant> = None;
+            let mut audio_output_device = audio_output.current_output_device().unwrap_or(0);
             let mut audio_rtcp = tokio::time::interval(std::time::Duration::from_secs(1));
             audio_rtcp.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut audio_diag = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -1925,52 +1930,64 @@ async fn run_mirror() -> Result<()> {
                             audio_highest_sequence = extended;
                         }
                         audio_jitter.observe(extended);
+                        audio_rtcp_stats.observe(extended, packet.timestamp);
                         let payload_type = packet.payload_type;
-                        if let Some((_, au_dump)) = audio_dump.as_mut() {
-                            let _ = au_dump.write_all(&(packet.payload.len() as u32).to_le_bytes());
-                            let _ = au_dump.write_all(&packet.payload);
-                        }
-                        match audio_decoder.decode(&packet.payload) {
-                            Ok(pcm) => {
-                                audio_decode_errors = 0;
-                                telemetry.decode_ok.fetch_add(1, Ordering::Relaxed);
-                                if let Some((pcm_dump, _)) = audio_dump.as_mut() {
-                                    let _ = pcm_dump.write_all(&pcm);
-                                }
-                                audio_pcm_bytes += pcm.len() as u64;
-                                let samples: Vec<i16> = pcm
-                                    .chunks_exact(2)
-                                    .map(|s| i16::from_le_bytes([s[0], s[1]]))
-                                    .collect();
-                                audio_peak = audio_peak
-                                    .max(samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0));
-                                let written = audio_ring.write(&samples);
-                                telemetry
-                                    .frames_written
-                                    .fetch_add((written / 2) as u64, Ordering::Relaxed);
-                                telemetry
-                                    .last_pcm_ms
-                                    .store(now_millis(), Ordering::Relaxed);
-                            }
-                            Err(error) => {
-                                audio_decode_errors += 1;
-                                telemetry.decode_errors.fetch_add(1, Ordering::Relaxed);
-                                if audio_decode_errors == 1 {
-                                    debug!(%error, payload_type, "AAC-ELD decode failed");
-                                }
-                                if audio_decode_errors >= 5 {
-                                    match AacEldDecoder::new() {
-                                        Ok(decoder) => {
-                                            audio_decoder = decoder;
-                                            audio_decode_errors = 0;
-                                            info!("Recreated the AAC-ELD decoder after repeated failures");
-                                        }
+                        audio_reorder.push(AudioPacket {
+                            sequence: extended,
+                            timestamp: packet.timestamp,
+                            payload: packet.payload.clone(),
+                        });
+
+                        for reordered in audio_reorder.pop_ready() {
+                            let pcm = match reordered {
+                                ReorderedAudio::Silence => vec![0_u8; 1920],
+                                ReorderedAudio::Packet(packet) => {
+                                    if let Some((_, au_dump)) = audio_dump.as_mut() {
+                                        let _ = au_dump.write_all(&(packet.payload.len() as u32).to_le_bytes());
+                                        let _ = au_dump.write_all(&packet.payload);
+                                    }
+                                    match audio_decoder.decode(&packet.payload) {
+                                        Ok(pcm) => pcm,
                                         Err(error) => {
-                                            warn!(%error, "Failed to recreate the AAC-ELD decoder");
+                                            audio_decode_errors += 1;
+                                            telemetry.decode_errors.fetch_add(1, Ordering::Relaxed);
+                                            if audio_decode_errors == 1 {
+                                                debug!(%error, payload_type, "AAC-ELD decode failed");
+                                            }
+                                            if audio_decode_errors >= 5 {
+                                                match AacEldDecoder::new() {
+                                                    Ok(decoder) => {
+                                                        audio_decoder = decoder;
+                                                        audio_decode_errors = 0;
+                                                        audio_reorder.reset();
+                                                        info!("Recreated AAC decoder after repeated failures");
+                                                    }
+                                                    Err(error) => warn!(%error, "Failed to recreate AAC decoder"),
+                                                }
+                                            }
+                                            vec![0_u8; 1920]
                                         }
                                     }
                                 }
+                            };
+                            telemetry.decode_ok.fetch_add(1, Ordering::Relaxed);
+                            if let Some((pcm_dump, _)) = audio_dump.as_mut() {
+                                let _ = pcm_dump.write_all(&pcm);
                             }
+                            audio_pcm_bytes += pcm.len() as u64;
+                            let samples: Vec<i16> = pcm
+                                .chunks_exact(2)
+                                .map(|s| i16::from_le_bytes([s[0], s[1]]))
+                                .collect();
+                            audio_peak = audio_peak
+                                .max(samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0));
+                            let written = audio_ring.write(&samples);
+                            telemetry
+                                .frames_written
+                                .fetch_add((written / 2) as u64, Ordering::Relaxed);
+                            telemetry
+                                .last_pcm_ms
+                                .store(now_millis(), Ordering::Relaxed);
                         }
                         if audio_packet_count % 500 == 0 {
                             let elapsed = audio_stats_start.elapsed().as_secs_f64();
@@ -1985,12 +2002,16 @@ async fn run_mirror() -> Result<()> {
                         }
                     }
                     _ = audio_rtcp.tick() => {
-                        if let Some(report) = client.audio_rtcp_report(audio_highest_sequence) {
+                        audio_rtcp_stats.refresh();
+                        audio_rtcp_stats.refresh_dlsr();
+                        video_rtcp_stats.refresh();
+                        video_rtcp_stats.refresh_dlsr();
+                        if let Some(report) = client.audio_rtcp_report(&audio_rtcp_stats) {
                             if let Err(error) = client.send_audio_rtcp(report).await {
                                 debug!(%error, "Failed to send the audio RTCP keepalive");
                             }
                         }
-                        if let Some(report) = client.video_rtcp_report(video_highest_sequence) {
+                        if let Some(report) = client.video_rtcp_report(&video_rtcp_stats) {
                             if let Err(error) = client.send_video_rtcp(report).await {
                                 debug!(%error, "Failed to send the video RTCP keepalive");
                             }
@@ -2018,6 +2039,27 @@ async fn run_mirror() -> Result<()> {
                         } else if audio_stalled_ticks < 3 {
                             audio_stalled_ticks += 1;
                         }
+                        // Default output device may change (HDMI, USB, Bluetooth,
+                        // or a driver reset). Recreate the backend on change.
+                        let current_device = audio_output.current_output_device();
+                        if let Some(device) = current_device {
+                            if audio_output_device != 0 && device != audio_output_device {
+                                let since = last_audio_restart
+                                    .map(|t| t.elapsed())
+                                    .unwrap_or(std::time::Duration::from_secs(3600));
+                                if since >= std::time::Duration::from_secs(2) {
+                                    warn!(old = audio_output_device, new = device, "Audio output device changed");
+                                    audio_ring.clear();
+                                    audio_output.restart(AudioRestartReason::OutputDeviceChanged)?;
+                                    audio_output_device = device;
+                                    last_audio_restart = Some(std::time::Instant::now());
+                                    audio_returned_at_check = audio_output.frame_stats().callbacks;
+                                }
+                            } else {
+                                audio_output_device = device;
+                            }
+                        }
+
                         if audio_stalled_ticks >= 3
                             && telemetry.last_rtp_ms.load(Ordering::Relaxed) + 2000
                                 > now_millis()
