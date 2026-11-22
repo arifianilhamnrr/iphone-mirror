@@ -1872,6 +1872,15 @@ async fn run_mirror() -> Result<()> {
                                 decoder_sets = None;
                                 video_highest_sequence = 0;
                                 audio_highest_sequence = 0;
+                                // A renegotiated stream starts with fresh SSRCs and
+                                // sequence numbers. Stale reorder/stats state would
+                                // discard every new packet as out-of-window.
+                                audio_reorder.reset();
+                                audio_rtcp_stats.reset();
+                                video_rtcp_stats.reset();
+                                audio_jitter = AudioJitter::new(8_000);
+                                audio_decode_errors = 0;
+                                ring_underflows_at_check = 0;
                                 audio_ring.clear();
                                 audio_output
                                     .restart(AudioRestartReason::MediaSessionRestarted)?;

@@ -2,7 +2,7 @@
 
 Native iPhone screen mirroring for macOS, written in Rust.
 
-- Version: **0.1.0-beta.3 (build 14)**
+- Version: **0.1.0-beta.3 (build 15)**
 - Host: **macOS 15 Sequoia** or **macOS 26 Tahoe**
 - Architecture: **x86_64** (Intel Mac and Hackintosh)
 - Tested device: **iPhone SE on iOS 27.2.1**

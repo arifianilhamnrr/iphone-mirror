@@ -49,12 +49,16 @@ impl AudioReorder {
     /// Insert a packet keyed by its extended sequence number.
     pub fn push(&mut self, packet: AudioPacket) {
         let seq = packet.sequence;
-        if self
-            .next
-            .is_some_and(|next| seq.wrapping_add(self.window) < next || seq < next.wrapping_sub(self.window))
-        {
-            // Too far out of window: discard stale packet.
-            return;
+        if let Some(next) = self.next {
+            let forward = seq.wrapping_sub(next);
+            // Accept a small forward jump; reject packets that are too far
+            // ahead or clearly behind. Use distance, not raw comparison, so
+            // sequence numbers near 0 or u32::MAX do not overflow.
+            let stale = forward > u32::MAX - self.window;
+            let too_far = forward > self.window;
+            if stale || too_far {
+                return;
+            }
         }
         if !self.pending.contains_key(&seq) {
             self.pending.insert(seq, packet);
@@ -172,6 +176,18 @@ mod tests {
         assert_eq!(r.stats().buffered, 1);
     }
 
+
+    #[test]
+    fn accepts_sequences_near_zero() {
+        let mut r = AudioReorder::new(8, Duration::from_millis(20));
+        r.push(pkt(1));
+        let out = r.pop_ready();
+        assert_eq!(out.len(), 1);
+        r.push(pkt(2));
+        let out = r.pop_ready();
+        assert_eq!(out.len(), 1);
+        match &out[0] { ReorderedAudio::Packet(p) => assert_eq!(p.sequence, 2), _ => panic!() }
+    }
     #[test]
     fn reset_clears_state() {
         let mut r = AudioReorder::new(8, Duration::from_millis(20));
