@@ -688,6 +688,13 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
     }
 }
 
+fn device_switch_enabled() -> bool {
+    matches!(
+        env::var("IPHONE_MIRROR_AUDIO_DEVICE_SWITCH").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1956,7 +1963,10 @@ async fn run_mirror() -> Result<()> {
                                         let _ = au_dump.write_all(&packet.payload);
                                     }
                                     match audio_decoder.decode(&packet.payload) {
-                                        Ok(pcm) => pcm,
+                                        Ok(pcm) => {
+                                            audio_decode_errors = 0;
+                                            pcm
+                                        }
                                         Err(error) => {
                                             audio_decode_errors += 1;
                                             telemetry.decode_errors.fetch_add(1, Ordering::Relaxed);
@@ -2049,8 +2059,13 @@ async fn run_mirror() -> Result<()> {
                             audio_stalled_ticks += 1;
                         }
                         // Default output device may change (HDMI, USB, Bluetooth,
-                        // or a driver reset). Recreate the backend on change.
-                        let current_device = audio_output.current_output_device();
+                        // or a driver reset). Opt-in because some drivers report
+                        // transient IDs that would cause needless restarts.
+                        let current_device = if device_switch_enabled() {
+                            audio_output.current_output_device()
+                        } else {
+                            None
+                        };
                         if let Some(device) = current_device {
                             if audio_output_device != 0 && device != audio_output_device {
                                 let since = last_audio_restart

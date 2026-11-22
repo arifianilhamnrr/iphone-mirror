@@ -51,12 +51,12 @@ impl AudioReorder {
         let seq = packet.sequence;
         if let Some(next) = self.next {
             let forward = seq.wrapping_sub(next);
-            // Accept a small forward jump; reject packets that are too far
-            // ahead or clearly behind. Use distance, not raw comparison, so
-            // sequence numbers near 0 or u32::MAX do not overflow.
-            let stale = forward > u32::MAX - self.window;
-            let too_far = forward > self.window;
-            if stale || too_far {
+            // Only reject clearly stale packets. A large forward jump must be
+            // accepted and buffered: pop_ready() emits silence for the gap and
+            // advances `next`. Rejecting it here would leave `next` stuck with
+            // no pending packet, so the timeout never fires and audio stays
+            // silent forever after a burst loss.
+            if forward > u32::MAX - self.window {
                 return;
             }
         }
@@ -187,6 +187,20 @@ mod tests {
         let out = r.pop_ready();
         assert_eq!(out.len(), 1);
         match &out[0] { ReorderedAudio::Packet(p) => assert_eq!(p.sequence, 2), _ => panic!() }
+    }
+
+    #[test]
+    fn large_forward_gap_does_not_deadlock() {
+        let mut r = AudioReorder::new(8, Duration::from_millis(5));
+        r.push(pkt(100));
+        r.pop_ready(); // next = 101
+        r.push(pkt(120)); // 19 ahead of next, previously rejected forever
+        assert_eq!(r.stats().buffered, 1);
+        std::thread::sleep(Duration::from_millis(10));
+        let out = r.pop_ready();
+        assert_eq!(out.len(), 20); // 19 silence + 1 packet
+        assert!(matches!(out[0], ReorderedAudio::Silence));
+        match out.last().unwrap() { ReorderedAudio::Packet(p) => assert_eq!(p.sequence, 120), _ => panic!() }
     }
     #[test]
     fn reset_clears_state() {

@@ -2,7 +2,7 @@
 
 Native iPhone screen mirroring for macOS, written in Rust.
 
-- Version: **0.1.0-beta.3 (build 15)**
+- Version: **0.1.0-beta.3 (build 16)**
 - Host: **macOS 15 Sequoia** or **macOS 26 Tahoe**
 - Architecture: **x86_64** (Intel Mac and Hackintosh)
 - Tested device: **iPhone SE on iOS 27.2.1**
@@ -246,6 +246,9 @@ IPHONE_MIRROR_AUDIO_BACKEND=audioqueue
 
 # Per-second audio sink diagnostics (RTP, ring depth, callbacks, restarts)
 IPHONE_MIRROR_AUDIO_DIAGNOSTICS=1
+
+# Opt-in: recreate audio backend on default output device change
+IPHONE_MIRROR_AUDIO_DEVICE_SWITCH=1
 ```
 
 The app-bundle backend log is written to the macOS temporary directory as:
