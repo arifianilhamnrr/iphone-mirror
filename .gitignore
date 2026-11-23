@@ -5,3 +5,12 @@ target/
 .DS_Store
 dist/
 build/
+
+# Local work artifacts and design scratch files
+capture/
+inbox/
+investigation.cany/
+craft.json
+feed.json
+usage.json
+screen-mirroring-icon.png
