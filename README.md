@@ -2,11 +2,11 @@
 
 Native iPhone screen mirroring for macOS, written in Rust.
 
-- Version: **0.2.0 (build 20)**
+- Version: **0.2.0 (build 21)**
 - Host: **macOS 12 Monterey** or newer (tested up to macOS 26 Tahoe)
 - Architecture: **x86_64** (Intel Mac and Hackintosh)
 - Tested device: **iPhone SE on iOS 27.2.1**
-- Connections: **USB** and direct **Wi-Fi**
+- Connections: **USB**, direct **Wi-Fi**, and optional **AirPlay (H.264)**
 - Status: stable
 
 > [!IMPORTANT]
@@ -27,7 +27,7 @@ Native iPhone screen mirroring for macOS, written in Rust.
 - Automatic recovery after media stalls or RTP packet loss.
 - Full-resolution PNG screenshots.
 - Fullscreen, auto-rotate, and always-on-top controls.
-- Native SwiftUI connection launcher.
+- Native SwiftUI Glassmorphism connection launcher with optional AirPlay (H.264) screen mirroring receiver mode (with automatic Hybrid HID touch/keyboard when paired).
 - Hardware-clocked AudioUnit output with a lock-free PCM ring buffer, replacing the timer-driven AudioQueue path.
 - Audio RTP reorder buffer with silence concealment for lost packets.
 - Output-device change detection with automatic backend recreation.

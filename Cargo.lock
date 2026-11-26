@@ -897,28 +897,38 @@ dependencies = [
 name = "iphone-mirror-rs"
 version = "0.2.0"
 dependencies = [
+ "aes",
  "anyhow",
  "bytes",
+ "cbc",
+ "cc",
+ "cipher",
  "core-foundation",
  "core-graphics-types",
+ "ed25519-dalek",
  "flate2",
  "foreign-types",
  "idevice",
+ "md-5",
  "metal",
  "objc",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
  "plist",
+ "rand 0.8.8",
  "raw-window-handle",
  "serde",
  "serde_json",
+ "sha1",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",
  "winit",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -1783,6 +1793,7 @@ version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e058c7de0b26af77780c769414d6257830bb240f3c38477dbc2c16e5f54d6d4c"
 dependencies = [
+ "libc",
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
 ]

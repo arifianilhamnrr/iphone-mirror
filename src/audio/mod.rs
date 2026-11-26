@@ -173,13 +173,20 @@ extern "C" fn converter_input(
 
 pub struct AacEldDecoder {
     converter: AudioConverterRef,
+    max_pcm_bytes: usize,
 }
 unsafe impl Send for AacEldDecoder {}
 
 impl AacEldDecoder {
     pub fn new() -> Result<Self> {
+        Self::new_with_source_rate(SAMPLE_RATE)
+    }
+
+    /// Creates an AAC-ELD decoder from `source_sample_rate` (e.g. `44_100.0` for
+    /// AirPlay or `48_000.0` for CoreDevice) to 48 kHz interleaved stereo `i16` PCM.
+    pub fn new_with_source_rate(source_sample_rate: f64) -> Result<Self> {
         let source = AudioStreamBasicDescription {
-            sample_rate: SAMPLE_RATE,
+            sample_rate: source_sample_rate,
             format_id: fourcc(b"aace"),
             format_flags: 0,
             bytes_per_packet: 0,
@@ -193,14 +200,19 @@ impl AacEldDecoder {
         let mut converter = ptr::null_mut();
         let status = unsafe { AudioConverterNew(&source, &destination, &mut converter) };
         if status != 0 || converter.is_null() {
-            bail!("AudioConverterNew AAC-ELD failed with OSStatus {status}");
+            bail!("AudioConverterNew AAC-ELD ({source_sample_rate}Hz) failed with OSStatus {status}");
         }
+        let cookie: [u8; 4] = if (source_sample_rate - 44_100.0).abs() < 1.0 {
+            [0xF8, 0xE8, 0x40, 0x00]
+        } else {
+            AAC_ELD_COOKIE
+        };
         let status = unsafe {
             AudioConverterSetProperty(
                 converter,
                 fourcc(b"dmgc"),
-                AAC_ELD_COOKIE.len() as u32,
-                AAC_ELD_COOKIE.as_ptr().cast(),
+                cookie.len() as u32,
+                cookie.as_ptr().cast(),
             )
         };
         if status != 0 {
@@ -209,11 +221,19 @@ impl AacEldDecoder {
             // reject re-setting it while still decoding AAC-ELD correctly.
             tracing::debug!(status, "AudioConverter rejected AAC-ELD magic cookie");
         }
-        Ok(Self { converter })
+        let max_pcm_bytes = if source_sample_rate < SAMPLE_RATE {
+            PCM_BYTES * 2
+        } else {
+            PCM_BYTES
+        };
+        Ok(Self {
+            converter,
+            max_pcm_bytes,
+        })
     }
 
     pub fn decode(&mut self, access_unit: &[u8]) -> Result<Vec<u8>> {
-        let mut pcm = vec![0_u8; PCM_BYTES];
+        let mut pcm = vec![0_u8; self.max_pcm_bytes];
         let mut context = InputContext {
             data: access_unit.as_ptr(),
             len: access_unit.len(),
@@ -232,7 +252,7 @@ impl AacEldDecoder {
                 data: pcm.as_mut_ptr().cast(),
             }],
         };
-        let mut packets = FRAMES_PER_PACKET;
+        let mut packets = (self.max_pcm_bytes / (CHANNELS as usize * 2)) as u32;
         let status = unsafe {
             AudioConverterFillComplexBuffer(
                 self.converter,

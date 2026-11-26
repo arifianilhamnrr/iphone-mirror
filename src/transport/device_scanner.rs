@@ -20,6 +20,7 @@ pub enum TransportPreference {
     Auto,
     Usb,
     Wifi,
+    Airplay,
 }
 
 impl fmt::Display for ConnectionType {
@@ -109,7 +110,7 @@ impl DeviceScanner {
         let mut devices = Self::list_devices().await?;
 
         devices.retain(|device| match transport {
-            TransportPreference::Auto => true,
+            TransportPreference::Auto | TransportPreference::Airplay => true,
             TransportPreference::Usb => device.connection_type == ConnectionType::Usb,
             TransportPreference::Wifi => device.connection_type == ConnectionType::Network,
         });
@@ -157,6 +158,7 @@ impl TransportPreference {
             Self::Auto => "USB or Wi-Fi",
             Self::Usb => "USB",
             Self::Wifi => "Wi-Fi",
+            Self::Airplay => "AirPlay (H.264)",
         }
     }
 }

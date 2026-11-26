@@ -2,13 +2,14 @@
 use anyhow::{Context, Result};
 use idevice::{
     core_device::{
-        ButtonState, DataInclusionPolicy, IndigoHidClient, PasteboardServiceClient,
-        UniversalHidServiceClient, GENERAL_PASTEBOARD,
+        ButtonState, DataInclusionPolicy, IndigoHidClient, MainKeyboardService,
+        PasteboardServiceClient, UniversalHidServiceClient, GENERAL_PASTEBOARD,
     },
     springboardservices::{InterfaceOrientation, SpringBoardServicesClient},
     RsdService,
 };
 use iphone_mirror_rs::{
+    airplay::AirPlayReceiver,
     audio::{
         AacEldDecoder,
         jitter::AudioJitter,
@@ -52,6 +53,7 @@ use tracing::{debug, info, warn};
 
 enum Command {
     Mirror,
+    Airplay,
     Devices { json: bool },
     Diagnose { udid: Option<String> },
     Pair { udid: Option<String> },
@@ -1045,7 +1047,8 @@ end run
                 settings.transport = match settings.transport {
                     TransportPreference::Auto => TransportPreference::Usb,
                     TransportPreference::Usb => TransportPreference::Wifi,
-                    TransportPreference::Wifi => TransportPreference::Auto,
+                    TransportPreference::Wifi => TransportPreference::Airplay,
+                    TransportPreference::Airplay => TransportPreference::Auto,
                 };
             }
             value if value == rotation => settings.auto_rotate = !settings.auto_rotate,
@@ -1059,6 +1062,7 @@ fn parse_command() -> Result<Command> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
         None | Some("mirror") => Ok(Command::Mirror),
+        Some("airplay") => Ok(Command::Airplay),
         Some("devices") => {
             let json = args.any(|arg| arg == "--json");
             Ok(Command::Devices { json })
@@ -1125,6 +1129,7 @@ fn print_help() {
         "iphone-mirror-rs\n\n\
          Usage:\n  \
            iphone-mirror [mirror]\n  \
+           iphone-mirror airplay\n  \
            iphone-mirror devices\n  \
            iphone-mirror diagnose [--udid <UDID>]\n  \
            iphone-mirror pair [--udid <UDID>]\n  \
@@ -1144,6 +1149,7 @@ async fn main() -> Result<()> {
 
     match parse_command()? {
         Command::Mirror => supervise_mirror().await,
+        Command::Airplay => run_airplay_mirror(load_settings()).await,
         Command::Devices { json } => list_devices(json).await,
         Command::Diagnose { udid } => diagnose(udid.as_deref()).await,
         Command::Pair { udid } => pair_device(udid.as_deref()).await,
@@ -1446,6 +1452,7 @@ async fn supervise_mirror() -> Result<()> {
                     TransportPreference::Auto => "auto",
                     TransportPreference::Usb => "usb",
                     TransportPreference::Wifi => "wifi",
+                    TransportPreference::Airplay => "airplay",
                 },
             )
             .env(
@@ -1558,10 +1565,14 @@ async fn run_mirror() -> Result<()> {
         transport: match env::var("IPHONE_MIRROR_TRANSPORT").as_deref() {
             Ok("usb") => TransportPreference::Usb,
             Ok("wifi") => TransportPreference::Wifi,
+            Ok("airplay") => TransportPreference::Airplay,
             _ => TransportPreference::Auto,
         },
         auto_rotate: env::var("IPHONE_MIRROR_AUTO_ROTATE").as_deref() != Ok("0"),
     };
+    if settings.transport == TransportPreference::Airplay {
+        return run_airplay_mirror(settings).await;
+    }
     let selected_udid = env::var("IPHONE_MIRROR_UDID").ok();
     let wifi_device = wifi::endpoint_from_env();
     let usb_device = if wifi_device.is_none() {
@@ -2376,90 +2387,7 @@ async fn run_mirror() -> Result<()> {
                         }
                     }
                     Some(command) = input_rx.recv() => {
-                        debug!(?command, "Sending HID input event");
-                        let command_kind = match &command {
-                            InputCommand::Down(..) => "touch-down",
-                            InputCommand::Move(..) => "touch-move",
-                            InputCommand::Up(..) => "touch-up",
-                            InputCommand::ScrollStart(..) => "scroll-start",
-                            InputCommand::ScrollMove(..) => "scroll-move",
-                            InputCommand::ScrollEnd => "scroll-end",
-                            InputCommand::SetKeys(..) => "keyboard",
-                            InputCommand::NavigateBack(..) => "navigate-back",
-                        };
-                        let result = match command {
-                            InputCommand::Down(x, y) | InputCommand::Move(x, y) => {
-                                hid.send_touchscreen(
-                                    idevice::core_device::TOUCHSCREEN_STATE_CONTACT,
-                                    x,
-                                    y,
-                                    None,
-                                ).await
-                            }
-                            InputCommand::Up(x, y) => {
-                                hid.send_touchscreen(
-                                    idevice::core_device::TOUCHSCREEN_STATE_RELEASE,
-                                    x,
-                                    y,
-                                    None,
-                                ).await
-                            }
-                            InputCommand::ScrollStart(x, y) => {
-                                scroll_position = Some((x, y));
-                                hid.send_touchscreen(
-                                    idevice::core_device::TOUCHSCREEN_STATE_CONTACT,
-                                    x,
-                                    y,
-                                    None,
-                                ).await
-                            }
-                            InputCommand::ScrollMove(dx, dy) => {
-                                if let Some((x, y)) = scroll_position {
-                                    let (x, y) = offset_touch_position((x, y), (dx, dy));
-                                    scroll_position = Some((x, y));
-                                    hid.send_touchscreen(
-                                        idevice::core_device::TOUCHSCREEN_STATE_CONTACT,
-                                        x,
-                                        y,
-                                        None,
-                                    ).await
-                                } else {
-                                    Ok(())
-                                }
-                            }
-                            InputCommand::ScrollEnd => {
-                                if let Some((x, y)) = scroll_position.take() {
-                                    hid.send_touchscreen(
-                                        idevice::core_device::TOUCHSCREEN_STATE_RELEASE,
-                                        x,
-                                        y,
-                                        None,
-                                    ).await
-                                } else {
-                                    Ok(())
-                                }
-                            }
-                            InputCommand::NavigateBack(rotation) => {
-                                scroll_position = None;
-                                // Start inside the visual left-edge zone and drag to ~73%
-                                // width to trigger the interactive pop gesture.
-                                let (sx, sy) = rotation.to_buffer_u16(128, 32_768);
-                                let (ex, ey) = rotation.to_buffer_u16(48_000, 32_768);
-                                hid.drag(sx, sy, ex, ey, 14, 12).await
-                            }
-                            InputCommand::SetKeys(usages) => {
-                                let usages = usages.into_iter()
-                                    .map(idevice::core_device::KeyboardUsage::new)
-                                    .collect::<std::result::Result<Vec<_>, _>>()
-                                    .map_err(|error| idevice::IdeviceError::UnexpectedResponse(error.to_string()))?;
-                                hid.set_main_keyboard_usages(&mut keyboard, usages)
-                                    .await
-                                    .map_err(|error| idevice::IdeviceError::UnexpectedResponse(error.to_string()))
-                            }
-                        };
-                        if let Err(error) = result {
-                            warn!(%error, command_kind, "Failed to send HID input event");
-                        }
+                        dispatch_hid_command(&mut hid, &mut keyboard, &mut scroll_position, command).await;
                     }
                     Some(content) = clipboard_rx.recv() => {
                         match content {
@@ -2549,6 +2477,445 @@ async fn run_mirror() -> Result<()> {
         .context("macOS window event loop failed")?;
     if let Some(error) = app.stream_error {
         anyhow::bail!("Mirror session failed: {error}");
+    }
+    Ok(())
+}
+
+async fn dispatch_hid_command<R: idevice::ReadWrite>(
+    hid: &mut UniversalHidServiceClient<R>,
+    keyboard: &mut MainKeyboardService,
+    scroll_position: &mut Option<(u16, u16)>,
+    command: InputCommand,
+) {
+    debug!(?command, "Sending HID input event");
+    let command_kind = match &command {
+        InputCommand::Down(..) => "touch-down",
+        InputCommand::Move(..) => "touch-move",
+        InputCommand::Up(..) => "touch-up",
+        InputCommand::ScrollStart(..) => "scroll-start",
+        InputCommand::ScrollMove(..) => "scroll-move",
+        InputCommand::ScrollEnd => "scroll-end",
+        InputCommand::SetKeys(..) => "keyboard",
+        InputCommand::NavigateBack(..) => "navigate-back",
+    };
+    let result = match command {
+        InputCommand::Down(x, y) | InputCommand::Move(x, y) => {
+            hid.send_touchscreen(idevice::core_device::TOUCHSCREEN_STATE_CONTACT, x, y, None)
+                .await
+        }
+        InputCommand::Up(x, y) => {
+            hid.send_touchscreen(idevice::core_device::TOUCHSCREEN_STATE_RELEASE, x, y, None)
+                .await
+        }
+        InputCommand::ScrollStart(x, y) => {
+            *scroll_position = Some((x, y));
+            hid.send_touchscreen(idevice::core_device::TOUCHSCREEN_STATE_CONTACT, x, y, None)
+                .await
+        }
+        InputCommand::ScrollMove(dx, dy) => {
+            if let Some((x, y)) = *scroll_position {
+                let (x, y) = offset_touch_position((x, y), (dx, dy));
+                *scroll_position = Some((x, y));
+                hid.send_touchscreen(idevice::core_device::TOUCHSCREEN_STATE_CONTACT, x, y, None)
+                    .await
+            } else {
+                Ok(())
+            }
+        }
+        InputCommand::ScrollEnd => {
+            if let Some((x, y)) = scroll_position.take() {
+                hid.send_touchscreen(idevice::core_device::TOUCHSCREEN_STATE_RELEASE, x, y, None)
+                    .await
+            } else {
+                Ok(())
+            }
+        }
+        InputCommand::NavigateBack(rotation) => {
+            *scroll_position = None;
+            let (sx, sy) = rotation.to_buffer_u16(128, 32_768);
+            let (ex, ey) = rotation.to_buffer_u16(48_000, 32_768);
+            hid.drag(sx, sy, ex, ey, 14, 12).await
+        }
+        InputCommand::SetKeys(usages) => {
+            match usages
+                .into_iter()
+                .map(idevice::core_device::KeyboardUsage::new)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|error| idevice::IdeviceError::UnexpectedResponse(error.to_string()))
+            {
+                Ok(usages) => hid
+                    .set_main_keyboard_usages(keyboard, usages)
+                    .await
+                    .map_err(|error| idevice::IdeviceError::UnexpectedResponse(error.to_string())),
+                Err(err) => Err(err),
+            }
+        }
+    };
+    if let Err(error) = result {
+        warn!(%error, command_kind, "Failed to send HID input event");
+    }
+}
+
+async fn connect_optional_hid_tunnel() -> Result<RsdTunnel> {
+    if let Some(wifi_device) = wifi::endpoint_from_env() {
+        return TunnelSource::Wifi(&wifi_device).connect().await;
+    }
+    let udid = env::var("IPHONE_MIRROR_UDID").ok();
+    let device = DeviceScanner::select_device_with_transport(
+        udid.as_deref(),
+        TransportPreference::Auto,
+    )
+    .await?;
+    TunnelSource::Usb(&device).connect().await
+}
+
+async fn run_airplay_hybrid_hid(
+    mut input_rx: tokio::sync::mpsc::UnboundedReceiver<InputCommand>,
+    mut button_rx: tokio::sync::mpsc::UnboundedReceiver<HardwareButton>,
+    mut clipboard_rx: tokio::sync::mpsc::UnboundedReceiver<ClipboardContent>,
+    clipboard_proxy: winit::event_loop::EventLoopProxy<UiEvent>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let tunnel = match tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        connect_optional_hid_tunnel(),
+    )
+    .await
+    {
+        Ok(Ok(t)) => t,
+        Ok(Err(err)) => {
+            info!("AirPlay running in view + audio mode (no paired CoreDevice HID: {err})");
+            drain_airplay_inputs(&mut input_rx, &mut button_rx, &mut clipboard_rx, &mut shutdown_rx).await;
+            return;
+        }
+        Err(_) => {
+            info!("AirPlay running in view + audio mode (HID tunnel timed out)");
+            drain_airplay_inputs(&mut input_rx, &mut button_rx, &mut clipboard_rx, &mut shutdown_rx).await;
+            return;
+        }
+    };
+
+    let mut tunnel = tunnel;
+    let Ok(Ok(mut hid)) = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        UniversalHidServiceClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake),
+    )
+    .await
+    else {
+        warn!("Hybrid HID unavailable over AirPlay; falling back to view + audio mode");
+        drain_airplay_inputs(&mut input_rx, &mut button_rx, &mut clipboard_rx, &mut shutdown_rx).await;
+        return;
+    };
+
+    let Ok(Ok(mut keyboard)) = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        hid.create_main_keyboard(),
+    )
+    .await
+    else {
+        warn!("Hybrid keyboard unavailable over AirPlay; falling back to view + audio mode");
+        drain_airplay_inputs(&mut input_rx, &mut button_rx, &mut clipboard_rx, &mut shutdown_rx).await;
+        return;
+    };
+
+    let mut indigo_hid = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        IndigoHidClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake),
+    )
+    .await
+    .ok()
+    .and_then(|r| r.ok());
+
+    let mut clipboard_writer = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        PasteboardServiceClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake),
+    )
+    .await
+    .ok()
+    .and_then(|r| r.ok());
+
+    if let Ok(Ok(mut clipboard_watcher)) = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        PasteboardServiceClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake),
+    )
+    .await
+    {
+        if clipboard_watcher
+            .set_change_notifications(
+                true,
+                GENERAL_PASTEBOARD,
+                Some(DataInclusionPolicy::AllResolved),
+            )
+            .await
+            .is_ok()
+        {
+            let mut cw_shutdown = shutdown_rx.clone();
+            let cw_proxy = clipboard_proxy.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        snapshot = clipboard_watcher.recv_push() => match snapshot {
+                            Ok(snapshot) => {
+                                let content = snapshot
+                                    .image()
+                                    .filter(|(_, bytes)| bytes.len() <= MAX_CLIPBOARD_IMAGE_BYTES)
+                                    .map(|(uti, bytes)| ClipboardContent::Image {
+                                        uti: uti.to_string(),
+                                        bytes,
+                                    })
+                                    .or_else(|| snapshot.text().map(ClipboardContent::Text));
+                                if let Some(content) = content {
+                                    if cw_proxy.send_event(UiEvent::Clipboard(content)).is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        },
+                        changed = cw_shutdown.changed() => {
+                            if changed.is_err() || *cw_shutdown.borrow() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    info!("Hybrid HID touch & keyboard active alongside AirPlay receiver");
+    let mut scroll_position: Option<(u16, u16)> = None;
+
+    loop {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            Some(command) = input_rx.recv() => {
+                dispatch_hid_command(&mut hid, &mut keyboard, &mut scroll_position, command).await;
+            }
+            Some(button) = button_rx.recv() => {
+                if let Some(indigo) = indigo_hid.as_mut() {
+                    let (usage_page, usage_code) = button.usage();
+                    if indigo.send_button(usage_page, usage_code, ButtonState::Down).await.is_ok() {
+                        tokio::time::sleep(button.hold()).await;
+                        let _ = indigo.send_button(usage_page, usage_code, ButtonState::Up).await;
+                    }
+                }
+            }
+            Some(content) = clipboard_rx.recv() => {
+                if let Some(writer) = clipboard_writer.as_mut() {
+                    match content {
+                        ClipboardContent::Text(text) => {
+                            let _ = writer.set_text(&text, GENERAL_PASTEBOARD).await;
+                        }
+                        ClipboardContent::Image { uti, bytes } => {
+                            let _ = writer.set_image(&bytes, &uti, GENERAL_PASTEBOARD).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        hid.remove_main_keyboard(&mut keyboard),
+    )
+    .await;
+}
+
+async fn drain_airplay_inputs(
+    input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<InputCommand>,
+    button_rx: &mut tokio::sync::mpsc::UnboundedReceiver<HardwareButton>,
+    clipboard_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ClipboardContent>,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            Some(_) = input_rx.recv() => {}
+            Some(_) = button_rx.recv() => {}
+            Some(_) = clipboard_rx.recv() => {}
+        }
+    }
+}
+
+async fn run_airplay_mirror(settings: AppSettings) -> Result<()> {
+    info!("Starting iphone-mirror-rs in optional AirPlay (H.264) Receiver mode...");
+
+    let (mut audio_output, audio_ring, audio_mute) = create_output(14_400);
+    audio_output.prepare()?;
+    audio_output.start()?;
+    info!(backend = audio_output.backend_name(), "AirPlay audio output started");
+
+    let event_loop = winit::event_loop::EventLoop::<UiEvent>::with_user_event()
+        .build()
+        .context("Failed to create the macOS event loop")?;
+    let proxy = event_loop.create_proxy();
+
+    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel(4);
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (button_tx, button_rx) = tokio::sync::mpsc::unbounded_channel::<HardwareButton>();
+    let (clipboard_tx, clipboard_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ClipboardContent>();
+    let audio_muted = Arc::new(AtomicBool::new(false));
+    let decoded_frames = Arc::new(AtomicU64::new(0));
+
+    let auto_rotate = settings.auto_rotate;
+    let orient_proxy = proxy.clone();
+    let orientation_cb: Arc<dyn Fn(DisplayRotation) + Send + Sync> = Arc::new(move |rotation| {
+        if auto_rotate {
+            let _ = orient_proxy.send_event(UiEvent::Orientation(rotation));
+        }
+    });
+
+    let airplay = AirPlayReceiver::start(
+        "iPhone Mirror".to_string(),
+        frame_tx,
+        decoded_frames,
+        audio_ring.clone(),
+        orientation_cb,
+    )
+    .await
+    .context("Failed to start AirPlay receiver")?;
+    info!(port = airplay.port, name = %airplay.receiver_name, "AirPlay H.264 receiver ready");
+
+    let latest_frame: Arc<std::sync::Mutex<Option<DecodedFrame>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let frame_pending = Arc::new(AtomicBool::new(false));
+    let latest_frame_tx = latest_frame.clone();
+    let frame_pending_tx = frame_pending.clone();
+    let frame_proxy = proxy.clone();
+    tokio::spawn(async move {
+        while let Some(frame) = frame_rx.recv().await {
+            if let Ok(mut slot) = latest_frame_tx.lock() {
+                *slot = Some(frame);
+            }
+            if !frame_pending_tx.swap(true, Ordering::AcqRel)
+                && frame_proxy.send_event(UiEvent::FrameReady).is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    let signal_proxy = proxy.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            if let Ok(mut terminate) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            {
+                tokio::select! {
+                    _ = terminate.recv() => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+                let _ = signal_proxy.send_event(UiEvent::ShutdownRequested);
+            }
+        }
+    });
+
+    let audio_muted_watch = audio_muted.clone();
+    let mut audio_shutdown_rx = shutdown_rx.clone();
+    let airplay_shutdown_proxy = proxy.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        let mut was_muted = false;
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    let muted = audio_muted_watch.load(Ordering::Relaxed);
+                    if muted != was_muted {
+                        audio_mute.set(muted);
+                        if !muted {
+                            audio_ring.clear();
+                        }
+                        was_muted = muted;
+                    }
+                }
+                changed = audio_shutdown_rx.changed() => {
+                    if changed.is_err() || *audio_shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = airplay_shutdown_proxy.send_event(UiEvent::ShutdownComplete);
+    });
+
+    let hid_proxy = proxy.clone();
+    let hid_shutdown_rx = shutdown_rx.clone();
+    std::thread::spawn(move || {
+        if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            rt.block_on(run_airplay_hybrid_hid(
+                input_rx,
+                button_rx,
+                clipboard_rx,
+                hid_proxy,
+                hid_shutdown_rx,
+            ));
+        }
+    });
+
+    let mut app = MirrorApp {
+        window: None,
+        renderer: None,
+        latest_frame,
+        frame_pending,
+        shutdown_tx,
+        frame_count: 0,
+        frame_size: None,
+        cursor_position: None,
+        touch_active: false,
+        scroll_active: false,
+        scroll_deadline: None,
+        scroll_started: false,
+        scroll_accum: (0.0, 0.0),
+        scroll_anchor: (u16::MAX / 2, u16::MAX / 2),
+        suppress_click_until: None,
+        last_touch_position: None,
+        input_tx,
+        button_tx,
+        audio_muted,
+        screenshot_requested: false,
+        always_on_top: false,
+        fullscreen: false,
+        auto_rotate: settings.auto_rotate,
+        rotation: DisplayRotation::Portrait,
+        manual_rotation_override: false,
+        frame_is_landscape: None,
+        pressed_keys: BTreeSet::new(),
+        modifiers: winit::keyboard::ModifiersState::empty(),
+        clipboard: SystemClipboard::new(),
+        clipboard_tx,
+        last_device_clipboard: None,
+        transfer_tx: None,
+        drop_candidates: Vec::new(),
+        drop_deadline: None,
+        transfer_status: None,
+        stream_error: None,
+        shutting_down: false,
+    };
+
+    let loop_result = event_loop
+        .run_app(&mut app)
+        .context("macOS window event loop failed");
+    airplay.stop();
+    let _ = audio_output;
+    let _ = shutdown_rx.changed();
+    loop_result?;
+    if let Some(error) = app.stream_error {
+        anyhow::bail!("AirPlay mirror session failed: {error}");
     }
     Ok(())
 }

@@ -151,15 +151,23 @@ impl HardwareDecoder {
 
     /// Feed one complete Annex-B NAL unit to VideoToolbox.
     pub fn decode_nal(&mut self, nal: &[u8]) -> Result<()> {
+        let payload = annex_b_payload(nal)?;
+        let payload_len = u32::try_from(payload.len()).map_err(|_| {
+            anyhow::anyhow!("HEVC NAL is too large for its 4-byte AVCC length prefix")
+        })?;
+        let mut avcc = Vec::with_capacity(payload.len() + 4);
+        avcc.extend_from_slice(&payload_len.to_be_bytes());
+        avcc.extend_from_slice(payload);
+        self.decode_avcc(&avcc)
+    }
+
+    /// Feed an AVCC length-prefixed access unit directly to VideoToolbox.
+    pub fn decode_avcc(&mut self, avcc: &[u8]) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
-            let payload = annex_b_payload(nal)?;
-            let payload_len = u32::try_from(payload.len()).map_err(|_| {
-                anyhow::anyhow!("HEVC NAL is too large for its 4-byte AVCC length prefix")
-            })?;
-            let mut avcc = Vec::with_capacity(payload.len() + 4);
-            avcc.extend_from_slice(&payload_len.to_be_bytes());
-            avcc.extend_from_slice(payload);
+            if avcc.is_empty() {
+                return Ok(());
+            }
 
             let mut block_buffer: CMBlockBufferRef = ptr::null_mut();
             let status = unsafe {
@@ -226,7 +234,7 @@ impl HardwareDecoder {
 
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = nal;
+            let _ = avcc;
             Ok(())
         }
     }

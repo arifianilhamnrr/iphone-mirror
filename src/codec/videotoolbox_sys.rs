@@ -120,6 +120,15 @@ extern "C" {
         format_description_out: *mut CMVideoFormatDescriptionRef,
     ) -> OSStatus;
 
+    pub fn CMVideoFormatDescriptionCreateFromH264ParameterSets(
+        allocator: *mut c_void,
+        parameter_set_count: usize,
+        parameter_set_pointers: *const *const u8,
+        parameter_set_sizes: *const usize,
+        nal_unit_header_length: i32,
+        format_description_out: *mut CMVideoFormatDescriptionRef,
+    ) -> OSStatus;
+
     pub fn VTDecompressionSessionCreate(
         allocator: *mut c_void,
         video_format_description: CMVideoFormatDescriptionRef,

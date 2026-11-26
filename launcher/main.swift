@@ -72,6 +72,33 @@ enum ConnectionType: Codable, Hashable {
     }
 }
 
+private enum TransportMode: String, CaseIterable, Identifiable {
+    case auto
+    case usb
+    case wifi
+    case airplay
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .auto: return "Auto"
+        case .usb: return "USB"
+        case .wifi: return "Wi-Fi"
+        case .airplay: return "AirPlay"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .auto: return "sparkles"
+        case .usb: return "cable.connector"
+        case .wifi: return "wifi"
+        case .airplay: return "airplayvideo"
+        }
+    }
+}
+
 @MainActor
 final class LauncherModel: ObservableObject {
     @Published var devices: [Device] = []
@@ -100,12 +127,16 @@ final class LauncherModel: ObservableObject {
 
     var filteredDevices: [Device] {
         let matches = devices.filter { device in
-            transport == "auto" || (transport == "usb" && device.connection_type == .usb)
+            transport == "auto"
+                || transport == "airplay"
+                || (transport == "usb" && device.connection_type == .usb)
                 || (transport == "wifi" && device.connection_type == .network)
         }
         var seen = Set<String>()
         return matches.filter { device in
-            if transport == "auto", seen.contains(device.udid) { return false }
+            if transport == "auto" || transport == "airplay", seen.contains(device.udid) {
+                return false
+            }
             seen.insert(device.udid)
             return true
         }
@@ -115,13 +146,16 @@ final class LauncherModel: ObservableObject {
         filteredDevices.first(where: { $0.id == selectedID }) ?? filteredDevices.first
     }
 
+    var canStart: Bool {
+        transport == "airplay" || selected != nil
+    }
+
     func start() {
         guard scanTask == nil else { return }
         startBonjourScanning()
         scanTask = Task {
             while !Task.isCancelled {
                 await scan()
-                // Wi-Fi discovery runs dns-sd browse + resolve, so scan less often.
                 try? await Task.sleep(nanoseconds: 4_000_000_000)
             }
         }
@@ -188,37 +222,58 @@ final class LauncherModel: ObservableObject {
             if selectedID == nil || !filteredDevices.contains(where: { $0.id == selectedID }) {
                 selectedID = filteredDevices.first?.id
             }
-            if autoConnect, !didAutoConnect, selected != nil {
+            if autoConnect, !didAutoConnect, transport != "airplay", selected != nil {
                 didAutoConnect = true
                 connect()
             }
         } catch {
             devices = []
-            self.error = "Couldn’t scan for iPhones. Check that Apple Mobile Device services are running."
+            if transport != "airplay" {
+                self.error = "Couldn’t scan for iPhones. Check that Apple Mobile Device services are running."
+            }
         }
     }
 
     func connect() {
-        guard backend == nil, let device = selected else { return }
+        guard backend == nil else { return }
+        if transport != "airplay", selected == nil {
+            return
+        }
+
         let process = Process()
         process.executableURL = backendURL
         process.arguments = ["mirror"]
         var environment = ProcessInfo.processInfo.environment
         environment["IPHONE_MIRROR_SESSION_WORKER"] = "1"
-        environment["IPHONE_MIRROR_UDID"] = device.udid
-        environment["IPHONE_MIRROR_TRANSPORT"] = device.connection_type == .network ? "wifi" : "usb"
         environment["IPHONE_MIRROR_AUTO_ROTATE"] = autoRotate ? "1" : "0"
-        if device.isRemote, let host = device.host, let port = device.port {
-            environment["IPHONE_MIRROR_WIFI_HOST"] = host
-            environment["IPHONE_MIRROR_WIFI_PORT"] = String(port)
-            environment["IPHONE_MIRROR_WIFI_NAME"] = device.name ?? device.udid
-            environment["IPHONE_MIRROR_WIFI_IDENTIFIER"] = device.udid
-        } else {
-            environment.removeValue(forKey: "IPHONE_MIRROR_WIFI_HOST")
-            environment.removeValue(forKey: "IPHONE_MIRROR_WIFI_PORT")
-            environment.removeValue(forKey: "IPHONE_MIRROR_WIFI_NAME")
-            environment.removeValue(forKey: "IPHONE_MIRROR_WIFI_IDENTIFIER")
+
+        if transport == "airplay" {
+            environment["IPHONE_MIRROR_TRANSPORT"] = "airplay"
+            if let device = selected {
+                environment["IPHONE_MIRROR_UDID"] = device.udid
+                if device.isRemote, let host = device.host, let port = device.port {
+                    environment["IPHONE_MIRROR_WIFI_HOST"] = host
+                    environment["IPHONE_MIRROR_WIFI_PORT"] = String(port)
+                    environment["IPHONE_MIRROR_WIFI_NAME"] = device.name ?? device.udid
+                    environment["IPHONE_MIRROR_WIFI_IDENTIFIER"] = device.udid
+                }
+            }
+        } else if let device = selected {
+            environment["IPHONE_MIRROR_UDID"] = device.udid
+            environment["IPHONE_MIRROR_TRANSPORT"] = device.connection_type == .network ? "wifi" : "usb"
+            if device.isRemote, let host = device.host, let port = device.port {
+                environment["IPHONE_MIRROR_WIFI_HOST"] = host
+                environment["IPHONE_MIRROR_WIFI_PORT"] = String(port)
+                environment["IPHONE_MIRROR_WIFI_NAME"] = device.name ?? device.udid
+                environment["IPHONE_MIRROR_WIFI_IDENTIFIER"] = device.udid
+            } else {
+                environment.removeValue(forKey: "IPHONE_MIRROR_WIFI_HOST")
+                environment.removeValue(forKey: "IPHONE_MIRROR_WIFI_PORT")
+                environment.removeValue(forKey: "IPHONE_MIRROR_WIFI_NAME")
+                environment.removeValue(forKey: "IPHONE_MIRROR_WIFI_IDENTIFIER")
+            }
         }
+
         process.environment = environment
         let logURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("iphone-mirror-backend.log")
@@ -231,8 +286,6 @@ final class LauncherModel: ObservableObject {
             Task { @MainActor in
                 self?.backend = nil
                 self?.backendRunning = false
-                // The mirror session owns the screen now. Bring the launcher
-                // back as soon as the backend exits (or the user disconnects).
                 Self.showLauncher()
                 if process.terminationStatus != 0 {
                     let detail = (try? String(contentsOf: logURL, encoding: .utf8))?
@@ -250,8 +303,6 @@ final class LauncherModel: ObservableObject {
             backend = process
             backendRunning = true
             error = nil
-            // Let the launcher leave the way so the mirror window owns the
-            // screen and shows up as a normal app in Cmd+Tab.
             Self.hideLauncher()
             NSRunningApplication(processIdentifier: process.processIdentifier)?
                 .activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
@@ -277,85 +328,350 @@ final class LauncherModel: ObservableObject {
     }
 }
 
+// MARK: - Glassmorphism Primitives (macOS 12 Monterey Compatible)
+
+struct VisualEffectBlur: NSViewRepresentable {
+    var material: NSVisualEffectView.Material
+    var blendingMode: NSVisualEffectView.BlendingMode = .behindWindow
+    var state: NSVisualEffectView.State = .active
+
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = material
+        view.blendingMode = blendingMode
+        view.state = state
+        return view
+    }
+
+    func updateNSView(_ view: NSVisualEffectView, context: Context) {
+        view.material = material
+        view.blendingMode = blendingMode
+        view.state = state
+    }
+}
+
+struct WindowGlassConfigurator: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async {
+            guard let window = view.window else { return }
+            window.titlebarAppearsTransparent = true
+            window.titleVisibility = .hidden
+            window.styleMask.insert(.fullSizeContentView)
+            window.isMovableByWindowBackground = true
+            window.isOpaque = false
+            window.backgroundColor = .clear
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+}
+
+struct GlassSurface<Content: View>: View {
+    var cornerRadius: CGFloat = 18
+    var material: NSVisualEffectView.Material = .hudWindow
+    var tintOpacity: Double = 0.08
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        ZStack {
+            VisualEffectBlur(material: material, blendingMode: .withinWindow)
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            Color.white.opacity(tintOpacity + 0.06),
+                            Color.white.opacity(tintOpacity * 0.4),
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+            content()
+        }
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .strokeBorder(
+                    LinearGradient(
+                        colors: [
+                            Color.white.opacity(0.38),
+                            Color.white.opacity(0.10),
+                            Color.white.opacity(0.22),
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    lineWidth: 1
+                )
+        )
+        .shadow(color: Color.black.opacity(0.28), radius: 18, x: 0, y: 8)
+    }
+}
+
+struct AmbientGlassBackdrop: View {
+    var accent: Color
+
+    var body: some View {
+        ZStack {
+            VisualEffectBlur(material: .underWindowBackground, blendingMode: .behindWindow)
+            LinearGradient(
+                colors: [
+                    Color(red: 0.07, green: 0.09, blue: 0.16).opacity(0.88),
+                    Color(red: 0.05, green: 0.06, blue: 0.11).opacity(0.94),
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            Circle()
+                .fill(accent.opacity(0.34))
+                .frame(width: 340, height: 340)
+                .blur(radius: 75)
+                .offset(x: -180, y: -140)
+            Circle()
+                .fill(Color(red: 0.24, green: 0.72, blue: 0.96).opacity(0.24))
+                .frame(width: 300, height: 300)
+                .blur(radius: 80)
+                .offset(x: 210, y: 150)
+            Circle()
+                .fill(Color(red: 0.56, green: 0.34, blue: 0.95).opacity(0.22))
+                .frame(width: 240, height: 240)
+                .blur(radius: 70)
+                .offset(x: 150, y: -150)
+        }
+        .ignoresSafeArea()
+    }
+}
+
 struct DeviceRow: View {
     let device: Device
     let selected: Bool
 
     var body: some View {
-        HStack(spacing: 14) {
-            Image(systemName: device.connection_type == .usb ? "cable.connector" : "wifi")
-                .font(.system(size: 17, weight: .medium))
-                .frame(width: 28, height: 28)
-                .foregroundStyle(selected ? Color.white : Color.accentColor)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(device.displayName)
+        HStack(spacing: 12) {
+            ZStack {
+                Circle()
+                    .fill(
+                        selected
+                            ? Color.white.opacity(0.22)
+                            : Color.white.opacity(0.08)
+                    )
+                    .frame(width: 32, height: 32)
+                Image(systemName: device.connection_type == .usb ? "cable.connector" : "wifi")
                     .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(selected ? .white : Color(red: 0.45, green: 0.80, blue: 1.0))
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(device.displayName)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(.white)
                     .lineLimit(1)
                 Text(device.connection_type.label)
-                    .font(.system(size: 12))
-                    .foregroundStyle(selected ? Color.white.opacity(0.78) : Color.secondary)
+                    .font(.system(size: 11))
+                    .foregroundColor(selected ? Color.white.opacity(0.82) : Color.white.opacity(0.55))
             }
             Spacer()
             Circle()
-                .fill(selected ? Color.white.opacity(0.8) : Color.green)
+                .fill(selected ? Color.white : Color.green)
                 .frame(width: 7, height: 7)
+                .shadow(color: Color.green.opacity(selected ? 0 : 0.7), radius: 4)
         }
         .padding(.horizontal, 12)
-        .frame(height: 58)
-        .background(selected ? Color.accentColor : Color.clear, in: RoundedRectangle(cornerRadius: 10))
+        .frame(height: 54)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(
+                    selected
+                        ? LinearGradient(
+                            colors: [
+                                Color(red: 0.25, green: 0.55, blue: 1.0).opacity(0.85),
+                                Color(red: 0.18, green: 0.42, blue: 0.92).opacity(0.75),
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                        : LinearGradient(
+                            colors: [Color.white.opacity(0.06), Color.white.opacity(0.02)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                )
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Color.white.opacity(selected ? 0.35 : 0.10), lineWidth: 1)
+        )
         .contentShape(Rectangle())
+    }
+}
+
+struct GlassModeSelector: View {
+    @Binding var selection: String
+    var onSelect: () -> Void
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(TransportMode.allCases) { mode in
+                let isSelected = selection == mode.rawValue
+                Button {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        selection = mode.rawValue
+                    }
+                    onSelect()
+                } label: {
+                    VStack(spacing: 3) {
+                        Image(systemName: mode.icon)
+                            .font(.system(size: 11, weight: .semibold))
+                        Text(mode.title)
+                            .font(.system(size: 10.5, weight: isSelected ? .semibold : .medium))
+                    }
+                    .foregroundColor(isSelected ? .white : Color.white.opacity(0.65))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 7)
+                    .background(
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .fill(
+                                isSelected
+                                    ? LinearGradient(
+                                        colors: [
+                                            Color.white.opacity(0.24),
+                                            Color.white.opacity(0.10),
+                                        ],
+                                        startPoint: .top,
+                                        endPoint: .bottom
+                                    )
+                                    : LinearGradient(colors: [.clear, .clear], startPoint: .top, endPoint: .bottom)
+                            )
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .strokeBorder(Color.white.opacity(isSelected ? 0.32 : 0.0), lineWidth: 1)
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(4)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.black.opacity(0.25))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.12), lineWidth: 1)
+        )
     }
 }
 
 struct ContentView: View {
     @EnvironmentObject private var model: LauncherModel
 
+    private var stageAccent: Color {
+        model.transport == "airplay"
+            ? Color(red: 0.42, green: 0.72, blue: 1.0)
+            : Color(red: 0.25, green: 0.62, blue: 1.0)
+    }
+
     var body: some View {
-        HStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 18) {
-                HStack {
-                    Text("Devices")
-                        .font(.system(size: 13, weight: .semibold))
+        ZStack {
+            AmbientGlassBackdrop(accent: stageAccent)
+            WindowGlassConfigurator()
+
+            HStack(spacing: 16) {
+                sidebarCard
+                    .frame(width: 268)
+
+                stageCard
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .padding(.top, 34)
+            .padding([.horizontal, .bottom], 18)
+        }
+        .preferredColorScheme(.dark)
+        .frame(minWidth: 780, idealWidth: 860, minHeight: 520, idealHeight: 560)
+        .task { model.start() }
+    }
+
+    private var sidebarCard: some View {
+        GlassSurface(cornerRadius: 20, material: .hudWindow, tintOpacity: 0.06) {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(spacing: 8) {
+                    Image(systemName: "iphone.gen3")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundColor(.white)
+                    Text("iPhone Mirror")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(.white)
                     Spacer()
-                    if model.isScanning { ProgressView().controlSize(.small) }
+                    if model.isScanning {
+                        ProgressView().controlSize(.small)
+                    }
                     Button { Task { await model.scan() } } label: {
                         Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(Color.white.opacity(0.8))
+                            .padding(6)
+                            .background(Color.white.opacity(0.08), in: Circle())
                     }
                     .buttonStyle(.plain)
                     .keyboardShortcut("r", modifiers: .command)
                     .help("Scan again")
                 }
 
-                Picker("Connection", selection: $model.transport) {
-                    Text("Auto").tag("auto")
-                    Text("USB").tag("usb")
-                    Text("Wi-Fi").tag("wifi")
-                }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                .onChange(of: model.transport) { _ in
+                GlassModeSelector(selection: $model.transport) {
                     model.selectedID = model.filteredDevices.first?.id
                     Task { await model.scan() }
                 }
 
-                if model.filteredDevices.isEmpty {
-                    VStack(alignment: .leading, spacing: 9) {
-                        Image(systemName: "iphone.slash")
-                            .font(.system(size: 24, weight: .light))
-                            .foregroundStyle(.secondary)
-                        Text("No iPhone found")
-                            .font(.system(size: 14, weight: .semibold))
-                        Text(model.transport == "wifi"
-                            ? "Connect the iPhone once by cable and accept the pairing prompt, then it will mirror directly over Wi-Fi."
-                            : "Connect by USB, or pair once by cable to enable Wi-Fi mirroring.")
-                            .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
+                if model.transport == "airplay" {
+                    HStack(spacing: 8) {
+                        Image(systemName: "airplayvideo")
+                            .foregroundColor(Color(red: 0.55, green: 0.85, blue: 1.0))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("AirPlay Receiver Mode")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundColor(.white)
+                            Text(model.selected != nil
+                                ? "Hybrid HID ready via \(model.selected!.displayName)"
+                                : "Standard H.264 wireless receiver")
+                                .font(.system(size: 10.5))
+                                .foregroundColor(Color.white.opacity(0.62))
+                                .lineLimit(2)
+                        }
                     }
-                    .padding(.top, 12)
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .strokeBorder(Color.white.opacity(0.16), lineWidth: 1)
+                    )
+                }
+
+                if model.filteredDevices.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Image(systemName: model.transport == "airplay" ? "antenna.radiowaves.left.and.right" : "iphone.slash")
+                            .font(.system(size: 22, weight: .light))
+                            .foregroundColor(Color.white.opacity(0.65))
+                        Text(model.transport == "airplay" ? "No wired/paired iPhone required" : "No iPhone found")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundColor(.white)
+                        Text(
+                            model.transport == "airplay"
+                                ? "Start the receiver directly, then pick “iPhone Mirror” in iPhone Control Center."
+                                : (model.transport == "wifi"
+                                    ? "Connect once via cable and trust this Mac to mirror over Wi-Fi."
+                                    : "Connect by USB, or pair once by cable for Wi-Fi mirroring.")
+                        )
+                        .font(.system(size: 11.5))
+                        .foregroundColor(Color.white.opacity(0.62))
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.top, 6)
                 } else {
                     ScrollView {
-                        LazyVStack(spacing: 4) {
+                        LazyVStack(spacing: 6) {
                             ForEach(model.filteredDevices) { device in
                                 DeviceRow(device: device, selected: model.selected?.id == device.id)
                                     .onTapGesture { model.selectedID = device.id }
@@ -365,94 +681,211 @@ struct ContentView: View {
                 }
 
                 if model.transport != "usb", !model.nearbyDevices.isEmpty {
-                    VStack(alignment: .leading, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 6) {
                         Text("Discovered on Wi-Fi")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                        ForEach(model.nearbyDevices) { device in
-                            HStack(spacing: 10) {
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(Color.white.opacity(0.55))
+                        ForEach(model.nearbyDevices.prefix(3)) { device in
+                            HStack(spacing: 8) {
                                 Image(systemName: "wifi")
-                                    .foregroundStyle(.secondary)
-                                VStack(alignment: .leading, spacing: 2) {
+                                    .font(.system(size: 11))
+                                    .foregroundColor(Color(red: 0.45, green: 0.80, blue: 1.0))
+                                VStack(alignment: .leading, spacing: 1) {
                                     Text(device.displayName)
-                                        .font(.system(size: 12, weight: .medium))
+                                        .font(.system(size: 11.5, weight: .medium))
+                                        .foregroundColor(.white)
                                         .lineLimit(1)
-                                    Text("Ready for direct Wi-Fi mirroring")
-                                        .font(.system(size: 10))
-                                        .foregroundStyle(.tertiary)
+                                    Text("Bonjour active")
+                                        .font(.system(size: 9.5))
+                                        .foregroundColor(Color.white.opacity(0.5))
                                 }
                             }
-                            .padding(.vertical, 4)
+                            .padding(.vertical, 2)
                         }
                     }
                 }
+
                 Spacer()
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 6) {
-                        Circle()
-                            .fill(model.error == nil ? Color.green : Color.orange)
-                            .frame(width: 6, height: 6)
-                        Text(model.isScanning ? "Scanning devices…" : "USB + Wi-Fi discovery active")
+
+                HStack {
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 6) {
+                            Circle()
+                                .fill(model.error == nil ? Color.green : Color.orange)
+                                .frame(width: 6, height: 6)
+                            Text(model.isScanning ? "Scanning…" : (model.transport == "airplay" ? "AirPlay ready" : "Discovery active"))
+                        }
+                        Text(AppInfo.label)
+                            .foregroundColor(Color.white.opacity(0.42))
                     }
-                    Text(AppInfo.label)
+                    .font(.system(size: 10.5))
+                    .foregroundColor(Color.white.opacity(0.65))
+                    Spacer()
                 }
-                    .font(.system(size: 11))
-                    .foregroundStyle(.tertiary)
             }
-            .padding(20)
-            .frame(width: 238)
-            .background(Color(nsColor: .windowBackgroundColor))
+            .padding(18)
+        }
+    }
 
-            Rectangle().fill(Color(nsColor: .separatorColor)).frame(width: 1)
-
+    private var stageCard: some View {
+        GlassSurface(cornerRadius: 22, material: .hudWindow, tintOpacity: 0.05) {
             VStack(spacing: 0) {
                 Spacer()
-                if let device = model.selected {
-                    Image(systemName: device.connection_type == .usb ? "iphone.gen3" : "iphone.radiowaves.left.and.right")
-                        .font(.system(size: 70, weight: .ultraLight))
-                        .foregroundStyle(Color.accentColor)
-                        .padding(.bottom, 24)
-                    Text("Ready to mirror")
-                        .font(.system(size: 25, weight: .semibold))
-                    Text("Connected over \(device.connection_type.label)")
-                        .foregroundStyle(.secondary)
-                        .padding(.top, 7)
-                    Button(model.backendRunning ? "Disconnect" : "Start Mirroring") {
+
+                if model.transport == "airplay" {
+                    ZStack {
+                        Circle()
+                            .fill(
+                                RadialGradient(
+                                    colors: [stageAccent.opacity(0.35), .clear],
+                                    center: .center,
+                                    startRadius: 8,
+                                    endRadius: 68
+                                )
+                            )
+                            .frame(width: 136, height: 136)
+                        Image(systemName: "airplayvideo")
+                            .font(.system(size: 62, weight: .light))
+                            .foregroundColor(.white)
+                    }
+                    .padding(.bottom, 12)
+
+                    Text("AirPlay H.264 Receiver")
+                        .font(.system(size: 25, weight: .bold))
+                        .foregroundColor(.white)
+
+                    Text("Open Control Center → Screen Mirroring on your iPhone and select “iPhone Mirror”.")
+                        .font(.system(size: 13))
+                        .foregroundColor(Color.white.opacity(0.75))
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 380)
+                        .padding(.top, 8)
+
+                    HStack(spacing: 8) {
+                        Image(systemName: model.selected != nil ? "hand.tap.fill" : "eye")
+                            .font(.system(size: 11))
+                        Text(
+                            model.selected != nil
+                                ? "Hybrid touch & keyboard enabled via \(model.selected!.connection_type.label)"
+                                : "Video + Audio mode (connect USB/Wi-Fi once to add touch control)"
+                        )
+                        .font(.system(size: 11.5, weight: .medium))
+                    }
+                    .foregroundColor(Color.white.opacity(0.85))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 7)
+                    .background(Color.white.opacity(0.09), in: Capsule())
+                    .overlay(Capsule().strokeBorder(Color.white.opacity(0.22), lineWidth: 1))
+                    .padding(.top, 16)
+
+                    glassPrimaryButton(
+                        title: model.backendRunning ? "Stop Receiver" : "Start AirPlay Receiver"
+                    ) {
                         model.backendRunning ? model.disconnect() : model.connect()
                     }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
-                    .keyboardShortcut(.defaultAction)
-                    .padding(.top, 28)
+                    .padding(.top, 24)
+                } else if let device = model.selected {
+                    ZStack {
+                        Circle()
+                            .fill(
+                                RadialGradient(
+                                    colors: [stageAccent.opacity(0.35), .clear],
+                                    center: .center,
+                                    startRadius: 8,
+                                    endRadius: 72
+                                )
+                            )
+                            .frame(width: 140, height: 140)
+                        Image(systemName: device.connection_type == .usb ? "iphone.gen3" : "iphone.radiowaves.left.and.right")
+                            .font(.system(size: 66, weight: .ultraLight))
+                            .foregroundColor(.white)
+                    }
+                    .padding(.bottom, 14)
+
+                    Text("Ready to mirror")
+                        .font(.system(size: 25, weight: .bold))
+                        .foregroundColor(.white)
+
+                    Text("Connected via \(device.displayName) · \(device.connection_type.label) HEVC")
+                        .font(.system(size: 13))
+                        .foregroundColor(Color.white.opacity(0.72))
+                        .padding(.top, 6)
+
+                    glassPrimaryButton(
+                        title: model.backendRunning ? "Disconnect" : "Start Mirroring"
+                    ) {
+                        model.backendRunning ? model.disconnect() : model.connect()
+                    }
+                    .padding(.top, 26)
                 } else {
                     Image(systemName: "rectangle.on.rectangle.slash")
-                        .font(.system(size: 60, weight: .ultraLight))
-                        .foregroundStyle(.secondary)
-                        .padding(.bottom, 24)
+                        .font(.system(size: 56, weight: .ultraLight))
+                        .foregroundColor(Color.white.opacity(0.55))
+                        .padding(.bottom, 18)
+
                     Text("Connect an iPhone")
-                        .font(.system(size: 25, weight: .semibold))
-                    Text("Use USB for the lowest latency, or pair once by cable to mirror directly over Wi-Fi.")
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 24, weight: .bold))
+                        .foregroundColor(.white)
+
+                    Text("Plug in USB for the lowest latency, use paired Wi-Fi, or switch the mode selector to AirPlay.")
+                        .font(.system(size: 13))
+                        .foregroundColor(Color.white.opacity(0.70))
                         .multilineTextAlignment(.center)
-                        .frame(maxWidth: 370)
+                        .frame(maxWidth: 380)
                         .padding(.top, 8)
                 }
+
                 if let error = model.error {
                     Text(error)
                         .font(.system(size: 12))
-                        .foregroundStyle(.red)
+                        .foregroundColor(Color(red: 1.0, green: 0.55, blue: 0.55))
                         .multilineTextAlignment(.center)
-                        .frame(maxWidth: 390)
-                        .padding(.top, 22)
+                        .frame(maxWidth: 400)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(Color.red.opacity(0.14), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .strokeBorder(Color.red.opacity(0.32), lineWidth: 1)
+                        )
+                        .padding(.top, 20)
                 }
+
                 Spacer()
             }
-            .frame(maxWidth: .infinity)
-            .padding(36)
-            .background(Color(nsColor: .controlBackgroundColor))
+            .padding(34)
         }
-        .frame(minWidth: 720, idealWidth: 820, minHeight: 480, idealHeight: 540)
-        .task { model.start() }
+    }
+
+    private func glassPrimaryButton(title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: model.backendRunning ? "stop.fill" : "play.fill")
+                    .font(.system(size: 12, weight: .bold))
+                Text(title)
+                    .font(.system(size: 14, weight: .semibold))
+            }
+            .foregroundColor(.white)
+            .padding(.horizontal, 24)
+            .padding(.vertical, 11)
+            .background(
+                LinearGradient(
+                    colors: model.backendRunning
+                        ? [Color(red: 0.92, green: 0.30, blue: 0.34), Color(red: 0.78, green: 0.18, blue: 0.24)]
+                        : [Color(red: 0.28, green: 0.62, blue: 1.0), Color(red: 0.16, green: 0.44, blue: 0.95)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                ),
+                in: Capsule()
+            )
+            .overlay(
+                Capsule()
+                    .strokeBorder(Color.white.opacity(0.38), lineWidth: 1)
+            )
+            .shadow(color: (model.backendRunning ? Color.red : Color.blue).opacity(0.42), radius: 14, x: 0, y: 6)
+        }
+        .buttonStyle(.plain)
+        .keyboardShortcut(.defaultAction)
     }
 }
 
@@ -477,6 +910,7 @@ struct SettingsView: View {
                 Text("Automatic").tag("auto")
                 Text("USB only").tag("usb")
                 Text("Wi-Fi only").tag("wifi")
+                Text("AirPlay (H.264)").tag("airplay")
             }
             Toggle("Connect automatically when an iPhone appears", isOn: $autoConnect)
             Toggle("Resize the mirror window when orientation changes", isOn: $autoRotate)
@@ -490,7 +924,7 @@ struct SettingsView: View {
         }
         .modifier(GroupedFormStyle())
         .padding(8)
-        .frame(width: 460, height: 230)
+        .frame(width: 460, height: 240)
     }
 }
 
