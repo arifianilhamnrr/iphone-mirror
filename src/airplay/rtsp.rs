@@ -4,9 +4,10 @@
 
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use plist::Value;
@@ -213,7 +214,7 @@ async fn handle_rtsp_connection(
         };
 
         let cseq = req.headers.get("cseq").cloned();
-        let response = dispatch_request(&req, &mut state, &identity, &callbacks).await;
+        let response = dispatch_request(&req, addr.ip(), &mut state, &identity, &callbacks).await;
         let proto = if req.proto.starts_with("HTTP/") {
             "RTSP/1.0"
         } else {
@@ -278,6 +279,7 @@ impl RtspResponse {
 
 async fn dispatch_request(
     req: &RtspRequest,
+    peer_ip: IpAddr,
     state: &mut SessionState,
     identity: &ServerIdentity,
     callbacks: &Arc<AirPlayCallbacks>,
@@ -358,7 +360,7 @@ async fn dispatch_request(
                 RtspResponse::bad_request()
             }
         },
-        ("SETUP", _) => handle_setup(&req.body, state, callbacks).await,
+        ("SETUP", _) => handle_setup(&req.body, peer_ip, state, callbacks).await,
         ("RECORD", _) => {
             let mut resp = RtspResponse::ok();
             resp.headers.push(("Audio-Latency", "11025".to_string()));
@@ -386,6 +388,7 @@ async fn dispatch_request(
 
 async fn handle_setup(
     body: &[u8],
+    peer_ip: IpAddr,
     state: &mut SessionState,
     callbacks: &Arc<AirPlayCallbacks>,
 ) -> RtspResponse {
@@ -423,9 +426,13 @@ async fn handle_setup(
         state.aes_key = Some(session_key);
         state.aes_iv = Some(iv);
 
+        let timing_rport = root
+            .get("timingPort")
+            .and_then(|v| v.as_unsigned_integer())
+            .unwrap_or(0) as u16;
         let ntp_port = match state.ntp_port {
             Some(p) => p,
-            None => match spawn_ntp_responder(state.stream_shutdown.subscribe()).await {
+            None => match spawn_ntp_client(peer_ip, timing_rport, state.stream_shutdown.subscribe()).await {
                 Ok(p) => {
                     state.ntp_port = Some(p);
                     p
@@ -524,13 +531,49 @@ async fn handle_setup(
     RtspResponse::ok().with_body("application/x-apple-binary-plist", out)
 }
 
-async fn spawn_ntp_responder(mut shutdown: watch::Receiver<bool>) -> Result<u16> {
-    let sock = UdpSocket::bind("0.0.0.0:0").await?;
+fn current_ntp_timestamp_be() -> [u8; 8] {
+    const NTP_EPOCH_OFFSET: u64 = 2_208_988_800;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs() + NTP_EPOCH_OFFSET;
+    let frac = ((now.subsec_nanos() as u64) << 32) / 1_000_000_000;
+    ((secs << 32) | frac).to_be_bytes()
+}
+
+async fn spawn_ntp_client(
+    peer_ip: IpAddr,
+    timing_rport: u16,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<u16> {
+    let bind_addr = if peer_ip.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let sock = UdpSocket::bind(bind_addr).await?;
     let port = sock.local_addr()?.port();
+    let remote = if timing_rport > 0 {
+        Some(SocketAddr::new(peer_ip, timing_rport))
+    } else {
+        None
+    };
+
     tokio::spawn(async move {
+        let mut last_t3_raw = [0u8; 8];
+        let mut last_recv_ntp = [0u8; 8];
         let mut buf = [0u8; 64];
+        let mut tick = tokio::time::interval(Duration::from_secs(3));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
+                _ = tick.tick() => {
+                    if let Some(target) = remote {
+                        let mut req = [0u8; 32];
+                        req[..4].copy_from_slice(&[0x80, 0xd2, 0x00, 0x07]);
+                        req[8..16].copy_from_slice(&last_t3_raw);
+                        req[16..24].copy_from_slice(&last_recv_ntp);
+                        req[24..32].copy_from_slice(&current_ntp_timestamp_be());
+                        let _ = sock.send_to(&req, target).await;
+                    }
+                }
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
                         break;
@@ -538,11 +581,20 @@ async fn spawn_ntp_responder(mut shutdown: watch::Receiver<bool>) -> Result<u16>
                 }
                 res = sock.recv_from(&mut buf) => {
                     if let Ok((len, peer)) = res {
-                        if len == 32 && (buf[1] & 0x7f) == 0x52 {
-                            // Reply with AirPlay NTP timing response (0x80 | 0x53)
-                            let mut reply = buf;
-                            reply[1] = 0xd3;
-                            let _ = sock.send_to(&reply[..32], peer).await;
+                        if len == 32 {
+                            let ptype = buf[1] & 0x7f;
+                            if ptype == 0x53 {
+                                last_t3_raw.copy_from_slice(&buf[24..32]);
+                                last_recv_ntp = current_ntp_timestamp_be();
+                            } else if ptype == 0x52 {
+                                let now = current_ntp_timestamp_be();
+                                let mut reply = buf;
+                                reply[1] = 0xd3;
+                                reply[8..16].copy_from_slice(&buf[24..32]);
+                                reply[16..24].copy_from_slice(&now);
+                                reply[24..32].copy_from_slice(&now);
+                                let _ = sock.send_to(&reply[..32], peer).await;
+                            }
                         }
                     }
                 }

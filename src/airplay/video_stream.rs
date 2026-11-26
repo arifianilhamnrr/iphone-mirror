@@ -79,6 +79,7 @@ async fn handle_video_connection(
     let mut decoder: Option<HardwareDecoder> = None;
     let mut last_avcc_config: Vec<u8> = Vec::new();
     let mut last_landscape: Option<bool> = None;
+    let mut decode_errors = 0_u32;
 
     loop {
         if let Err(err) = stream.read_exact(&mut header).await {
@@ -177,11 +178,15 @@ async fn handle_video_connection(
                 ctr.apply_keystream(&mut payload);
                 if let Some(dec) = decoder.as_mut() {
                     if let Err(err) = dec.decode_avcc(&payload) {
-                        debug!("AirPlay H.264 decode error: {err}");
-                    }
-                    let count = frame_count.load(Ordering::Relaxed);
-                    if count == 1 || count % 300 == 0 {
-                        debug!(frame = count, "AirPlay decoded H.264 frame");
+                        decode_errors += 1;
+                        if decode_errors == 1 || decode_errors % 100 == 0 {
+                            warn!(decode_errors, "AirPlay H.264 decode error: {err}");
+                        }
+                    } else {
+                        let count = frame_count.load(Ordering::Relaxed);
+                        if count == 1 || count % 300 == 0 {
+                            info!(frame = count, "AirPlay decoded H.264 frame");
+                        }
                     }
                 }
             }

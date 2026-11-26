@@ -6,7 +6,7 @@ use aes::Aes128;
 use anyhow::{bail, Result};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha512};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
 /// Streaming AES-128-CTR cipher matching OpenSSL `EVP_aes_128_ctr` behavior
@@ -189,11 +189,11 @@ impl PairVerifyState {
     }
 }
 
-/// Combines FairPlay-decrypted AES key with optional `pair-verify` ECDH secret via SHA-256.
+/// Combines FairPlay-decrypted AES key with optional `pair-verify` ECDH secret via SHA-512.
 pub fn derive_session_aes_key(fairplay_key: [u8; 16], ecdh_secret: Option<[u8; 32]>) -> [u8; 16] {
     match ecdh_secret {
         Some(secret) => {
-            let mut hasher = Sha256::new();
+            let mut hasher = Sha512::new();
             hasher.update(fairplay_key);
             hasher.update(secret);
             let digest = hasher.finalize();
@@ -259,6 +259,19 @@ mod tests {
         assert_eq!(iv1, iv2);
         assert_ne!(k1, k3);
         assert_ne!(k1, iv1);
+    }
+
+    #[test]
+    fn session_aes_key_uses_sha512() {
+        let fp_key = [0x12u8; 16];
+        let secret = [0x34u8; 32];
+        let derived = derive_session_aes_key(fp_key, Some(secret));
+        let mut expected = Sha512::new();
+        expected.update(fp_key);
+        expected.update(secret);
+        let digest = expected.finalize();
+        assert_eq!(derived, digest[..16]);
+        assert_eq!(derive_session_aes_key(fp_key, None), fp_key);
     }
 
     #[test]
