@@ -5,6 +5,7 @@ use idevice::{
         ButtonState, DataInclusionPolicy, IndigoHidClient, PasteboardServiceClient,
         UniversalHidServiceClient, GENERAL_PASTEBOARD,
     },
+    springboardservices::{InterfaceOrientation, SpringBoardServicesClient},
     RsdService,
 };
 use iphone_mirror_rs::{
@@ -19,7 +20,7 @@ use iphone_mirror_rs::{
     codec::{decoder::HardwareDecoder, format_desc::FormatDescription, screenshot::save_frame_png},
     input::{
         clipboard::{ClipboardContent, SystemClipboard, MAX_CLIPBOARD_IMAGE_BYTES},
-        coordinate_mapper::CoordinateMapper,
+        coordinate_mapper::{CoordinateMapper, DisplayRotation},
     },
     media::nal_parser::ParameterSetCache,
     media::{h265_depacketizer::H265Depacketizer, rtp::RtpPacket},
@@ -81,6 +82,7 @@ fn default_true() -> bool {
 
 enum UiEvent {
     Frame(iphone_mirror_rs::codec::decoder::DecodedFrame),
+    Orientation(DisplayRotation),
     Clipboard(ClipboardContent),
     ShutdownRequested,
     ShutdownComplete,
@@ -98,7 +100,7 @@ enum InputCommand {
     ScrollEnd,
     SetKeys(Vec<u16>),
     /// iOS has no hardware Back button; emulate the left-edge swipe gesture.
-    NavigateBack,
+    NavigateBack(DisplayRotation),
 }
 
 /// Consumer-page (0x0C) HID usages for the iPhone's physical buttons.
@@ -169,6 +171,8 @@ struct MirrorApp {
     always_on_top: bool,
     fullscreen: bool,
     auto_rotate: bool,
+    rotation: DisplayRotation,
+    manual_rotation_override: bool,
     frame_is_landscape: Option<bool>,
     pressed_keys: BTreeSet<u16>,
     modifiers: winit::keyboard::ModifiersState,
@@ -218,7 +222,7 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
             UiEvent::Frame(frame) => {
                 self.frame_count += 1;
                 self.frame_size = Some((frame.width(), frame.height()));
-                let landscape = frame.width() > frame.height();
+                let landscape = self.rotation.is_landscape() || frame.width() > frame.height();
                 if self.auto_rotate
                     && self.frame_is_landscape != Some(landscape)
                     && !self.fullscreen
@@ -261,6 +265,11 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                     if let Err(error) = renderer.render_frame(&frame) {
                         warn!(%error, "Failed to present decoded frame");
                     }
+                }
+            }
+            UiEvent::Orientation(rotation) => {
+                if self.auto_rotate && !self.manual_rotation_override && self.rotation != rotation {
+                    self.apply_rotation(rotation);
                 }
             }
             UiEvent::Transfer(event) => {
@@ -470,9 +479,12 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                             )
                         })
                         .unwrap_or((100.0, 100.0));
+                    let (dx, dy) = self
+                        .rotation
+                        .rotate_delta_f64(ax * scale.0, ay * scale.1);
                     let _ = self.input_tx.send(InputCommand::ScrollMove(
-                        (ax * scale.0).round() as i32,
-                        (ay * scale.1).round() as i32,
+                        dx.round() as i32,
+                        dy.round() as i32,
                     ));
                     self.scroll_deadline =
                         Some(std::time::Instant::now() + std::time::Duration::from_millis(250));
@@ -509,7 +521,9 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                             if event.state == winit::event::ElementState::Pressed && !event.repeat
                             {
                                 self.end_scroll();
-                                let _ = self.input_tx.send(InputCommand::NavigateBack);
+                                let _ = self
+                                    .input_tx
+                                    .send(InputCommand::NavigateBack(self.rotation));
                             }
                             return;
                         }
@@ -555,6 +569,13 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                                     });
                                 }
                                 info!(always_on_top = self.always_on_top, "Toggled always-on-top");
+                                return;
+                            }
+                            if code == winit::keyboard::KeyCode::KeyR {
+                                let next = self.rotation.cycle_manual();
+                                self.manual_rotation_override = next != DisplayRotation::Portrait;
+                                self.apply_rotation(next);
+                                info!(rotation = next.label(), "Rotated mirror display manually");
                                 return;
                             }
                             if code == winit::keyboard::KeyCode::KeyF && self.modifiers.super_key()
@@ -814,6 +835,32 @@ impl MirrorApp {
         }
     }
 
+    fn apply_rotation(&mut self, rotation: DisplayRotation) {
+        self.rotation = rotation;
+        if let Some(renderer) = &self.renderer {
+            renderer.set_rotation(rotation);
+        }
+        let landscape = rotation.is_landscape()
+            || self.frame_size.is_some_and(|(width, height)| width > height);
+        if !self.fullscreen && self.frame_is_landscape != Some(landscape) {
+            self.frame_is_landscape = Some(landscape);
+            if let Some(window) = &self.window {
+                let current = window.inner_size();
+                let (width, height) =
+                    rotated_window_size(current.width, current.height, landscape);
+                let target = winit::dpi::PhysicalSize::new(width, height);
+                let _ = window.request_inner_size(target);
+                info!(
+                    rotation = rotation.label(),
+                    landscape,
+                    width = target.width,
+                    height = target.height,
+                    "Rotated mirror window"
+                );
+            }
+        }
+    }
+
     /// Scroll the mirrored iPhone with a synthetic touchscreen drag. The finger
     /// moves opposite to the content: ArrowUp reveals content above (finger
     /// drags down), ArrowDown reveals content below (finger drags up).
@@ -832,7 +879,8 @@ impl MirrorApp {
                 .send(InputCommand::ScrollStart(anchor.0, anchor.1));
         }
         let step = (u16::MAX as f32 * 0.22 * direction as f32).round() as i32;
-        let _ = self.input_tx.send(InputCommand::ScrollMove(0, step));
+        let (dx, dy) = self.rotation.rotate_delta(0, step);
+        let _ = self.input_tx.send(InputCommand::ScrollMove(dx, dy));
         self.scroll_deadline =
             Some(std::time::Instant::now() + std::time::Duration::from_millis(200));
     }
@@ -860,11 +908,12 @@ impl MirrorApp {
         let window = self.window.as_ref()?;
         let (frame_width, frame_height) = self.frame_size?;
         let size = window.inner_size();
-        let (x, y) = CoordinateMapper::map_aspect_fit(
+        let (x, y) = CoordinateMapper::map_aspect_fit_rotated(
             size.width as f64,
             size.height as f64,
             frame_width as f64,
             frame_height as f64,
+            self.rotation,
             position.x,
             position.y,
         )?;
@@ -1588,6 +1637,26 @@ async fn run_mirror() -> Result<()> {
     .context("Timed out connecting the auto-paste HID channel")?
     .context("Failed to connect the auto-paste HID channel")?;
 
+    let springboard = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        SpringBoardServicesClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake),
+    )
+    .await
+    {
+        Ok(Ok(client)) => {
+            info!("SpringBoard services connected for interface orientation");
+            Some(client)
+        }
+        Ok(Err(error)) => {
+            warn!(%error, "SpringBoard services unavailable; auto-rotate will rely on Ctrl+R");
+            None
+        }
+        Err(_) => {
+            warn!("Timed out connecting to SpringBoard services; auto-rotate will rely on Ctrl+R");
+            None
+        }
+    };
+
     let event_loop = winit::event_loop::EventLoop::<UiEvent>::with_user_event()
         .build()
         .context("Failed to create the macOS event loop")?;
@@ -1635,6 +1704,67 @@ async fn run_mirror() -> Result<()> {
         tokio::sync::mpsc::unbounded_channel::<ClipboardContent>();
     let audio_muted = Arc::new(AtomicBool::new(false));
     let audio_muted_stream = audio_muted.clone();
+
+    if let Some(mut springboard) = springboard {
+        let orientation_proxy = stream_proxy.clone();
+        let mut orientation_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut poll = tokio::time::interval(std::time::Duration::from_millis(500));
+            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut last_rotation: Option<DisplayRotation> = None;
+            loop {
+                tokio::select! {
+                    _ = poll.tick() => {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            springboard.get_interface_orientation(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(orientation)) => {
+                                let rotation = match orientation {
+                                    InterfaceOrientation::Portrait => Some(DisplayRotation::Portrait),
+                                    InterfaceOrientation::PortraitUpsideDown => {
+                                        Some(DisplayRotation::PortraitUpsideDown)
+                                    }
+                                    InterfaceOrientation::LandscapeRight => {
+                                        Some(DisplayRotation::LandscapeRight)
+                                    }
+                                    InterfaceOrientation::LandscapeLeft => {
+                                        Some(DisplayRotation::LandscapeLeft)
+                                    }
+                                    InterfaceOrientation::Unknown => None,
+                                };
+                                if let Some(rotation) = rotation {
+                                    if last_rotation != Some(rotation) {
+                                        last_rotation = Some(rotation);
+                                        if orientation_proxy
+                                            .send_event(UiEvent::Orientation(rotation))
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(Err(error)) => {
+                                debug!(%error, "SpringBoard orientation query stopped");
+                                break;
+                            }
+                            Err(_) => {
+                                debug!("SpringBoard orientation query timed out");
+                            }
+                        }
+                    }
+                    changed = orientation_shutdown.changed() => {
+                        if changed.is_err() || *orientation_shutdown.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     let signal_proxy = stream_proxy.clone();
     tokio::spawn(async move {
@@ -2221,7 +2351,7 @@ async fn run_mirror() -> Result<()> {
                             InputCommand::ScrollMove(..) => "scroll-move",
                             InputCommand::ScrollEnd => "scroll-end",
                             InputCommand::SetKeys(..) => "keyboard",
-                            InputCommand::NavigateBack => "navigate-back",
+                            InputCommand::NavigateBack(..) => "navigate-back",
                         };
                         let result = match command {
                             InputCommand::Down(x, y) | InputCommand::Move(x, y) => {
@@ -2275,11 +2405,13 @@ async fn run_mirror() -> Result<()> {
                                     Ok(())
                                 }
                             }
-                            InputCommand::NavigateBack => {
+                            InputCommand::NavigateBack(rotation) => {
                                 scroll_position = None;
-                                // Start inside the left-edge zone and drag to ~73% width
-                                // to trigger the interactive pop gesture.
-                                hid.drag(128, 32_768, 48_000, 32_768, 14, 12).await
+                                // Start inside the visual left-edge zone and drag to ~73%
+                                // width to trigger the interactive pop gesture.
+                                let (sx, sy) = rotation.to_buffer_u16(128, 32_768);
+                                let (ex, ey) = rotation.to_buffer_u16(48_000, 32_768);
+                                hid.drag(sx, sy, ex, ey, 14, 12).await
                             }
                             InputCommand::SetKeys(usages) => {
                                 let usages = usages.into_iter()
@@ -2361,6 +2493,8 @@ async fn run_mirror() -> Result<()> {
         always_on_top: false,
         fullscreen: false,
         auto_rotate: settings.auto_rotate,
+        rotation: DisplayRotation::Portrait,
+        manual_rotation_override: false,
         frame_is_landscape: None,
         pressed_keys: BTreeSet::new(),
         modifiers: winit::keyboard::ModifiersState::empty(),

@@ -1,6 +1,10 @@
 // language: Rust, file: src/ui/metal_renderer.rs, target: macOS
-use crate::codec::{decoder::DecodedFrame, videotoolbox_sys::*};
+use crate::{
+    codec::{decoder::DecodedFrame, videotoolbox_sys::*},
+    input::coordinate_mapper::DisplayRotation,
+};
 use anyhow::{bail, Context, Result};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 #[cfg(target_os = "macos")]
 use core_graphics_types::geometry::CGSize;
@@ -24,6 +28,7 @@ pub struct MetalRenderer {
     pipeline: RenderPipelineState,
     #[cfg(target_os = "macos")]
     texture_cache: CVMetalTextureCacheRef,
+    rotation: AtomicU32,
 }
 
 impl MetalRenderer {
@@ -92,6 +97,7 @@ impl MetalRenderer {
             layer,
             pipeline,
             texture_cache,
+            rotation: AtomicU32::new(DisplayRotation::Portrait.shader_mode()),
         };
         renderer.resize(window.inner_size().width, window.inner_size().height);
         Ok(renderer)
@@ -99,7 +105,13 @@ impl MetalRenderer {
 
     #[cfg(not(target_os = "macos"))]
     pub fn new(_window: &winit::window::Window) -> Result<Self> {
-        Ok(Self {})
+        Ok(Self {
+            rotation: AtomicU32::new(DisplayRotation::Portrait.shader_mode()),
+        })
+    }
+
+    pub fn set_rotation(&self, rotation: DisplayRotation) {
+        self.rotation.store(rotation.shader_mode(), Ordering::Relaxed);
     }
 
     pub fn resize(&self, width: u32, height: u32) {
@@ -136,8 +148,15 @@ impl MetalRenderer {
             let command = self.command_queue.new_command_buffer();
             let encoder = command.new_render_command_encoder(pass);
             encoder.set_render_pipeline_state(&self.pipeline);
+            let rotation = DisplayRotation::from_shader_mode(self.rotation.load(Ordering::Relaxed));
+            let native_landscape = frame.width() > frame.height();
+            let (display_width, display_height) = if rotation.is_landscape() && !native_landscape {
+                (frame.height() as f64, frame.width() as f64)
+            } else {
+                (frame.width() as f64, frame.height() as f64)
+            };
             let drawable_size = self.layer.drawable_size();
-            let video_aspect = frame.width() as f64 / frame.height() as f64;
+            let video_aspect = display_width / display_height;
             let drawable_aspect = drawable_size.width / drawable_size.height;
             let (viewport_width, viewport_height) = if drawable_aspect > video_aspect {
                 (drawable_size.height * video_aspect, drawable_size.height)
@@ -152,8 +171,18 @@ impl MetalRenderer {
                 znear: 0.0,
                 zfar: 1.0,
             });
+            let shader_rot = if native_landscape && rotation.is_landscape() {
+                0_u32
+            } else {
+                rotation.shader_mode()
+            };
             encoder.set_fragment_texture(0, Some(luma.texture()));
             encoder.set_fragment_texture(1, Some(chroma.texture()));
+            encoder.set_fragment_bytes(
+                0,
+                std::mem::size_of::<u32>() as u64,
+                (&shader_rot as *const u32).cast(),
+            );
             encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
             encoder.end_encoding();
             command.present_drawable(drawable);
@@ -231,10 +260,19 @@ vertex Out video_vertex(uint id [[vertex_id]]) {
     return { float4(positions[id], 0.0, 1.0), uvs[id] };
 }
 fragment float4 video_fragment(Out in [[stage_in]], texture2d<float> yTex [[texture(0)]],
-                               texture2d<float> uvTex [[texture(1)]]) {
+                               texture2d<float> uvTex [[texture(1)]],
+                               constant uint &rot [[buffer(0)]]) {
     constexpr sampler s(address::clamp_to_edge, filter::linear);
-    float y = yTex.sample(s, in.uv).r;
-    float2 uv = uvTex.sample(s, in.uv).rg - float2(0.5);
+    float2 sample_uv = in.uv;
+    if (rot == 1) {
+        sample_uv = float2(1.0 - in.uv.y, in.uv.x);
+    } else if (rot == 2) {
+        sample_uv = float2(in.uv.y, 1.0 - in.uv.x);
+    } else if (rot == 3) {
+        sample_uv = float2(1.0 - in.uv.x, 1.0 - in.uv.y);
+    }
+    float y = yTex.sample(s, sample_uv).r;
+    float2 uv = uvTex.sample(s, sample_uv).rg - float2(0.5);
     float3 rgb = float3(y + 1.5748 * uv.y,
                         y - 0.1873 * uv.x - 0.4681 * uv.y,
                         y + 1.8556 * uv.x);

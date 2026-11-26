@@ -1,5 +1,5 @@
 // Unit tests for RTP packet parser and RFC 7798 H.265 depacketizer
-use iphone_mirror_rs::input::coordinate_mapper::CoordinateMapper;
+use iphone_mirror_rs::input::coordinate_mapper::{CoordinateMapper, DisplayRotation};
 use iphone_mirror_rs::media::nal_parser::{NalUnitType, ParameterSetCache};
 use iphone_mirror_rs::media::rtp::RtpPacket;
 use iphone_mirror_rs::media::{h265_depacketizer::H265Depacketizer, rtp};
@@ -190,5 +190,47 @@ fn test_aspect_fit_coordinate_mapping() {
     );
     assert!(
         CoordinateMapper::map_aspect_fit(1000.0, 1000.0, 1600.0, 900.0, 500.0, 100.0).is_none()
+    );
+}
+
+#[test]
+fn test_rotated_landscape_coordinate_and_delta_mapping() {
+    // Portrait buffer (752x1344) displayed rotated in a matching landscape window (1344x752).
+    // Top-left of landscape window (0, 0) maps to portrait buffer top-right (1.0, 0.0).
+    let (bx, by) = CoordinateMapper::map_aspect_fit_rotated(
+        1344.0,
+        752.0,
+        752.0,
+        1344.0,
+        DisplayRotation::LandscapeRight,
+        0.0,
+        0.0,
+    )
+    .expect("top-left should map inside frame");
+    assert!((bx - 1.0).abs() < 1e-5);
+    assert!(by.abs() < 1e-5);
+
+    // Bottom-left of landscape window (0, 752) maps to portrait buffer top-left (0.0, 0.0).
+    let (bx, by) = CoordinateMapper::map_aspect_fit_rotated(
+        1344.0,
+        752.0,
+        752.0,
+        1344.0,
+        DisplayRotation::LandscapeRight,
+        0.0,
+        752.0,
+    )
+    .expect("bottom-left should map inside frame");
+    assert!(bx.abs() < 1e-5);
+    assert!(by.abs() < 1e-5);
+
+    // Visual scroll down (dy > 0) in LandscapeRight drags toward bx=0 (dbx < 0, dby = 0).
+    assert_eq!(DisplayRotation::LandscapeRight.rotate_delta(0, 1000), (-1000, 0));
+    assert_eq!(DisplayRotation::LandscapeLeft.rotate_delta(0, 1000), (1000, 0));
+
+    // Esc back gesture starts at visual left edge (x=128, y=32768) -> (bx=32767, by=128) in LandscapeRight.
+    assert_eq!(
+        DisplayRotation::LandscapeRight.to_buffer_u16(128, 32_768),
+        (u16::MAX - 32_768, 128)
     );
 }

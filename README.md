@@ -121,6 +121,7 @@ Deleting that file requires pairing again by cable.
 | `Ctrl+M` | Mute or unmute Mac audio playback |
 | `Ctrl+S` | Save a PNG screenshot |
 | `Ctrl+T` | Toggle always-on-top |
+| `Ctrl+R` | Rotate display manually |
 | `Ctrl+Cmd+F` | Toggle borderless fullscreen |
 | `Cmd+,` | Open settings |
 | `↑` / `↓` | Scroll the mirrored screen |

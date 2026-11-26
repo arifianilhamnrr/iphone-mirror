@@ -27,6 +27,7 @@ idevice = { git = "https://github.com/jkcoxson/idevice", rev = "89702099f4d7552f
     "mobile_image_mounter",
     "remote_pairing",
     "ring",
+    "springboardservices",
     "tunnel_tcp_stack",
     "usbmuxd",
 ] }
