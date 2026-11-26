@@ -43,7 +43,7 @@ impl MetalRenderer {
         layer.set_device(&device);
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
         layer.set_presents_with_transaction(false);
-        layer.set_display_sync_enabled(true);
+        layer.set_display_sync_enabled(false);
 
         let handle = window
             .window_handle()
@@ -52,6 +52,7 @@ impl MetalRenderer {
             bail!("Expected an AppKit window handle");
         };
         unsafe {
+            let _: () = msg_send![layer.as_ref(), setAllowsNextDrawableTimeout: YES];
             let view = handle.ns_view.as_ptr() as *mut objc::runtime::Object;
             let _: () = msg_send![view, setWantsLayer: YES];
             let _: () = msg_send![view, setLayer: layer.as_ref()];

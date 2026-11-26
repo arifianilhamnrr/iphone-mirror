@@ -17,12 +17,16 @@ use iphone_mirror_rs::{
         },
         reorder::{AudioPacket, AudioReorder, ReorderedAudio},
     },
-    codec::{decoder::HardwareDecoder, format_desc::FormatDescription, screenshot::save_frame_png},
+    codec::{
+        decoder::{DecodedFrame, HardwareDecoder},
+        format_desc::FormatDescription,
+        screenshot::save_frame_png,
+    },
     input::{
         clipboard::{ClipboardContent, SystemClipboard, MAX_CLIPBOARD_IMAGE_BYTES},
         coordinate_mapper::{CoordinateMapper, DisplayRotation},
     },
-    media::nal_parser::ParameterSetCache,
+    media::nal_parser::{NalUnitType, ParameterSetCache},
     media::{h265_depacketizer::H265Depacketizer, rtp::RtpPacket},
     protocol::{display_client::DisplayClient, rtcp_stats::RtcpReportStats},
     transfer::{
@@ -81,7 +85,7 @@ fn default_true() -> bool {
 }
 
 enum UiEvent {
-    Frame(iphone_mirror_rs::codec::decoder::DecodedFrame),
+    FrameReady,
     Orientation(DisplayRotation),
     Clipboard(ClipboardContent),
     ShutdownRequested,
@@ -147,6 +151,8 @@ impl HardwareButton {
 struct MirrorApp {
     window: Option<winit::window::Window>,
     renderer: Option<MetalRenderer>,
+    latest_frame: Arc<std::sync::Mutex<Option<DecodedFrame>>>,
+    frame_pending: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     frame_count: u64,
     frame_size: Option<(usize, usize)>,
@@ -219,7 +225,16 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
 
     fn user_event(&mut self, event_loop: &winit::event_loop::ActiveEventLoop, event: UiEvent) {
         match event {
-            UiEvent::Frame(frame) => {
+            UiEvent::FrameReady => {
+                self.frame_pending.store(false, Ordering::Release);
+                let Some(frame) = self
+                    .latest_frame
+                    .lock()
+                    .ok()
+                    .and_then(|mut slot| slot.take())
+                else {
+                    return;
+                };
                 self.frame_count += 1;
                 self.frame_size = Some((frame.width(), frame.height()));
                 let landscape = self.rotation.is_landscape() || frame.width() > frame.height();
@@ -1843,9 +1858,19 @@ async fn run_mirror() -> Result<()> {
         }
     });
 
+    let latest_frame: Arc<std::sync::Mutex<Option<DecodedFrame>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let frame_pending = Arc::new(AtomicBool::new(false));
+    let latest_frame_tx = latest_frame.clone();
+    let frame_pending_tx = frame_pending.clone();
     tokio::spawn(async move {
         while let Some(frame) = frame_rx.recv().await {
-            if proxy.send_event(UiEvent::Frame(frame)).is_err() {
+            if let Ok(mut slot) = latest_frame_tx.lock() {
+                *slot = Some(frame);
+            }
+            if !frame_pending_tx.swap(true, Ordering::AcqRel)
+                && proxy.send_event(UiEvent::FrameReady).is_err()
+            {
                 break;
             }
         }
@@ -1928,13 +1953,22 @@ async fn run_mirror() -> Result<()> {
                             match depacketizer.process_packet(&rtp) {
                             Ok(nals) => for nal in nals {
                                 nal_count += 1;
-                                parameter_sets.inspect_and_cache(&nal);
+                                if matches!(
+                                    ParameterSetCache::parse_nal_type(&nal),
+                                    Some(
+                                        NalUnitType::VpsNut
+                                            | NalUnitType::SpsNut
+                                            | NalUnitType::PpsNut
+                                    )
+                                ) {
+                                    parameter_sets.inspect_and_cache(&nal);
+                                    continue;
+                                }
 
                                 // iOS can change VPS/SPS/PPS mid-stream (rotation,
-                                // resolution change, encoder reset). A decoder built
-                                // from the old set then silently rejects every frame,
-                                // which looks like a frozen window while RTP keeps
-                                // arriving. Rebuild it whenever the sets change.
+                                // resolution change, encoder reset). Wait until a
+                                // non-parameter-set NAL arrives so all three sets are
+                                // updated before rebuilding the decoder once.
                                 let current_sets = match (
                                     parameter_sets.vps.as_ref(),
                                     parameter_sets.sps.as_ref(),
@@ -2474,6 +2508,8 @@ async fn run_mirror() -> Result<()> {
     let mut app = MirrorApp {
         window: None,
         renderer: None,
+        latest_frame,
+        frame_pending,
         shutdown_tx,
         frame_count: 0,
         frame_size: None,
