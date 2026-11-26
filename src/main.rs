@@ -97,13 +97,14 @@ enum InputCommand {
     ScrollMove(i32, i32),
     ScrollEnd,
     SetKeys(Vec<u16>),
+    /// iOS has no hardware Back button; emulate the left-edge swipe gesture.
+    NavigateBack,
 }
 
 /// Consumer-page (0x0C) HID usages for the iPhone's physical buttons.
 #[derive(Debug, Clone, Copy)]
 enum HardwareButton {
     Home,
-    Back,
     Lock,
     VolumeUp,
     VolumeDown,
@@ -114,8 +115,6 @@ impl HardwareButton {
     fn usage(self) -> (u64, u64) {
         match self {
             Self::Home => (0x0C, 0x40),
-            // Consumer page "AC Back", the standard hardware back-button usage.
-            Self::Back => (0x0C, 0x224),
             Self::Lock => (0x0C, 0x30),
             Self::VolumeUp => (0x0C, 0xE9),
             Self::VolumeDown => (0x0C, 0xEA),
@@ -135,7 +134,6 @@ impl HardwareButton {
     fn label(self) -> &'static str {
         match self {
             Self::Home => "home",
-            Self::Back => "back",
             Self::Lock => "lock",
             Self::VolumeUp => "volume-up",
             Self::VolumeDown => "volume-down",
@@ -510,7 +508,8 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                         winit::keyboard::KeyCode::Escape => {
                             if event.state == winit::event::ElementState::Pressed && !event.repeat
                             {
-                                let _ = self.button_tx.send(HardwareButton::Back);
+                                self.end_scroll();
+                                let _ = self.input_tx.send(InputCommand::NavigateBack);
                             }
                             return;
                         }
@@ -2164,6 +2163,15 @@ async fn run_mirror() -> Result<()> {
                             decoder_sets = None;
                             video_highest_sequence = 0;
                             audio_highest_sequence = 0;
+                            audio_reorder.reset();
+                            audio_rtcp_stats.reset();
+                            video_rtcp_stats.reset();
+                            audio_jitter = AudioJitter::new(8_000);
+                            audio_decode_errors = 0;
+                            ring_underflows_at_check = 0;
+                            audio_ring.clear();
+                            audio_output
+                                .restart(AudioRestartReason::MediaSessionRestarted)?;
                             decode_failures = 0;
                             decoder_stalled_ticks = 0;
                             frames_at_check = frames;
@@ -2213,6 +2221,7 @@ async fn run_mirror() -> Result<()> {
                             InputCommand::ScrollMove(..) => "scroll-move",
                             InputCommand::ScrollEnd => "scroll-end",
                             InputCommand::SetKeys(..) => "keyboard",
+                            InputCommand::NavigateBack => "navigate-back",
                         };
                         let result = match command {
                             InputCommand::Down(x, y) | InputCommand::Move(x, y) => {
@@ -2265,6 +2274,12 @@ async fn run_mirror() -> Result<()> {
                                 } else {
                                     Ok(())
                                 }
+                            }
+                            InputCommand::NavigateBack => {
+                                scroll_position = None;
+                                // Start inside the left-edge zone and drag to ~73% width
+                                // to trigger the interactive pop gesture.
+                                hid.drag(128, 32_768, 48_000, 32_768, 14, 12).await
                             }
                             InputCommand::SetKeys(usages) => {
                                 let usages = usages.into_iter()

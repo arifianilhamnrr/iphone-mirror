@@ -21,6 +21,8 @@ pub enum ReorderedAudio {
     Silence,
 }
 
+const MAX_SILENCE_GAP: usize = 64;
+
 pub struct AudioReorder {
     pending: BTreeMap<u32, AudioPacket>,
     next: Option<u32>,
@@ -96,6 +98,16 @@ impl AudioReorder {
                 .first_pending
                 .is_some_and(|t| t.elapsed() >= self.timeout);
             if !timed_out {
+                break;
+            }
+            if out.len() >= MAX_SILENCE_GAP || oldest.wrapping_sub(next) > MAX_SILENCE_GAP as u32 {
+                // Avoid unbounded silence allocation if `next` and `oldest` diverge
+                // (e.g. across a stream reset or large jump); resync to `oldest`.
+                next = oldest;
+                while let Some(packet) = self.pending.remove(&next) {
+                    out.push(ReorderedAudio::Packet(packet));
+                    next = next.wrapping_add(1);
+                }
                 break;
             }
             out.push(ReorderedAudio::Silence);
@@ -202,6 +214,22 @@ mod tests {
         assert!(matches!(out[0], ReorderedAudio::Silence));
         match out.last().unwrap() { ReorderedAudio::Packet(p) => assert_eq!(p.sequence, 120), _ => panic!() }
     }
+    #[test]
+    fn huge_or_backward_gap_resyncs_without_oom() {
+        let mut r = AudioReorder::new(8, Duration::from_millis(5));
+        r.push(pkt(50_000));
+        r.pop_ready(); // next = 50_001
+        r.push(pkt(1_000)); // e.g. stream restarted with lower sequence
+        std::thread::sleep(Duration::from_millis(10));
+        let out = r.pop_ready();
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ReorderedAudio::Packet(p) => assert_eq!(p.sequence, 1_000),
+            _ => panic!("expected resynced packet"),
+        }
+        assert_eq!(r.stats().next, Some(1_001));
+    }
+
     #[test]
     fn reset_clears_state() {
         let mut r = AudioReorder::new(8, Duration::from_millis(20));

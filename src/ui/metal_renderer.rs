@@ -111,6 +111,7 @@ impl MetalRenderer {
     pub fn render_frame(&self, frame: &DecodedFrame) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
+            objc::rc::autoreleasepool(|| -> Result<()> {
             let planes = unsafe { CVPixelBufferGetPlaneCount(frame.as_ptr()) };
             if planes < 2 {
                 bail!("Expected a bi-planar NV12 VideoToolbox frame, got {planes} planes");
@@ -157,6 +158,8 @@ impl MetalRenderer {
             encoder.end_encoding();
             command.present_drawable(drawable);
             command.commit();
+            Ok(())
+            })?;
         }
         Ok(())
     }

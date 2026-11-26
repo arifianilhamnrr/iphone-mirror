@@ -1,4 +1,5 @@
 // language: Rust, file: src/audio/audiounit.rs
+#![allow(non_upper_case_globals)]
 //! Default-output AudioUnit backend. CoreAudio pulls PCM from the ring buffer
 //! through a real-time render callback, so the hardware clock drives playback.
 

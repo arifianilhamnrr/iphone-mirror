@@ -122,7 +122,7 @@ final class LauncherModel: ObservableObject {
             while !Task.isCancelled {
                 await scan()
                 // Wi-Fi discovery runs dns-sd browse + resolve, so scan less often.
-                try? await Task.sleep(for: .seconds(4))
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
             }
         }
     }
@@ -451,8 +451,18 @@ struct ContentView: View {
             .padding(36)
             .background(Color(nsColor: .controlBackgroundColor))
         }
-        .frame(minWidth: 720, minHeight: 480)
+        .frame(minWidth: 720, idealWidth: 820, minHeight: 480, idealHeight: 540)
         .task { model.start() }
+    }
+}
+
+struct GroupedFormStyle: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 13.0, *) {
+            content.formStyle(.grouped)
+        } else {
+            content.padding(12)
+        }
     }
 }
 
@@ -478,7 +488,7 @@ struct SettingsView: View {
                 Spacer()
             }
         }
-        .formStyle(.grouped)
+        .modifier(GroupedFormStyle())
         .padding(8)
         .frame(width: 460, height: 230)
     }
@@ -492,8 +502,6 @@ struct IPhoneMirrorLauncher: App {
         WindowGroup("iPhone Mirror") {
             ContentView().environmentObject(model)
         }
-        .defaultSize(width: 820, height: 540)
-        .windowResizability(.contentMinSize)
 
         Settings { SettingsView() }
     }

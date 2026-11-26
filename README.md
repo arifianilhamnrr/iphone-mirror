@@ -2,12 +2,12 @@
 
 Native iPhone screen mirroring for macOS, written in Rust.
 
-- Version: **0.1.0-beta.3 (build 16)**
-- Host: **macOS 15 Sequoia** or **macOS 26 Tahoe**
+- Version: **0.2.0 (build 17)**
+- Host: **macOS 12 Monterey** or newer (tested up to macOS 26 Tahoe)
 - Architecture: **x86_64** (Intel Mac and Hackintosh)
 - Tested device: **iPhone SE on iOS 27.2.1**
 - Connections: **USB** and direct **Wi-Fi**
-- Status: experimental prerelease
+- Status: stable
 
 > [!IMPORTANT]
 > This project uses private and undocumented Apple services. Compatibility may change after an iOS or macOS update.
@@ -37,7 +37,7 @@ Native iPhone screen mirroring for macOS, written in Rust.
 ## Installation
 
 1. Open the [Releases](https://github.com/arifianilhamnrr/iphone-mirror/releases) page.
-2. Download `iPhone-Mirror-v0.1.0-beta.2-macOS-x86_64.dmg`.
+2. Download `iPhone-Mirror-v0.2.0-macOS-x86_64.dmg`.
 3. Open the DMG.
 4. Drag **iPhone Mirror.app** into **Applications**.
 5. Eject the DMG.
@@ -124,7 +124,7 @@ Deleting that file requires pairing again by cable.
 | `Ctrl+Cmd+F` | Toggle borderless fullscreen |
 | `Cmd+,` | Open settings |
 | `↑` / `↓` | Scroll the mirrored screen |
-| `Esc` | Back |
+| `Esc` | Back (left-edge swipe gesture) |
 
 Screenshots are saved to:
 
@@ -329,8 +329,8 @@ make package
 Generated artifacts:
 
 ```text
-dist/iPhone-Mirror-v0.1.0-beta.2-macOS-x86_64.dmg
-dist/iPhone-Mirror-v0.1.0-beta.2-macOS-x86_64.zip
+dist/iPhone-Mirror-v0.2.0-macOS-x86_64.dmg
+dist/iPhone-Mirror-v0.2.0-macOS-x86_64.zip
 dist/SHA256SUMS.txt
 ```
 

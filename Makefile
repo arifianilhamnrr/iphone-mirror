@@ -7,6 +7,8 @@ ICON := resources/AppIcon.icns
 VERSION := $(shell /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)
 BUILD := $(shell /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Info.plist)
 ARCH := $(shell uname -m)
+MACOSX_DEPLOYMENT_TARGET := 12.0
+export MACOSX_DEPLOYMENT_TARGET
 ZIP := dist/iPhone-Mirror-v$(VERSION)-macOS-$(ARCH).zip
 DMG := dist/iPhone-Mirror-v$(VERSION)-macOS-$(ARCH).dmg
 DMG_ROOT := build/dmg-root
@@ -17,8 +19,8 @@ all: build
 
 build:
 	cargo build --release --locked
-	mkdir -p build
-	xcrun swiftc -O -parse-as-library launcher/main.swift -o "$(LAUNCHER)"
+	mkdir -p build/swift-cache
+	xcrun swiftc -O -parse-as-library -module-cache-path build/swift-cache -target $(ARCH)-apple-macosx$(MACOSX_DEPLOYMENT_TARGET) launcher/main.swift -o "$(LAUNCHER)"
 
 icon:
 	python3 scripts/generate_icon.py
@@ -35,7 +37,7 @@ bundle: build
 	cp "$(ICON)" "$(HELPER)/Contents/Resources/AppIcon.icns"
 	cp "$(LAUNCHER)" "$(APP)/Contents/MacOS/iphone-mirror-launcher"
 	cp "$(TARGET)" "$(HELPER)/Contents/MacOS/iphone-mirror-backend"
-	python3 -c 'import plistlib; plistlib.dump({"CFBundleExecutable":"iphone-mirror-backend","CFBundleIdentifier":"id.web.projectar.iphone-mirror.stream","CFBundleName":"iPhone Mirror Stream","CFBundlePackageType":"APPL","CFBundleShortVersionString":"$(VERSION)","CFBundleVersion":"$(BUILD)","CFBundleIconFile":"AppIcon","LSMinimumSystemVersion":"15.0","LSUIElement":False,"NSHighResolutionCapable":True}, open("$(HELPER)/Contents/Info.plist", "wb"))'
+	python3 -c 'import plistlib; plistlib.dump({"CFBundleExecutable":"iphone-mirror-backend","CFBundleIdentifier":"id.web.projectar.iphone-mirror.stream","CFBundleName":"iPhone Mirror Stream","CFBundlePackageType":"APPL","CFBundleShortVersionString":"$(VERSION)","CFBundleVersion":"$(BUILD)","CFBundleIconFile":"AppIcon","LSMinimumSystemVersion":"12.0","LSUIElement":False,"NSHighResolutionCapable":True}, open("$(HELPER)/Contents/Info.plist", "wb"))'
 	chmod +x "$(APP)/Contents/MacOS/iphone-mirror-launcher" "$(HELPER)/Contents/MacOS/iphone-mirror-backend"
 	plutil -lint "$(APP)/Contents/Info.plist"
 	codesign --force --deep --sign - "$(APP)"

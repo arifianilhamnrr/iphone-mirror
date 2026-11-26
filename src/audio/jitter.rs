@@ -4,6 +4,7 @@
 /// Tracks RTP sequence/arrival statistics and adapts the desired buffer depth.
 pub struct AudioJitter {
     pub target_frames: usize,
+    #[allow(dead_code)]
     min_target: usize,
     max_target: usize,
     base_target: usize,
