@@ -194,6 +194,23 @@ pub async fn connect(device: &WifiDevice) -> Result<(AdapterHandle, RsdHandshake
     Ok((adapter, handshake))
 }
 
+pub fn is_uuid_like(value: &str) -> bool {
+    let trimmed = value.trim();
+    let hex_only: String = trimmed.chars().filter(|c| *c != '-' && *c != ':').collect();
+    hex_only.len() >= 16 && hex_only.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+pub fn friendly_name_from_host(host: &str, fallback: &str) -> String {
+    let stripped = host.trim().trim_end_matches('.').trim_end_matches(".local").trim();
+    if !stripped.is_empty() && !is_uuid_like(stripped) {
+        stripped.to_string()
+    } else if !fallback.is_empty() && !is_uuid_like(fallback) {
+        fallback.to_string()
+    } else {
+        "iPhone".to_string()
+    }
+}
+
 fn parse_resolved(name: &str, output: &str) -> Option<WifiDevice> {
     for line in output.lines() {
         if let Some(at) = line.find(" can be reached at ") {
@@ -209,8 +226,13 @@ fn parse_resolved(name: &str, output: &str) -> Option<WifiDevice> {
                 .map(|value| value.split_whitespace().next().unwrap_or(name))
                 .unwrap_or(name)
                 .to_string();
+            let friendly_name = if is_uuid_like(name) {
+                friendly_name_from_host(&host, name)
+            } else {
+                name.to_string()
+            };
             return Some(WifiDevice {
-                name: name.to_string(),
+                name: friendly_name,
                 identifier,
                 host,
                 port,

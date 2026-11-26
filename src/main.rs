@@ -5,8 +5,9 @@ use idevice::{
         ButtonState, DataInclusionPolicy, IndigoHidClient, MainKeyboardService,
         PasteboardServiceClient, UniversalHidServiceClient, GENERAL_PASTEBOARD,
     },
+    lockdown::LockdownClient,
     springboardservices::{InterfaceOrientation, SpringBoardServicesClient},
-    RsdService,
+    IdeviceService, RsdService,
 };
 use iphone_mirror_rs::{
     airplay::AirPlayReceiver,
@@ -1173,14 +1174,142 @@ struct DeviceJson {
     port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct CachedDeviceMeta {
+    name: Option<String>,
+    model: Option<String>,
+}
+
+fn devices_cache_path() -> Option<std::path::PathBuf> {
+    env::var_os("HOME").map(|home| {
+        std::path::PathBuf::from(home)
+            .join("Library/Application Support/iPhone Mirror/devices.json")
+    })
+}
+
+fn load_device_cache() -> std::collections::BTreeMap<String, CachedDeviceMeta> {
+    devices_cache_path()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_device_cache(cache: &std::collections::BTreeMap<String, CachedDeviceMeta>) {
+    let Some(path) = devices_cache_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec_pretty(cache) {
+        let _ = std::fs::write(path, bytes);
+    }
+}
+
+fn product_type_to_model(product_type: &str) -> String {
+    match product_type {
+        "iPhone8,4" => "iPhone SE".to_string(),
+        "iPhone12,1" => "iPhone 11".to_string(),
+        "iPhone12,3" => "iPhone 11 Pro".to_string(),
+        "iPhone12,5" => "iPhone 11 Pro Max".to_string(),
+        "iPhone12,8" => "iPhone SE (2nd Gen)".to_string(),
+        "iPhone13,1" => "iPhone 12 mini".to_string(),
+        "iPhone13,2" => "iPhone 12".to_string(),
+        "iPhone13,3" => "iPhone 12 Pro".to_string(),
+        "iPhone13,4" => "iPhone 12 Pro Max".to_string(),
+        "iPhone14,2" => "iPhone 13 Pro".to_string(),
+        "iPhone14,3" => "iPhone 13 Pro Max".to_string(),
+        "iPhone14,4" => "iPhone 13 mini".to_string(),
+        "iPhone14,5" => "iPhone 13".to_string(),
+        "iPhone14,6" => "iPhone SE (3rd Gen)".to_string(),
+        "iPhone14,7" => "iPhone 14".to_string(),
+        "iPhone14,8" => "iPhone 14 Plus".to_string(),
+        "iPhone15,2" => "iPhone 14 Pro".to_string(),
+        "iPhone15,3" => "iPhone 14 Pro Max".to_string(),
+        "iPhone15,4" => "iPhone 15".to_string(),
+        "iPhone15,5" => "iPhone 15 Plus".to_string(),
+        "iPhone16,1" => "iPhone 15 Pro".to_string(),
+        "iPhone16,2" => "iPhone 15 Pro Max".to_string(),
+        "iPhone17,1" => "iPhone 16 Pro".to_string(),
+        "iPhone17,2" => "iPhone 16 Pro Max".to_string(),
+        "iPhone17,3" => "iPhone 16".to_string(),
+        "iPhone17,4" => "iPhone 16 Plus".to_string(),
+        "iPhone17,5" => "iPhone 16e".to_string(),
+        "iPhone18,1" => "iPhone 17 Pro".to_string(),
+        "iPhone18,2" => "iPhone 17 Pro Max".to_string(),
+        "iPhone18,3" => "iPhone 17".to_string(),
+        "iPhone18,4" => "iPhone 17 Air".to_string(),
+        other => other.to_string(),
+    }
+}
+
+async fn read_lockdown_identity(client: &mut LockdownClient) -> CachedDeviceMeta {
+    let name = client
+        .get_value(Some("DeviceName"), None)
+        .await
+        .ok()
+        .and_then(|v| v.as_string().map(|s| s.to_string()));
+    let model = client
+        .get_value(Some("ProductType"), None)
+        .await
+        .ok()
+        .and_then(|v| v.as_string().map(product_type_to_model));
+    CachedDeviceMeta { name, model }
+}
+
+async fn query_and_cache_rsd_identity(tunnel: &mut RsdTunnel, keys: &[String]) {
+    let Ok(Ok(mut lockdown)) = tokio::time::timeout(
+        std::time::Duration::from_millis(1200),
+        LockdownClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake),
+    )
+    .await
+    else {
+        return;
+    };
+    let meta = read_lockdown_identity(&mut lockdown).await;
+    if meta.name.is_some() || meta.model.is_some() {
+        let mut cache = load_device_cache();
+        for key in keys {
+            if !key.is_empty() {
+                cache.insert(key.clone(), meta.clone());
+            }
+        }
+        save_device_cache(&cache);
+    }
 }
 
 async fn list_devices(json: bool) -> Result<()> {
-    let mut devices: Vec<DeviceJson> = DeviceScanner::list_devices()
+    let mut cache = load_device_cache();
+    let mut cache_dirty = false;
+
+    let scanned = DeviceScanner::list_devices()
         .await
-        .context("Could not scan usbmuxd devices")?
-        .into_iter()
-        .map(|device| DeviceJson {
+        .context("Could not scan usbmuxd devices")?;
+    let mut devices: Vec<DeviceJson> = Vec::with_capacity(scanned.len());
+
+    for device in scanned {
+        let mut meta = cache.get(&device.udid).cloned().unwrap_or_default();
+        if let Ok(Ok(mut lockdown)) = tokio::time::timeout(
+            std::time::Duration::from_millis(600),
+            LockdownClient::connect(&device.provider()),
+        )
+        .await
+        {
+            let live = read_lockdown_identity(&mut lockdown).await;
+            if live.name.is_some() || live.model.is_some() {
+                meta = CachedDeviceMeta {
+                    name: live.name.or(meta.name),
+                    model: live.model.or(meta.model),
+                };
+                cache.insert(device.udid.clone(), meta.clone());
+                cache_dirty = true;
+            }
+        }
+        devices.push(DeviceJson {
             udid: device.udid,
             connection_type: match device.connection_type {
                 iphone_mirror_rs::transport::device_scanner::ConnectionType::Usb => "usb",
@@ -1190,25 +1319,41 @@ async fn list_devices(json: bool) -> Result<()> {
             device_id: device.device_id,
             host: None,
             port: None,
-            name: None,
-        })
-        .collect();
+            name: meta.name,
+            model: meta.model,
+        });
+    }
 
     match wifi::WifiDiscovery::discover().await {
         Ok(remote) => {
             for device in remote {
                 debug!(name = %device.name, host = %device.host, port = device.port, "Found Wi-Fi iPhone");
+                let host_key = device.host.to_ascii_lowercase();
+                let cached = cache
+                    .get(&device.identifier)
+                    .or_else(|| cache.get(&host_key));
+                let fallback_name = wifi::friendly_name_from_host(&device.host, &device.name);
+                let resolved_name = cached
+                    .and_then(|c| c.name.clone())
+                    .filter(|s| !wifi::is_uuid_like(s))
+                    .unwrap_or(fallback_name);
+                let resolved_model = cached.and_then(|c| c.model.clone());
                 devices.push(DeviceJson {
                     udid: device.identifier,
                     connection_type: "network",
                     device_id: 0,
                     host: Some(device.host),
                     port: Some(device.port),
-                    name: Some(device.name),
+                    name: Some(resolved_name),
+                    model: resolved_model,
                 });
             }
         }
         Err(error) => debug!(%error, "Wi-Fi discovery failed"),
+    }
+
+    if cache_dirty {
+        save_device_cache(&cache);
     }
 
     if json {
@@ -1596,6 +1741,18 @@ async fn run_mirror() -> Result<()> {
     };
 
     let mut tunnel = connect_tunnel_with_ddi(&source).await?;
+    let mut identity_keys = Vec::new();
+    if let Some(w) = &wifi_device {
+        identity_keys.push(w.identifier.clone());
+        identity_keys.push(w.host.to_ascii_lowercase());
+    }
+    if let Some(u) = &usb_device {
+        identity_keys.push(u.udid.clone());
+    }
+    if let Some(udid) = &selected_udid {
+        identity_keys.push(udid.clone());
+    }
+    query_and_cache_rsd_identity(&mut tunnel, &identity_keys).await;
     if !tunnel.has_display_service() {
         anyhow::bail!(
             "Display service is unavailable. Enable Developer Mode and ensure the developer image is mounted."
@@ -2596,6 +2753,14 @@ async fn run_airplay_hybrid_hid(
     };
 
     let mut tunnel = tunnel;
+    let mut hid_keys = Vec::new();
+    if let Ok(udid) = env::var("IPHONE_MIRROR_UDID") {
+        hid_keys.push(udid);
+    }
+    if let Ok(host) = env::var("IPHONE_MIRROR_WIFI_HOST") {
+        hid_keys.push(host.to_ascii_lowercase());
+    }
+    query_and_cache_rsd_identity(&mut tunnel, &hid_keys).await;
     let Ok(Ok(mut hid)) = tokio::time::timeout(
         std::time::Duration::from_secs(4),
         UniversalHidServiceClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake),

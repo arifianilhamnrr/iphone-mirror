@@ -15,10 +15,37 @@ struct Device: Codable, Identifiable, Hashable {
     let host: String?
     let port: UInt16?
     let name: String?
+    let model: String?
 
     var id: String { "\(udid)-\(connection_type.id)" }
     var isRemote: Bool { host != nil && port != nil }
-    var displayName: String { name ?? (connection_type == .usb ? "iPhone (USB)" : "iPhone (Wi-Fi)") }
+
+    private static func isUUIDLike(_ value: String) -> Bool {
+        let stripped = value.replacingOccurrences(of: "-", with: "").replacingOccurrences(of: ":", with: "")
+        return stripped.count >= 16 && stripped.allSatisfy { $0.isHexDigit }
+    }
+
+    var resolvedUserName: String {
+        if let name = name?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !name.isEmpty,
+           !Self.isUUIDLike(name) {
+            return name
+        }
+        if let host = host?.trimmingCharacters(in: CharacterSet(charactersIn: ".")) {
+            let shortHost = host.hasSuffix(".local") ? String(host.dropLast(6)) : host
+            if !shortHost.isEmpty, !Self.isUUIDLike(shortHost) {
+                return shortHost
+            }
+        }
+        return connection_type == .usb ? "iPhone (USB)" : "iPhone (Wi-Fi)"
+    }
+
+    var displayName: String {
+        if let model = model, !model.isEmpty {
+            return "\(resolvedUserName) · \(model)"
+        }
+        return resolvedUserName
+    }
 }
 
 struct NearbyDevice: Identifiable, Hashable {
@@ -416,29 +443,7 @@ struct AmbientGlassBackdrop: View {
     var body: some View {
         ZStack {
             VisualEffectBlur(material: .underWindowBackground, blendingMode: .behindWindow)
-            LinearGradient(
-                colors: [
-                    Color(red: 0.07, green: 0.09, blue: 0.16).opacity(0.88),
-                    Color(red: 0.05, green: 0.06, blue: 0.11).opacity(0.94),
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            Circle()
-                .fill(accent.opacity(0.34))
-                .frame(width: 340, height: 340)
-                .blur(radius: 75)
-                .offset(x: -180, y: -140)
-            Circle()
-                .fill(Color(red: 0.24, green: 0.72, blue: 0.96).opacity(0.24))
-                .frame(width: 300, height: 300)
-                .blur(radius: 80)
-                .offset(x: 210, y: 150)
-            Circle()
-                .fill(Color(red: 0.56, green: 0.34, blue: 0.95).opacity(0.22))
-                .frame(width: 240, height: 240)
-                .blur(radius: 70)
-                .offset(x: 150, y: -150)
+            Color(red: 0.085, green: 0.09, blue: 0.105).opacity(0.92)
         }
         .ignoresSafeArea()
     }
@@ -737,7 +742,7 @@ struct ContentView: View {
                         Circle()
                             .fill(
                                 RadialGradient(
-                                    colors: [stageAccent.opacity(0.35), .clear],
+                                    colors: [Color.white.opacity(0.10), .clear],
                                     center: .center,
                                     startRadius: 8,
                                     endRadius: 68
@@ -789,7 +794,7 @@ struct ContentView: View {
                         Circle()
                             .fill(
                                 RadialGradient(
-                                    colors: [stageAccent.opacity(0.35), .clear],
+                                    colors: [Color.white.opacity(0.10), .clear],
                                     center: .center,
                                     startRadius: 8,
                                     endRadius: 72
@@ -806,7 +811,7 @@ struct ContentView: View {
                         .font(.system(size: 25, weight: .bold))
                         .foregroundColor(.white)
 
-                    Text("Connected via \(device.displayName) · \(device.connection_type.label) HEVC")
+                    Text("\(device.displayName) · \(device.connection_type.label) HEVC")
                         .font(.system(size: 13))
                         .foregroundColor(Color.white.opacity(0.72))
                         .padding(.top, 6)

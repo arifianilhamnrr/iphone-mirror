@@ -83,7 +83,7 @@ impl HardwareDecoder {
         duration: CMTime,
     ) {
         if status != 0 || image_buffer.is_null() {
-            tracing::debug!(status, "VideoToolbox output callback reported an error");
+            tracing::warn!(status, null_buf = image_buffer.is_null(), "VideoToolbox output callback reported an error");
             return;
         }
 

@@ -386,6 +386,12 @@ async fn dispatch_request(
     }
 }
 
+fn plist_as_u64(value: &Value) -> Option<u64> {
+    value
+        .as_unsigned_integer()
+        .or_else(|| value.as_signed_integer().map(|signed| signed as u64))
+}
+
 async fn handle_setup(
     body: &[u8],
     peer_ip: IpAddr,
@@ -428,7 +434,7 @@ async fn handle_setup(
 
         let timing_rport = root
             .get("timingPort")
-            .and_then(|v| v.as_unsigned_integer())
+            .and_then(plist_as_u64)
             .unwrap_or(0) as u16;
         let ntp_port = match state.ntp_port {
             Some(p) => p,
@@ -457,12 +463,12 @@ async fn handle_setup(
             let Some(dict) = item.as_dictionary() else {
                 continue;
             };
-            let stype = dict.get("type").and_then(|v| v.as_unsigned_integer()).unwrap_or(0);
+            let stype = dict.get("type").and_then(plist_as_u64).unwrap_or(0);
             match stype {
                 110 => {
                     let conn_id = dict
                         .get("streamConnectionID")
-                        .and_then(|v| v.as_unsigned_integer())
+                        .and_then(plist_as_u64)
                         .unwrap_or(0);
                     match VideoStreamListener::bind().await {
                         Ok(listener) => {
@@ -486,7 +492,7 @@ async fn handle_setup(
                     }
                 }
                 96 => {
-                    let ct = dict.get("ct").and_then(|v| v.as_unsigned_integer()).unwrap_or(8) as u8;
+                    let ct = dict.get("ct").and_then(plist_as_u64).unwrap_or(8) as u8;
                     match AudioStreamListener::bind().await {
                         Ok(listener) => {
                             let data_port = listener.data_port;
@@ -693,6 +699,13 @@ mod tests {
         let dict = parsed.as_dictionary().unwrap();
         assert_eq!(dict.get("model").and_then(|v| v.as_string()), Some("AppleTV3,2"));
         assert_eq!(dict.get("name").and_then(|v| v.as_string()), Some("iPhone Mirror"));
+    }
+
+    #[test]
+    fn plist_as_u64_preserves_signed_64bit_stream_ids() {
+        let large_id: u64 = 0x8F12_3456_789A_BCDE;
+        let val = Value::Integer((large_id as i64).into());
+        assert_eq!(plist_as_u64(&val), Some(large_id));
     }
 
     #[test]

@@ -184,7 +184,7 @@ async fn handle_video_connection(
                         }
                     } else {
                         let count = frame_count.load(Ordering::Relaxed);
-                        if count == 1 || count % 300 == 0 {
+                        if count > 0 && (count == 1 || count % 300 == 0) {
                             info!(frame = count, "AirPlay decoded H.264 frame");
                         }
                     }
