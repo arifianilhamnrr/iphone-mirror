@@ -13,9 +13,14 @@ ZIP := dist/iPhone-Mirror-v$(VERSION)-macOS-$(ARCH).zip
 DMG := dist/iPhone-Mirror-v$(VERSION)-macOS-$(ARCH).dmg
 DMG_ROOT := build/dmg-root
 
-.PHONY: all build icon bundle package installer checksums verify clean
+.PHONY: all build bump-build icon bundle package installer checksums verify clean
 
 all: build
+
+bump-build:
+	@next=$$(($$( /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Info.plist ) + 1)); \
+	/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $$next" Info.plist; \
+	echo "Bumped CFBundleVersion to $$next"
 
 build:
 	cargo build --release --locked
