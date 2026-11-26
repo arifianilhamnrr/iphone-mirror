@@ -153,6 +153,35 @@ fn test_rtcp_is_detected_before_rtp_parsing() {
 }
 
 #[test]
+fn test_large_forward_gap_is_reported_and_late_packet_ignored() {
+    let mut depacketizer = H265Depacketizer::new();
+    depacketizer
+        .process_packet(&rtp_packet(100, &[0x40, 0x01, 0x0c, 0x01]))
+        .unwrap();
+    assert_eq!(depacketizer.last_gap, 0);
+
+    // Late/duplicate packet (99 < 101) should be ignored, not treated as a huge gap.
+    let late = depacketizer
+        .process_packet(&rtp_packet(99, &[0x40, 0x01, 0x0c, 0x01]))
+        .unwrap();
+    assert!(late.is_empty());
+    assert_eq!(depacketizer.last_gap, 0);
+
+    // Forward gap of 150 packets (expected 101, received 251) must be visible to caller.
+    depacketizer
+        .process_packet(&rtp_packet(251, &[0x40, 0x01, 0x0c, 0x01]))
+        .unwrap();
+    assert_eq!(depacketizer.last_gap, 150);
+    assert!(depacketizer.sequence_gap);
+
+    // Next contiguous packet clears last_gap.
+    depacketizer
+        .process_packet(&rtp_packet(252, &[0x40, 0x01, 0x0c, 0x01]))
+        .unwrap();
+    assert_eq!(depacketizer.last_gap, 0);
+}
+
+#[test]
 fn test_aspect_fit_coordinate_mapping() {
     // 16:9 content centered in a square window: 218.75px bars top and bottom.
     assert_eq!(

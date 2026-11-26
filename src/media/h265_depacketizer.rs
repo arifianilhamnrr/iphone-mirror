@@ -32,6 +32,7 @@ impl H265Depacketizer {
     /// Process incoming RTP packet per RFC 7798
     /// Returns every complete Annex-B NAL carried by the packet.
     pub fn process_packet(&mut self, pkt: &RtpPacket) -> Result<Vec<Vec<u8>>> {
+        self.last_gap = 0;
         if pkt.payload.is_empty() {
             return Ok(Vec::new());
         }
@@ -39,12 +40,18 @@ impl H265Depacketizer {
         // Sequence continuity check
         if let Some(expected) = self.expected_seq {
             if pkt.sequence_number != expected {
+                let gap = pkt.sequence_number.wrapping_sub(expected);
+                if gap >= 0x8000 {
+                    // Late or duplicate packet from before `expected`; ignore without
+                    // triggering a false forward-gap restart.
+                    return Ok(Vec::new());
+                }
                 warn!(
                     received = pkt.sequence_number,
                     expected, "RTP sequence gap detected, discarding partial FU buffer"
                 );
                 self.sequence_gap = true;
-                self.last_gap = pkt.sequence_number.wrapping_sub(expected);
+                self.last_gap = gap;
                 self.fu_buffer.clear();
                 self.is_assembling_fu = false;
             }
@@ -141,10 +148,6 @@ impl H265Depacketizer {
                 Ok(Vec::new())
             }
         }
-        .map(|nals| {
-            self.last_gap = 0;
-            nals
-        })
     }
 }
 
