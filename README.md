@@ -2,7 +2,7 @@
 
 Native iPhone screen mirroring for macOS, written in Rust.
 
-- Version: **0.2.0 (build 24)**
+- Version: **0.3.0**
 - Host: **macOS 12 Monterey** or newer (tested up to macOS 26 Tahoe)
 - Architecture: **x86_64** (Intel Mac and Hackintosh)
 - Tested device: **iPhone SE on iOS 27.2.1**
@@ -21,23 +21,27 @@ Native iPhone screen mirroring for macOS, written in Rust.
 - Two-finger trackpad and mouse-wheel scrolling.
 - Physical keyboard forwarding.
 - Text and image clipboard synchronization in both directions.
-- Finder drag-and-drop from Mac to iPhone.
 - Direct Wi-Fi mirroring through Bonjour and RemotePairing TLS-PSK.
+- Optional AirPlay (H.264) wireless screen mirroring and 44.1 kHz AAC-ELD audio receiver (with automatic Hybrid HID touch/keyboard when paired).
 - Automatic compatible DeveloperDiskImage installation.
 - Automatic recovery after media stalls or RTP packet loss.
 - Full-resolution PNG screenshots.
 - Fullscreen, auto-rotate, and always-on-top controls.
-- Native SwiftUI Glassmorphism connection launcher with optional AirPlay (H.264) screen mirroring receiver mode (with automatic Hybrid HID touch/keyboard when paired).
+- Single-color Glassmorphism SwiftUI launcher with iPhone user/model name detection and GitHub release update checker.
 - Hardware-clocked AudioUnit output with a lock-free PCM ring buffer, replacing the timer-driven AudioQueue path.
 - Audio RTP reorder buffer with silence concealment for lost packets.
 - Output-device change detection with automatic backend recreation.
 - Accurate RTCP receiver reports (loss fraction, cumulative loss, jitter, LSR/DLSR).
 - Selectable audio backend (`IPHONE_MIRROR_AUDIO_BACKEND=audiounit|audioqueue`) and opt-in diagnostics (`IPHONE_MIRROR_AUDIO_DIAGNOSTICS=1`).
 
+## Experimental features
+
+- Finder drag-and-drop file transfer from Mac to iPhone (`AFC` staging + pasteboard auto-paste).
+
 ## Installation
 
 1. Open the [Releases](https://github.com/arifianilhamnrr/iphone-mirror/releases) page.
-2. Download `iPhone-Mirror-v0.2.0-macOS-x86_64.dmg`.
+2. Download `iPhone-Mirror-v0.3.0-macOS-x86_64.dmg`.
 3. Open the DMG.
 4. Drag **iPhone Mirror.app** into **Applications**.
 5. Eject the DMG.
@@ -142,7 +146,10 @@ Screenshots are saved to:
 - Clipboard images larger than 20 MiB are ignored.
 - IME composition and dead-key input are not currently supported.
 
-## Drag-and-drop files
+## Drag-and-drop files (Experimental)
+
+> [!NOTE]
+> Drag-and-drop file transfer is experimental. Compatibility and paste behavior depend on the active iPhone app and pasteboard support.
 
 1. Open the destination app on the mirrored iPhone.
 2. Focus the destination field or conversation.
@@ -330,8 +337,8 @@ make package
 Generated artifacts:
 
 ```text
-dist/iPhone-Mirror-v0.2.0-macOS-x86_64.dmg
-dist/iPhone-Mirror-v0.2.0-macOS-x86_64.zip
+dist/iPhone-Mirror-v0.3.0-macOS-x86_64.dmg
+dist/iPhone-Mirror-v0.3.0-macOS-x86_64.zip
 dist/SHA256SUMS.txt
 ```
 
@@ -341,7 +348,8 @@ dist/SHA256SUMS.txt
 
 ```text
 src/
-├── audio/       # AAC-ELD decoding and AudioQueue playback
+├── airplay/     # Optional AirPlay H.264 RTSP, FairPlay SAP v3, video/audio streams
+├── audio/       # AAC-ELD decoding, resampling, and AudioUnit/AudioQueue playback
 ├── codec/       # VideoToolbox decoding and screenshots
 ├── input/       # Touch, keyboard, shortcuts, and clipboard
 ├── media/       # RTP parsing and HEVC depacketization

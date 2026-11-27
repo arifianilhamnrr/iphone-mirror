@@ -3,9 +3,56 @@ import Network
 import SwiftUI
 
 private enum AppInfo {
-    static let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
-    static let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
-    static let label = "v\(version) (build \(build))"
+    static let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.3.0"
+    static let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
+    static let buildNumber = Int(build) ?? 1
+    static let isBeta = buildNumber > 1 || version.lowercased().contains("beta")
+
+    static var label: String {
+        if !isBeta {
+            return "v\(version)"
+        }
+        let base = version.lowercased().contains("beta") ? version : "\(version)-beta"
+        return "v\(base) (build \(build))"
+    }
+
+    static func parseSemver(_ tag: String) -> [Int] {
+        let cleaned = tag
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "^v", with: "", options: .regularExpression)
+            .split(separator: "-", maxSplits: 1)
+            .first
+            .map(String.init) ?? ""
+        return cleaned.split(separator: ".").prefix(3).map { Int($0) ?? 0 }
+    }
+
+    static func isNewerVersion(remoteTag: String, than localVersion: String, localIsBeta: Bool) -> Bool {
+        let remoteParts = parseSemver(remoteTag)
+        let localParts = parseSemver(localVersion)
+        let count = max(remoteParts.count, localParts.count, 3)
+        for i in 0..<count {
+            let r = i < remoteParts.count ? remoteParts[i] : 0
+            let l = i < localParts.count ? localParts[i] : 0
+            if r != l {
+                return r > l
+            }
+        }
+        let remoteIsPrerelease = remoteTag.lowercased().contains("beta")
+            || remoteTag.lowercased().contains("alpha")
+            || remoteTag.lowercased().contains("rc")
+        return localIsBeta && !remoteIsPrerelease
+    }
+}
+
+struct GitHubRelease: Decodable {
+    let tag_name: String
+    let name: String?
+    let html_url: String
+}
+
+struct AvailableUpdate: Equatable {
+    let version: String
+    let url: URL
 }
 
 struct Device: Codable, Identifiable, Hashable {
@@ -135,10 +182,15 @@ final class LauncherModel: ObservableObject {
     @Published var bonjourScanning = false
     @Published var error: String?
     @Published var backendRunning = false
+    @Published var availableUpdate: AvailableUpdate?
+    @Published var updateDismissed = false
+    @Published var isCheckingUpdates = false
+    @Published var updateStatusMessage: String?
 
     @AppStorage("transport") var transport = "auto"
     @AppStorage("autoRotate") var autoRotate = true
     @AppStorage("autoConnect") var autoConnect = false
+    @AppStorage("autoCheckUpdates") var autoCheckUpdates = true
 
     private var backend: Process?
     private var scanTask: Task<Void, Never>?
@@ -180,11 +232,81 @@ final class LauncherModel: ObservableObject {
     func start() {
         guard scanTask == nil else { return }
         startBonjourScanning()
+        if autoCheckUpdates {
+            Task { await checkForUpdates(silent: true) }
+        }
         scanTask = Task {
             while !Task.isCancelled {
                 await scan()
                 try? await Task.sleep(nanoseconds: 4_000_000_000)
             }
+        }
+    }
+
+    func checkForUpdates(silent: Bool = false) async {
+        guard !isCheckingUpdates else { return }
+        isCheckingUpdates = true
+        defer { isCheckingUpdates = false }
+        if !silent {
+            updateStatusMessage = "Checking GitHub releases…"
+        }
+
+        guard let url = URL(string: "https://api.github.com/repos/arifianilhamnrr/iphone-mirror/releases/latest") else {
+            if !silent { updateStatusMessage = "Invalid update URL." }
+            return
+        }
+
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("iPhone-Mirror/\(AppInfo.version)", forHTTPHeaderField: "User-Agent")
+
+        do {
+            let (data, response) = try await fetchData(for: request)
+            if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+                if !silent {
+                    updateStatusMessage = "Could not check updates (HTTP \(http.statusCode))."
+                }
+                return
+            }
+            let release = try JSONDecoder().decode(GitHubRelease.self, from: data)
+            let remoteVersion = release.tag_name.trimmingCharacters(in: CharacterSet(charactersIn: "vV "))
+            if AppInfo.isNewerVersion(
+                remoteTag: release.tag_name,
+                than: AppInfo.version,
+                localIsBeta: AppInfo.isBeta
+            ), let htmlURL = URL(string: release.html_url) {
+                availableUpdate = AvailableUpdate(version: remoteVersion, url: htmlURL)
+                updateDismissed = false
+                updateStatusMessage = "Update available: v\(remoteVersion)"
+            } else {
+                availableUpdate = nil
+                if !silent {
+                    updateStatusMessage = "You’re up to date (\(AppInfo.label))."
+                }
+            }
+        } catch {
+            if !silent {
+                updateStatusMessage = "Update check failed. Check your internet connection."
+            }
+        }
+    }
+
+    func openUpdateDownload() {
+        guard let url = availableUpdate?.url else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    private func fetchData(for request: URLRequest) async throws -> (Data, URLResponse) {
+        try await withCheckedThrowingContinuation { continuation in
+            URLSession.shared.dataTask(with: request) { data, response, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else if let data, let response {
+                    continuation.resume(returning: (data, response))
+                } else {
+                    continuation.resume(throwing: URLError(.badServerResponse))
+                }
+            }.resume()
         }
     }
 
@@ -726,6 +848,38 @@ struct ContentView: View {
                     .font(.system(size: 10.5))
                     .foregroundColor(Color.white.opacity(0.65))
                     Spacer()
+                    Button {
+                        if model.availableUpdate != nil {
+                            model.openUpdateDownload()
+                        } else {
+                            Task { await model.checkForUpdates(silent: false) }
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: model.availableUpdate != nil ? "arrow.down.circle.fill" : "arrow.triangle.2.circlepath")
+                                .font(.system(size: 10.5, weight: .semibold))
+                            if let update = model.availableUpdate {
+                                Text("v\(update.version)")
+                                    .font(.system(size: 10, weight: .semibold))
+                            }
+                        }
+                        .foregroundColor(model.availableUpdate != nil ? .white : Color.white.opacity(0.72))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(
+                            (model.availableUpdate != nil
+                                ? Color(red: 0.22, green: 0.56, blue: 1.0).opacity(0.65)
+                                : Color.white.opacity(0.08)),
+                            in: Capsule()
+                        )
+                        .overlay(
+                            Capsule()
+                                .strokeBorder(Color.white.opacity(0.18), lineWidth: 1)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(model.isCheckingUpdates)
+                    .help(model.availableUpdate != nil ? "Download update" : "Check for GitHub updates")
                 }
             }
             .padding(18)
@@ -735,6 +889,10 @@ struct ContentView: View {
     private var stageCard: some View {
         GlassSurface(cornerRadius: 22, material: .hudWindow, tintOpacity: 0.05) {
             VStack(spacing: 0) {
+                if let update = model.availableUpdate, !model.updateDismissed {
+                    updateBanner(update)
+                }
+
                 Spacer()
 
                 if model.transport == "airplay" {
@@ -862,6 +1020,44 @@ struct ContentView: View {
         }
     }
 
+    private func updateBanner(_ update: AvailableUpdate) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "sparkles")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(Color(red: 0.48, green: 0.80, blue: 1.0))
+            Text("Update available: v\(update.version)")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(.white)
+            Spacer()
+            Button("Download") {
+                model.openUpdateDownload()
+            }
+            .buttonStyle(.plain)
+            .font(.system(size: 11.5, weight: .semibold))
+            .foregroundColor(.white)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(Color(red: 0.25, green: 0.56, blue: 1.0), in: Capsule())
+            Button {
+                model.updateDismissed = true
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundColor(Color.white.opacity(0.6))
+                    .padding(4)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.20), lineWidth: 1)
+        )
+        .padding(.bottom, 12)
+    }
+
     private func glassPrimaryButton(title: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 8) {
@@ -905,9 +1101,11 @@ struct GroupedFormStyle: ViewModifier {
 }
 
 struct SettingsView: View {
+    @EnvironmentObject private var model: LauncherModel
     @AppStorage("transport") private var transport = "auto"
     @AppStorage("autoRotate") private var autoRotate = true
     @AppStorage("autoConnect") private var autoConnect = false
+    @AppStorage("autoCheckUpdates") private var autoCheckUpdates = true
 
     var body: some View {
         Form {
@@ -919,6 +1117,28 @@ struct SettingsView: View {
             }
             Toggle("Connect automatically when an iPhone appears", isOn: $autoConnect)
             Toggle("Resize the mirror window when orientation changes", isOn: $autoRotate)
+            Toggle("Check for updates on launch", isOn: $autoCheckUpdates)
+
+            HStack(spacing: 10) {
+                Button(model.isCheckingUpdates ? "Checking…" : "Check for Updates") {
+                    Task { await model.checkForUpdates(silent: false) }
+                }
+                .disabled(model.isCheckingUpdates)
+
+                if model.availableUpdate != nil {
+                    Button("Download Update") {
+                        model.openUpdateDownload()
+                    }
+                }
+                Spacer()
+                if let msg = model.updateStatusMessage {
+                    Text(msg)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+
             HStack {
                 Spacer()
                 Text(AppInfo.label)
@@ -929,7 +1149,7 @@ struct SettingsView: View {
         }
         .modifier(GroupedFormStyle())
         .padding(8)
-        .frame(width: 460, height: 240)
+        .frame(width: 480, height: 290)
     }
 }
 
@@ -942,6 +1162,6 @@ struct IPhoneMirrorLauncher: App {
             ContentView().environmentObject(model)
         }
 
-        Settings { SettingsView() }
+        Settings { SettingsView().environmentObject(model) }
     }
 }
