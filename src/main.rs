@@ -63,6 +63,7 @@ enum Command {
         udid: Option<String>,
         paths: Vec<std::path::PathBuf>,
     },
+    CheckUpdate,
     Help,
 }
 
@@ -973,9 +974,22 @@ fn rotated_window_size(width: u32, height: u32, landscape: bool) -> (u32, u32) {
 }
 
 fn settings_path() -> Result<std::path::PathBuf> {
-    let home = env::var_os("HOME").context("HOME is not set")?;
-    Ok(std::path::PathBuf::from(home)
-        .join("Library/Application Support/iPhone Mirror/settings.json"))
+    #[cfg(target_os = "macos")]
+    {
+        let home = env::var_os("HOME").context("HOME is not set")?;
+        Ok(std::path::PathBuf::from(home)
+            .join("Library/Application Support/iPhone Mirror/settings.json"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let base = if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
+            std::path::PathBuf::from(xdg)
+        } else {
+            let home = env::var_os("HOME").context("HOME is not set")?;
+            std::path::PathBuf::from(home).join(".config")
+        };
+        Ok(base.join("iphone-mirror").join("settings.json"))
+    }
 }
 
 fn load_settings() -> AppSettings {
@@ -1003,60 +1017,174 @@ enum LauncherAction {
 }
 
 fn launcher_alert(message: &str, detail: &str) -> LauncherAction {
-    const SCRIPT: &str = r#"
+    #[cfg(target_os = "macos")]
+    {
+        const SCRIPT: &str = r#"
 on run argv
   set result to display dialog (item 2 of argv) with title (item 1 of argv) buttons {"Quit", "Settings…", "Try Again"} default button "Try Again" cancel button "Quit" with icon caution
   return button returned of result
 end run
 "#;
-    match std::process::Command::new("osascript")
-        .args(["-e", SCRIPT, "--", message, detail])
-        .output()
+        match std::process::Command::new("osascript")
+            .args(["-e", SCRIPT, "--", message, detail])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                match String::from_utf8_lossy(&output.stdout).trim() {
+                    "Try Again" => LauncherAction::Retry,
+                    "Settings…" => LauncherAction::Settings,
+                    _ => LauncherAction::Quit,
+                }
+            }
+            _ => LauncherAction::Quit,
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
     {
-        Ok(output) if output.status.success() => {
-            match String::from_utf8_lossy(&output.stdout).trim() {
-                "Try Again" => LauncherAction::Retry,
-                "Settings…" => LauncherAction::Settings,
+        // Try zenity (GTK / GNOME / Wayland & X11), then kdialog (KDE Plasma), then CLI prompt.
+        if let Ok(output) = std::process::Command::new("zenity")
+            .args([
+                "--question",
+                "--title",
+                message,
+                "--text",
+                detail,
+                "--ok-label=Try Again",
+                "--cancel-label=Quit",
+                "--extra-button=Settings…",
+            ])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if text.trim() == "Settings…" {
+                return LauncherAction::Settings;
+            }
+            if output.status.success() {
+                return LauncherAction::Retry;
+            }
+            return LauncherAction::Quit;
+        }
+        if let Ok(output) = std::process::Command::new("kdialog")
+            .args([
+                "--title",
+                message,
+                "--yesnocancel",
+                detail,
+                "--yes-label",
+                "Try Again",
+                "--no-label",
+                "Settings…",
+                "--cancel-label",
+                "Quit",
+            ])
+            .status()
+        {
+            return match output.code() {
+                Some(0) => LauncherAction::Retry,
+                Some(1) => LauncherAction::Settings,
+                _ => LauncherAction::Quit,
+            };
+        }
+        eprintln!("\n[{message}]\n{detail}\n");
+        eprint!("Action: [r] Try Again, [s] Settings, [q] Quit (default q): ");
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_ok() {
+            match line.trim().to_ascii_lowercase().as_str() {
+                "r" | "retry" => LauncherAction::Retry,
+                "s" | "settings" => LauncherAction::Settings,
                 _ => LauncherAction::Quit,
             }
+        } else {
+            LauncherAction::Quit
         }
-        _ => LauncherAction::Quit,
     }
 }
 
 fn edit_settings(settings: &mut AppSettings) -> Result<()> {
-    loop {
-        let transport = format!("Connection: {}", settings.transport.label());
-        let rotation = format!(
-            "Auto-Rotate: {}",
-            if settings.auto_rotate { "On" } else { "Off" }
-        );
-        const SCRIPT: &str = r#"
+    #[cfg(target_os = "macos")]
+    {
+        loop {
+            let transport = format!("Connection: {}", settings.transport.label());
+            let rotation = format!(
+                "Auto-Rotate: {}",
+                if settings.auto_rotate { "On" } else { "Off" }
+            );
+            const SCRIPT: &str = r#"
 on run argv
   set result to display dialog "Auto prefers USB when the same iPhone is also available over Wi-Fi." with title "iPhone Mirror Settings" buttons {"Done", item 2 of argv, item 1 of argv} default button "Done"
   return button returned of result
 end run
 "#;
-        let output = std::process::Command::new("osascript")
-            .args(["-e", SCRIPT, "--", &transport, &rotation])
-            .output()?;
-        if !output.status.success() {
-            break;
-        }
-        match String::from_utf8_lossy(&output.stdout).trim() {
-            value if value == transport => {
-                settings.transport = match settings.transport {
-                    TransportPreference::Auto => TransportPreference::Usb,
-                    TransportPreference::Usb => TransportPreference::Wifi,
-                    TransportPreference::Wifi => TransportPreference::Airplay,
-                    TransportPreference::Airplay => TransportPreference::Auto,
-                };
+            let output = std::process::Command::new("osascript")
+                .args(["-e", SCRIPT, "--", &transport, &rotation])
+                .output()?;
+            if !output.status.success() {
+                break;
             }
-            value if value == rotation => settings.auto_rotate = !settings.auto_rotate,
-            _ => break,
+            match String::from_utf8_lossy(&output.stdout).trim() {
+                value if value == transport => {
+                    settings.transport = match settings.transport {
+                        TransportPreference::Auto => TransportPreference::Usb,
+                        TransportPreference::Usb => TransportPreference::Wifi,
+                        TransportPreference::Wifi => TransportPreference::Airplay,
+                        TransportPreference::Airplay => TransportPreference::Auto,
+                    };
+                }
+                value if value == rotation => settings.auto_rotate = !settings.auto_rotate,
+                _ => break,
+            }
         }
+        return save_settings(settings);
     }
-    save_settings(settings)
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Ok(output) = std::process::Command::new("zenity")
+            .args([
+                "--list",
+                "--title=iPhone Mirror Settings",
+                "--text=Select connection mode (toggle Auto-Rotate with Toggle Rotate button):",
+                "--column=Mode",
+                "Auto (USB preferred)",
+                "USB only",
+                "Wi-Fi only",
+                "AirPlay (H.264)",
+                if settings.auto_rotate {
+                    "Auto-Rotate: On (click to turn Off)"
+                } else {
+                    "Auto-Rotate: Off (click to turn On)"
+                },
+            ])
+            .output()
+        {
+            if output.status.success() {
+                let choice = String::from_utf8_lossy(&output.stdout);
+                let trimmed = choice.trim();
+                if trimmed.starts_with("Auto (") {
+                    settings.transport = TransportPreference::Auto;
+                } else if trimmed.starts_with("USB") {
+                    settings.transport = TransportPreference::Usb;
+                } else if trimmed.starts_with("Wi-Fi") {
+                    settings.transport = TransportPreference::Wifi;
+                } else if trimmed.starts_with("AirPlay") {
+                    settings.transport = TransportPreference::Airplay;
+                } else if trimmed.starts_with("Auto-Rotate") {
+                    settings.auto_rotate = !settings.auto_rotate;
+                }
+            }
+        } else {
+            settings.transport = match settings.transport {
+                TransportPreference::Auto => TransportPreference::Usb,
+                TransportPreference::Usb => TransportPreference::Wifi,
+                TransportPreference::Wifi => TransportPreference::Airplay,
+                TransportPreference::Airplay => TransportPreference::Auto,
+            };
+            eprintln!("Switched transport mode to: {}", settings.transport.label());
+        }
+        save_settings(settings)
+    }
 }
 
 fn parse_command() -> Result<Command> {
@@ -1120,6 +1248,7 @@ fn parse_command() -> Result<Command> {
             }
             Ok(Command::SendFiles { udid, paths })
         }
+        Some("check-update") => Ok(Command::CheckUpdate),
         Some("help" | "--help" | "-h") => Ok(Command::Help),
         Some(command) => anyhow::bail!("Unknown command: {command}. Run with --help for usage."),
     }
@@ -1135,7 +1264,8 @@ fn print_help() {
            iphone-mirror diagnose [--udid <UDID>]\n  \
            iphone-mirror pair [--udid <UDID>]\n  \
            iphone-mirror probe-files [--udid <UDID>]\n  \
-           iphone-mirror send-files [--udid <UDID>] <path>...\n"
+           iphone-mirror send-files [--udid <UDID>] <path>...\n  \
+           iphone-mirror check-update\n"
     );
 }
 
@@ -1156,11 +1286,42 @@ async fn main() -> Result<()> {
         Command::Pair { udid } => pair_device(udid.as_deref()).await,
         Command::ProbeFiles { udid } => probe_files(udid.as_deref()).await,
         Command::SendFiles { udid, paths } => send_files(udid.as_deref(), paths).await,
+        Command::CheckUpdate => check_for_update().await,
         Command::Help => {
             print_help();
             Ok(())
         }
     }
+}
+
+async fn check_for_update() -> Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    let output = tokio::process::Command::new("curl")
+        .args([
+            "-fsSL",
+            "-H",
+            "User-Agent: iphone-mirror",
+            "https://api.github.com/repos/arifianilhamnrr/iphone-mirror/releases/latest",
+        ])
+        .output()
+        .await
+        .context("Failed to execute curl to check GitHub releases")?;
+    if !output.status.success() {
+        anyhow::bail!("GitHub update check failed");
+    }
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let latest_tag = json["tag_name"].as_str().unwrap_or(current);
+    let latest = latest_tag.trim_start_matches('v');
+    let url = json["html_url"]
+        .as_str()
+        .unwrap_or("https://github.com/arifianilhamnrr/iphone-mirror/releases/latest");
+    if latest != current {
+        println!("Update available: v{latest} (current v{current})");
+        println!("Download: {url}");
+    } else {
+        println!("Up to date (v{current})");
+    }
+    Ok(())
 }
 
 #[derive(serde::Serialize)]
@@ -1185,10 +1346,22 @@ struct CachedDeviceMeta {
 }
 
 fn devices_cache_path() -> Option<std::path::PathBuf> {
-    env::var_os("HOME").map(|home| {
-        std::path::PathBuf::from(home)
-            .join("Library/Application Support/iPhone Mirror/devices.json")
-    })
+    #[cfg(target_os = "macos")]
+    {
+        env::var_os("HOME").map(|home| {
+            std::path::PathBuf::from(home)
+                .join("Library/Application Support/iPhone Mirror/devices.json")
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let base = if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
+            std::path::PathBuf::from(xdg)
+        } else {
+            std::path::PathBuf::from(env::var_os("HOME")?).join(".config")
+        };
+        Some(base.join("iphone-mirror").join("devices.json"))
+    }
 }
 
 fn load_device_cache() -> std::collections::BTreeMap<String, CachedDeviceMeta> {

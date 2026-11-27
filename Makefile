@@ -59,6 +59,18 @@ verify: bundle
 	@test -x "$(HELPER)/Contents/MacOS/iphone-mirror-backend"
 	@test "$$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$(HELPER)/Contents/Info.plist")" = "id.web.projectar.iphone-mirror.stream"
 
+package-linux:
+	cargo build --release --locked
+	@stage="build/linux-stage/iPhone-Mirror-v$(VERSION)-linux-x86_64"; \
+	mkdir -p "$$stage/resources" "$$stage/scripts" dist; \
+	cp target/release/iphone-mirror "$$stage/iphone-mirror"; \
+	cp resources/AppIcon.png "$$stage/resources/AppIcon.png"; \
+	cp scripts/install-linux.sh "$$stage/install.sh"; \
+	cp README.md "$$stage/README.md"; \
+	chmod +x "$$stage/iphone-mirror" "$$stage/install.sh"; \
+	tar -C "build/linux-stage" -czf "dist/iPhone-Mirror-v$(VERSION)-linux-x86_64.tar.gz" "iPhone-Mirror-v$(VERSION)-linux-x86_64"; \
+	echo "Created dist/iPhone-Mirror-v$(VERSION)-linux-x86_64.tar.gz"
+
 package: verify installer
 	rm -f "$(ZIP)"
 	ditto -c -k --sequesterRsrc --keepParent "$(APP)" "$(ZIP)"

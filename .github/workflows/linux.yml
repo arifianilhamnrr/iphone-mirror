@@ -1,0 +1,53 @@
+name: Linux Build & Release
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry & build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run unit tests
+        run: cargo test --lib --bins --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package universal Linux tarball
+        run: |
+          VERSION=$(grep -E '^version = ' Cargo.toml | head -n1 | cut -d'"' -f2)
+          STAGE="build/linux-stage/iPhone-Mirror-v${VERSION}-linux-x86_64"
+          mkdir -p "$STAGE/resources" dist
+          cp target/release/iphone-mirror "$STAGE/iphone-mirror"
+          cp resources/AppIcon.png "$STAGE/resources/AppIcon.png"
+          cp scripts/install-linux.sh "$STAGE/install.sh"
+          cp README.md "$STAGE/README.md"
+          chmod +x "$STAGE/iphone-mirror" "$STAGE/install.sh"
+          tar -C "build/linux-stage" -czf "dist/iPhone-Mirror-v${VERSION}-linux-x86_64.tar.gz" "iPhone-Mirror-v${VERSION}-linux-x86_64"
+          (cd dist && sha256sum "iPhone-Mirror-v${VERSION}-linux-x86_64.tar.gz" > "SHA256SUMS-linux-x86_64.txt")
+
+      - name: Upload Linux release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/iPhone-Mirror-v*-linux-x86_64.tar.gz
+            dist/SHA256SUMS-linux-x86_64.txt

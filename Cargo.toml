@@ -46,14 +46,16 @@ sha1 = "0.10"
 md-5 = "0.10"
 rand = "0.8"
 
-# macOS Native Frameworks (macOS 15 Sequoia / macOS 26 Tahoe)
+# Windowing & Raw Handles (macOS AppKit + Linux Wayland/X11 dynamic loading)
+winit = "0.30"
+raw-window-handle = "0.6"
+
+# macOS Native Frameworks (macOS 12 Monterey .. macOS 26 Tahoe)
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
 objc2-foundation = "0.2"
 objc2-app-kit = "0.2"
 core-foundation = "0.9"
-winit = "0.30"
-raw-window-handle = "0.6"
 metal = "0.29"
 foreign-types = "0.5"
 objc = "0.2"

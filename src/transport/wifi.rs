@@ -1,8 +1,8 @@
 // language: Rust, file: src/transport/wifi.rs
-//! Wi-Fi transport discovery and tunnel setup via Bonjour + RemotePairing.
+//! Wi-Fi transport discovery and tunnel setup via Bonjour/Avahi + RemotePairing.
 //!
 //! iOS advertises `_remotepairing._tcp` when "Show this iPhone when on Wi-Fi"
-//! is enabled in Finder. A device found there can be paired once and then
+//! is enabled. A device found there can be paired once and then
 //! reached over a TLS-PSK tunnel without usbmuxd.
 
 use anyhow::{Context, Result};
@@ -17,11 +17,7 @@ use idevice::{
     tcp::handle::AdapterHandle,
 };
 use serde::Serialize;
-use std::{
-    path::PathBuf,
-    process::Stdio,
-    time::Duration,
-};
+use std::{path::PathBuf, process::Stdio, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     net::TcpStream,
@@ -48,9 +44,26 @@ pub struct WifiDevice {
 pub struct WifiDiscovery;
 
 impl WifiDiscovery {
-    /// Discover iPhones advertising the RemotePairing service via `dns-sd`.
+    /// Discover iPhones advertising `_remotepairing._tcp` via `avahi-browse` (Linux) or `dns-sd` (macOS).
     pub async fn discover() -> Result<Vec<WifiDevice>> {
-        let browse = run_dns_sd(
+        #[cfg(not(target_os = "macos"))]
+        {
+            if let Ok(output) = run_tool(
+                "avahi-browse",
+                &["-prt", "_remotepairing._tcp"],
+                Duration::from_millis(1500),
+            )
+            .await
+            {
+                let devices = parse_avahi_browse_output(&output);
+                if !devices.is_empty() {
+                    return Ok(devices);
+                }
+            }
+        }
+
+        let browse = run_tool(
+            "dns-sd",
             &["-B", "_remotepairing._tcp"],
             Duration::from_secs(BROWSE_SECONDS),
         )
@@ -76,7 +89,7 @@ impl WifiDiscovery {
         let mut devices = Vec::new();
         for name in names {
             let args = ["-L", name.as_str(), "_remotepairing._tcp", "local."];
-            match run_dns_sd(&args, Duration::from_secs(RESOLVE_SECONDS)).await {
+            match run_tool("dns-sd", &args, Duration::from_secs(RESOLVE_SECONDS)).await {
                 Ok(output) => {
                     if let Some(device) = parse_resolved(&name, &output) {
                         devices.push(device);
@@ -91,10 +104,23 @@ impl WifiDiscovery {
 
 /// Load the pairing file for this host, generating a fresh one on first use.
 pub fn pairing_file_path() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home)
-        .join("Library/Application Support/iPhone Mirror")
-        .join("rppairing.plist"))
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME").context("HOME is not set")?;
+        Ok(PathBuf::from(home)
+            .join("Library/Application Support/iPhone Mirror")
+            .join("rppairing.plist"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let base = if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+            PathBuf::from(xdg)
+        } else {
+            let home = std::env::var_os("HOME").context("HOME is not set")?;
+            PathBuf::from(home).join(".config")
+        };
+        Ok(base.join("iphone-mirror").join("rppairing.plist"))
+    }
 }
 
 async fn load_or_create_pairing_file() -> Result<RpPairingFile> {
@@ -185,7 +211,8 @@ pub async fn connect(device: &WifiDevice) -> Result<(AdapterHandle, RsdHandshake
     let mtu = tunnel.info.mtu as usize;
     let rsd_port = tunnel.info.server_rsd_port;
     let info = tunnel.info.clone();
-    let mut adapter = idevice::tcp::adapter::Adapter::new(Box::new(tunnel.into_inner()), client_ip, server_ip);
+    let mut adapter =
+        idevice::tcp::adapter::Adapter::new(Box::new(tunnel.into_inner()), client_ip, server_ip);
     adapter.set_mss(mtu.saturating_sub(60).min(8192));
     let mut adapter = adapter.to_async_handle();
     let rsd_stream = adapter.connect(rsd_port).await?;
@@ -201,7 +228,11 @@ pub fn is_uuid_like(value: &str) -> bool {
 }
 
 pub fn friendly_name_from_host(host: &str, fallback: &str) -> String {
-    let stripped = host.trim().trim_end_matches('.').trim_end_matches(".local").trim();
+    let stripped = host
+        .trim()
+        .trim_end_matches('.')
+        .trim_end_matches(".local")
+        .trim();
     if !stripped.is_empty() && !is_uuid_like(stripped) {
         stripped.to_string()
     } else if !fallback.is_empty() && !is_uuid_like(fallback) {
@@ -209,6 +240,84 @@ pub fn friendly_name_from_host(host: &str, fallback: &str) -> String {
     } else {
         "iPhone".to_string()
     }
+}
+
+pub fn parse_avahi_browse_output(output: &str) -> Vec<WifiDevice> {
+    let mut devices: Vec<WifiDevice> = Vec::new();
+    for line in output.lines() {
+        if !line.starts_with("=;") {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(';').collect();
+        if cols.len() < 9 {
+            continue;
+        }
+        let raw_name = unescape_avahi_text(cols[3]);
+        let hostname = cols[6].trim_end_matches('.').to_string();
+        let address = cols[7].trim();
+        let Ok(port) = cols[8].trim().parse::<u16>() else {
+            continue;
+        };
+        let host = if !address.is_empty() && cols[2].trim() == "IPv4" {
+            address.to_string()
+        } else if !hostname.is_empty() {
+            hostname.clone()
+        } else if !address.is_empty() {
+            address.to_string()
+        } else {
+            continue;
+        };
+
+        let txt = cols.get(9).copied().unwrap_or("");
+        let identifier = txt
+            .split('"')
+            .find_map(|token| token.strip_prefix("identifier="))
+            .map(str::to_string)
+            .unwrap_or_else(|| raw_name.clone());
+
+        let friendly_name = if is_uuid_like(&raw_name) {
+            friendly_name_from_host(&hostname, &raw_name)
+        } else {
+            raw_name
+        };
+
+        if let Some(existing) = devices.iter_mut().find(|d| d.identifier == identifier) {
+            if cols[2].trim() == "IPv4" {
+                existing.host = host;
+                existing.port = port;
+            }
+            continue;
+        }
+        devices.push(WifiDevice {
+            name: friendly_name,
+            identifier,
+            host,
+            port,
+        });
+    }
+    devices
+}
+
+fn unescape_avahi_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len() {
+            if let Ok(code) =
+                std::str::from_utf8(&bytes[i + 1..i + 4]).and_then(|s| Ok(u8::from_str_radix(s, 10)))
+            {
+                if let Ok(ch) = code {
+                    out.push(ch as char);
+                    i += 4;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
 
 fn parse_resolved(name: &str, output: &str) -> Option<WifiDevice> {
@@ -242,15 +351,18 @@ fn parse_resolved(name: &str, output: &str) -> Option<WifiDevice> {
     None
 }
 
-async fn run_dns_sd(args: &[&str], duration: Duration) -> Result<String> {
-    let mut child = Command::new("dns-sd")
+async fn run_tool(program: &str, args: &[&str], duration: Duration) -> Result<String> {
+    let mut child = Command::new(program)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .context("Could not run dns-sd; Bonjour discovery is unavailable")?;
-    let stdout = child.stdout.take().context("dns-sd had no stdout")?;
+        .with_context(|| format!("Could not run {program}; mDNS discovery is unavailable"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .with_context(|| format!("{program} had no stdout"))?;
     let mut reader = BufReader::new(stdout);
     let mut output = String::new();
     let mut line = String::new();
@@ -280,11 +392,30 @@ pub fn endpoint_from_env() -> Option<WifiDevice> {
         .parse()
         .ok()?;
     Some(WifiDevice {
-        name: std::env::var("IPHONE_MIRROR_WIFI_NAME")
-            .unwrap_or_else(|_| host.clone()),
-        identifier: std::env::var("IPHONE_MIRROR_WIFI_IDENTIFIER")
-            .unwrap_or_else(|_| host.clone()),
+        name: std::env::var("IPHONE_MIRROR_WIFI_NAME").unwrap_or_else(|_| host.clone()),
+        identifier: std::env::var("IPHONE_MIRROR_WIFI_IDENTIFIER").unwrap_or_else(|_| host.clone()),
         host,
         port,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_avahi_browse_output;
+
+    #[test]
+    fn parses_avahi_remotepairing_resolved_lines() {
+        let sample = "\
++;wlan0;IPv4;3AF62AF2-6CCF-4234-B2AE-A6CB63C72C9E;_remotepairing._tcp;local\n\
+=;wlan0;IPv4;3AF62AF2-6CCF-4234-B2AE-A6CB63C72C9E;_remotepairing._tcp;local;iPhone-SE.local;192.168.1.42;51234;\"identifier=3AF62AF2-6CCF-4234-B2AE-A6CB63C72C9E\"\n";
+        let devices = parse_avahi_browse_output(sample);
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "iPhone-SE");
+        assert_eq!(
+            devices[0].identifier,
+            "3AF62AF2-6CCF-4234-B2AE-A6CB63C72C9E"
+        );
+        assert_eq!(devices[0].host, "192.168.1.42");
+        assert_eq!(devices[0].port, 51234);
+    }
 }

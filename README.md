@@ -1,10 +1,11 @@
 # iPhone Mirror
 
-Native iPhone screen mirroring for macOS, written in Rust.
+Native iPhone screen mirroring for **macOS** and **Linux (Wayland & X11)**, written in Rust.
 
 - Version: **0.3.0**
-- Host: **macOS 12 Monterey** or newer (tested up to macOS 26 Tahoe)
-- Architecture: **x86_64** (Intel Mac and Hackintosh)
+- Hosts:
+  - **macOS 12 Monterey** or newer (tested up to macOS 26 Tahoe, `x86_64`)
+  - **Linux (All Distros)** — both **Wayland** (GNOME, KDE Plasma, Hyprland, Sway) and **X11** (XFCE, i3, Cinnamon, MATE) desktop environments via runtime dynamic loading (PipeWire / PulseAudio / ALSA audio)
 - Tested device: **iPhone SE on iOS 27.2.1**
 - Connections: **USB**, direct **Wi-Fi**, and optional **AirPlay (H.264)**
 - Status: stable
@@ -38,7 +39,7 @@ Native iPhone screen mirroring for macOS, written in Rust.
 
 - Finder drag-and-drop file transfer from Mac to iPhone (`AFC` staging + pasteboard auto-paste).
 
-## Installation
+## Installation (macOS)
 
 1. Open the [Releases](https://github.com/arifianilhamnrr/iphone-mirror/releases) page.
 2. Download `iPhone-Mirror-v0.3.0-macOS-x86_64.dmg`.
@@ -55,6 +56,21 @@ The app is ad-hoc signed and not notarized. If Gatekeeper blocks the first launc
 4. Confirm **Open** in the dialog.
 
 Install only one copy of the app. Running another copy from the DMG or a build directory can create duplicate Launchpad entries.
+
+## Installation (Linux — All Distros, Wayland & X11)
+
+One universal binary runs natively on **Wayland** (`wl_shm`) and **X11** (`XPutImage`) via dynamic library loading, with automatic **PipeWire -> PulseAudio -> ALSA** audio output and **Avahi** mDNS discovery:
+
+1. Download `iPhone-Mirror-vX.Y.Z-linux-x86_64.tar.gz` from [Releases](https://github.com/arifianilhamnrr/iphone-mirror/releases) (or build from source with `cargo build --release --locked`).
+2. Extract and run the universal installer (supports `apt`, `dnf`, `pacman`, `zypper`, and `apk`):
+
+```bash
+tar -xzf iPhone-Mirror-*-linux-x86_64.tar.gz
+cd iPhone-Mirror-*-linux-x86_64
+./install.sh
+```
+
+3. Launch **iPhone Mirror** or **iPhone Mirror (AirPlay Receiver)** from your desktop app menu, or run `iphone-mirror` / `iphone-mirror airplay` / `iphone-mirror check-update` in a terminal.
 
 ## iPhone preparation
 

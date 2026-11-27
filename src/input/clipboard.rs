@@ -1,4 +1,4 @@
-// language: Rust, file: src/input/clipboard.rs, target: macOS
+// language: Rust, file: src/input/clipboard.rs, target: macOS & Linux (Wayland/X11)
 use anyhow::{bail, Result};
 
 pub const MAX_CLIPBOARD_IMAGE_BYTES: usize = 20 * 1024 * 1024;
@@ -12,7 +12,12 @@ pub enum ClipboardContent {
 pub struct SystemClipboard {
     #[cfg(target_os = "macos")]
     pasteboard: objc2::rc::Retained<objc2_app_kit::NSPasteboard>,
+    #[cfg(target_os = "macos")]
     change_count: isize,
+    #[cfg(not(target_os = "macos"))]
+    last_text: Option<String>,
+    #[cfg(not(target_os = "macos"))]
+    last_poll: Option<std::time::Instant>,
 }
 
 impl SystemClipboard {
@@ -27,7 +32,13 @@ impl SystemClipboard {
             }
         }
         #[cfg(not(target_os = "macos"))]
-        Self { change_count: 0 }
+        {
+            let initial = linux_read_text();
+            Self {
+                last_text: initial,
+                last_poll: Some(std::time::Instant::now()),
+            }
+        }
     }
 
     pub fn changed_content(&mut self) -> Option<ClipboardContent> {
@@ -64,7 +75,22 @@ impl SystemClipboard {
             }
         }
         #[cfg(not(target_os = "macos"))]
-        None
+        {
+            let now = std::time::Instant::now();
+            if self
+                .last_poll
+                .is_some_and(|prev| now.duration_since(prev) < std::time::Duration::from_millis(1500))
+            {
+                return None;
+            }
+            self.last_poll = Some(now);
+            let current = linux_read_text()?;
+            if self.last_text.as_deref() == Some(current.as_str()) {
+                return None;
+            }
+            self.last_text = Some(current.clone());
+            Some(ClipboardContent::Text(current))
+        }
     }
 
     pub fn set_image(&mut self, uti: &str, bytes: &[u8]) -> Result<()> {
@@ -101,8 +127,14 @@ impl SystemClipboard {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (uti, bytes);
-            bail!("System clipboard synchronization is only supported on macOS")
+            let mime = if uti.contains("png") {
+                "image/png"
+            } else if uti.contains("jpeg") {
+                "image/jpeg"
+            } else {
+                "image/png"
+            };
+            linux_write_bytes(mime, bytes)
         }
     }
 
@@ -114,7 +146,7 @@ impl SystemClipboard {
                 .map(|text| text.to_string())
         }
         #[cfg(not(target_os = "macos"))]
-        None
+        linux_read_text()
     }
 
     pub fn set_text(&mut self, text: &str) -> Result<()> {
@@ -135,10 +167,93 @@ impl SystemClipboard {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = text;
-            bail!("System clipboard synchronization is only supported on macOS")
+            linux_write_bytes("text/plain", text.as_bytes())?;
+            self.last_text = Some(text.to_string());
+            Ok(())
         }
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_wayland() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn linux_read_text() -> Option<String> {
+    use std::process::{Command, Stdio};
+    if is_wayland() {
+        if let Ok(out) = Command::new("wl-paste")
+            .args(["--no-newline", "--type", "text/plain"])
+            .stderr(Stdio::null())
+            .output()
+        {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout).into_owned();
+                if !s.is_empty() {
+                    return Some(s);
+                }
+            }
+        }
+    }
+    for (bin, args) in [
+        ("xclip", &["-selection", "clipboard", "-o"][..]),
+        ("xsel", &["--clipboard", "--output"][..]),
+    ] {
+        if let Ok(out) = Command::new(bin)
+            .args(args)
+            .stderr(Stdio::null())
+            .output()
+        {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout).into_owned();
+                if !s.is_empty() {
+                    return Some(s);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn linux_write_bytes(mime: &str, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let candidates: Vec<(&str, Vec<&str>)> = if is_wayland() {
+        vec![
+            ("wl-copy", vec!["--type", mime]),
+            ("xclip", vec!["-selection", "clipboard", "-t", mime, "-i"]),
+        ]
+    } else if mime == "text/plain" {
+        vec![
+            ("xclip", vec!["-selection", "clipboard", "-i"]),
+            ("xsel", vec!["--clipboard", "--input"]),
+        ]
+    } else {
+        vec![("xclip", vec!["-selection", "clipboard", "-t", mime, "-i"])]
+    };
+
+    for (bin, args) in candidates {
+        if let Ok(mut child) = Command::new(bin)
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(bytes);
+            }
+            if let Ok(status) = child.wait() {
+                if status.success() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    bail!("No Linux clipboard utility found (install wl-clipboard for Wayland or xclip/xsel for X11)")
 }
 
 impl Default for SystemClipboard {
