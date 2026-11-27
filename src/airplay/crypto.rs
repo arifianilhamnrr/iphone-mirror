@@ -67,9 +67,54 @@ pub struct ServerIdentity {
 }
 
 impl ServerIdentity {
+    fn key_path() -> Option<std::path::PathBuf> {
+        #[cfg(target_os = "macos")]
+        {
+            std::env::var_os("HOME").map(|home| {
+                std::path::PathBuf::from(home)
+                    .join("Library/Application Support/iPhone Mirror/airplay_ed25519.key")
+            })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let base = if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+                std::path::PathBuf::from(xdg)
+            } else {
+                std::path::PathBuf::from(std::env::var_os("HOME")?).join(".config")
+            };
+            Some(base.join("iphone-mirror").join("airplay_ed25519.key"))
+        }
+    }
+
     pub fn generate() -> Self {
+        if let Some(path) = Self::key_path() {
+            if let Ok(bytes) = std::fs::read(&path) {
+                if bytes.len() == 32 {
+                    let mut seed = [0u8; 32];
+                    seed.copy_from_slice(&bytes);
+                    return Self {
+                        signing_key: SigningKey::from_bytes(&seed),
+                    };
+                }
+            }
+            let signing_key = SigningKey::generate(&mut OsRng);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&path, signing_key.to_bytes());
+            return Self { signing_key };
+        }
         let signing_key = SigningKey::generate(&mut OsRng);
         Self { signing_key }
+    }
+
+    pub fn device_id(&self) -> String {
+        let digest = Sha512::digest(self.public_key_bytes());
+        let b0 = (digest[0] & 0xfe) | 0x02;
+        format!(
+            "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            b0, digest[1], digest[2], digest[3], digest[4], digest[5]
+        )
     }
 
     pub fn public_key_bytes(&self) -> [u8; 32] {

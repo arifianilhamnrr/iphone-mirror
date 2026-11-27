@@ -2,7 +2,7 @@
 
 Native iPhone screen mirroring for **macOS** and **Linux (Wayland & X11)**, written in Rust.
 
-- Version: **0.4.0**
+- Version: **0.4.1**
 - Hosts:
   - **macOS 12 Monterey** or newer (tested up to macOS 26 Tahoe, `x86_64`)
   - **Linux (All Distros)** — both **Wayland** (GNOME, KDE Plasma, Hyprland, Sway) and **X11** (XFCE, i3, Cinnamon, MATE) desktop environments via runtime dynamic loading (PipeWire / PulseAudio / ALSA audio)
@@ -42,7 +42,7 @@ Native iPhone screen mirroring for **macOS** and **Linux (Wayland & X11)**, writ
 ## Installation (macOS)
 
 1. Open the [Releases](https://github.com/arifianilhamnrr/iphone-mirror/releases) page.
-2. Download `iPhone-Mirror-v0.4.0-macOS-x86_64.dmg`.
+2. Download `iPhone-Mirror-v0.4.1-macOS-x86_64.dmg`.
 3. Open the DMG.
 4. Drag **iPhone Mirror.app** into **Applications**.
 5. Eject the DMG.
@@ -70,7 +70,7 @@ cd iPhone-Mirror-*-linux-x86_64
 ./install.sh
 ```
 
-3. Launch **iPhone Mirror** or **iPhone Mirror (AirPlay Receiver)** from your desktop app menu, or run `iphone-mirror` / `iphone-mirror airplay` / `iphone-mirror check-update` in a terminal.
+3. Launch **iPhone Mirror** from your desktop app menu (supports Auto, USB, Wi-Fi, and AirPlay in one unified launcher), or run `iphone-mirror` / `iphone-mirror airplay` / `iphone-mirror check-update` in a terminal.
 
 ## iPhone preparation
 
@@ -353,8 +353,8 @@ make package
 Generated artifacts:
 
 ```text
-dist/iPhone-Mirror-v0.4.0-macOS-x86_64.dmg
-dist/iPhone-Mirror-v0.4.0-macOS-x86_64.zip
+dist/iPhone-Mirror-v0.4.1-macOS-x86_64.dmg
+dist/iPhone-Mirror-v0.4.1-macOS-x86_64.zip
 dist/SHA256SUMS.txt
 ```
 

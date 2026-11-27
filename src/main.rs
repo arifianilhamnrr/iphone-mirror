@@ -53,7 +53,9 @@ use std::sync::{
 use tracing::{debug, info, warn};
 
 enum Command {
+    Launcher,
     Mirror,
+    MirrorDirect,
     Airplay,
     Devices {
         json: bool,
@@ -81,6 +83,10 @@ struct AppSettings {
     transport: TransportPreference,
     #[serde(default = "default_true")]
     auto_rotate: bool,
+    #[serde(default)]
+    auto_connect: bool,
+    #[serde(default = "default_true")]
+    auto_check_updates: bool,
 }
 
 impl Default for AppSettings {
@@ -88,6 +94,8 @@ impl Default for AppSettings {
         Self {
             transport: TransportPreference::Auto,
             auto_rotate: true,
+            auto_connect: false,
+            auto_check_updates: true,
         }
     }
 }
@@ -385,6 +393,14 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
             winit::event::WindowEvent::Resized(size) => {
                 if let Some(renderer) = &self.renderer {
                     renderer.resize(size.width, size.height);
+                }
+            }
+            winit::event::WindowEvent::RedrawRequested => {
+                if self.frame_count == 0 {
+                    if let (Some(window), Some(renderer)) = (&self.window, &self.renderer) {
+                        let size = window.inner_size();
+                        renderer.resize(size.width, size.height);
+                    }
                 }
             }
             winit::event::WindowEvent::CursorMoved { position, .. } => {
@@ -1186,7 +1202,24 @@ end run
 fn parse_command() -> Result<Command> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
-        None | Some("mirror") => Ok(Command::Mirror),
+        None => {
+            #[cfg(not(target_os = "macos"))]
+            {
+                Ok(Command::Launcher)
+            }
+            #[cfg(target_os = "macos")]
+            {
+                Ok(Command::Mirror)
+            }
+        }
+        Some("launcher") => Ok(Command::Launcher),
+        Some("mirror") => {
+            if args.any(|arg| arg == "--direct") {
+                Ok(Command::MirrorDirect)
+            } else {
+                Ok(Command::Mirror)
+            }
+        }
         Some("airplay") => Ok(Command::Airplay),
         Some("devices") => {
             let json = args.any(|arg| arg == "--json");
@@ -1254,7 +1287,8 @@ fn print_help() {
     println!(
         "iphone-mirror-rs\n\n\
          Usage:\n  \
-           iphone-mirror [mirror]\n  \
+           iphone-mirror [launcher]\n  \
+           iphone-mirror mirror [--direct]\n  \
            iphone-mirror airplay\n  \
            iphone-mirror devices\n  \
            iphone-mirror diagnose [--udid <UDID>]\n  \
@@ -1275,7 +1309,26 @@ async fn main() -> Result<()> {
         .init();
 
     match parse_command()? {
-        Command::Mirror => supervise_mirror().await,
+        Command::Launcher => {
+            #[cfg(not(target_os = "macos"))]
+            {
+                iphone_mirror_rs::ui::launcher::run_launcher()
+            }
+            #[cfg(target_os = "macos")]
+            {
+                supervise_mirror().await
+            }
+        }
+        Command::Mirror => {
+            #[cfg(not(target_os = "macos"))]
+            {
+                if env::var_os("IPHONE_MIRROR_SESSION_WORKER").is_none() {
+                    return iphone_mirror_rs::ui::launcher::run_launcher();
+                }
+            }
+            supervise_mirror().await
+        }
+        Command::MirrorDirect => supervise_mirror().await,
         Command::Airplay => run_airplay_mirror(load_settings()).await,
         Command::Devices { json } => list_devices(json).await,
         Command::Diagnose { udid } => diagnose(udid.as_deref()).await,
@@ -1455,9 +1508,13 @@ async fn list_devices(json: bool) -> Result<()> {
     let mut cache = load_device_cache();
     let mut cache_dirty = false;
 
-    let scanned = DeviceScanner::list_devices()
-        .await
-        .context("Could not scan usbmuxd devices")?;
+    let scanned = match DeviceScanner::list_devices().await {
+        Ok(list) => list,
+        Err(error) => {
+            debug!(%error, "usbmuxd unavailable or no USB iPhone connected; continuing with Wi-Fi discovery");
+            Vec::new()
+        }
+    };
     let mut devices: Vec<DeviceJson> = Vec::with_capacity(scanned.len());
 
     for device in scanned {
@@ -1718,13 +1775,48 @@ async fn send_files(udid: Option<&str>, paths: Vec<std::path::PathBuf>) -> Resul
     anyhow::bail!("transfer ended without a result")
 }
 
-async fn diagnose(udid: Option<&str>) -> Result<()> {
-    let wifi_device = wifi::endpoint_from_env();
-    let usb_device = if wifi_device.is_none() {
-        Some(DeviceScanner::select_device(udid).await?)
+async fn select_tunnel_devices(
+    udid: Option<&str>,
+    transport: TransportPreference,
+) -> Result<(Option<ConnectedDevice>, Option<WifiDevice>)> {
+    if let Some(wifi_device) = wifi::endpoint_from_env() {
+        return Ok((None, Some(wifi_device)));
+    }
+
+    let mut usb_err = None;
+    if transport != TransportPreference::Wifi {
+        match DeviceScanner::select_device_with_transport(udid, transport).await {
+            Ok(device) => return Ok((Some(device), None)),
+            Err(err) => {
+                debug!(%err, "USB/usbmuxd selection unavailable; checking Wi-Fi discovery");
+                usb_err = Some(err);
+            }
+        }
+    }
+
+    if transport != TransportPreference::Usb {
+        if let Ok(remote) = wifi::WifiDiscovery::discover().await {
+            let matched = remote
+                .into_iter()
+                .find(|dev| udid.is_none_or(|target| dev.identifier.eq_ignore_ascii_case(target)));
+            if let Some(wifi_device) = matched {
+                return Ok((None, Some(wifi_device)));
+            }
+        }
+    }
+
+    if let Some(err) = usb_err {
+        Err(err)
     } else {
-        None
-    };
+        anyhow::bail!(
+            "No iPhone detected over {}. Connect and trust an iPhone first.",
+            transport.label()
+        )
+    }
+}
+
+async fn diagnose(udid: Option<&str>) -> Result<()> {
+    let (usb_device, wifi_device) = select_tunnel_devices(udid, TransportPreference::Auto).await?;
     let source = if let Some(wifi_device) = &wifi_device {
         println!("Device: {} (Wi-Fi)", wifi_device.identifier);
         TunnelSource::Wifi(wifi_device)
@@ -1906,23 +1998,14 @@ async fn run_mirror() -> Result<()> {
             _ => TransportPreference::Auto,
         },
         auto_rotate: env::var("IPHONE_MIRROR_AUTO_ROTATE").as_deref() != Ok("0"),
+        ..Default::default()
     };
     if settings.transport == TransportPreference::Airplay {
         return run_airplay_mirror(settings).await;
     }
     let selected_udid = env::var("IPHONE_MIRROR_UDID").ok();
-    let wifi_device = wifi::endpoint_from_env();
-    let usb_device = if wifi_device.is_none() {
-        Some(
-            DeviceScanner::select_device_with_transport(
-                selected_udid.as_deref(),
-                settings.transport,
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
+    let (usb_device, wifi_device) =
+        select_tunnel_devices(selected_udid.as_deref(), settings.transport).await?;
     let source = if let Some(wifi_device) = &wifi_device {
         info!(host = %wifi_device.host, port = wifi_device.port, name = %wifi_device.name, "Wi-Fi iPhone selected");
         TunnelSource::Wifi(wifi_device)
@@ -2350,6 +2433,9 @@ async fn run_mirror() -> Result<()> {
                                         decoder = Some(HardwareDecoder::new(format, frame_tx.clone(), decoded_frames.clone())?);
                                         decoder_sets = Some(sets);
                                         decode_failures = 0;
+                                        decoder_stalled_ticks = 0;
+                                        frames_at_check = decoded_frames.load(Ordering::Relaxed);
+                                        last_nal_at_check = nal_count;
                                         info!(nal_count, "VideoToolbox decoder ready for current HEVC parameter sets");
                                     }
                                 }
@@ -2380,6 +2466,9 @@ async fn run_mirror() -> Result<()> {
                                         decoder = Some(HardwareDecoder::new(format, frame_tx.clone(), decoded_frames.clone())?);
                                         decoder_sets = Some(sets);
                                         decode_failures = 0;
+                                        decoder_stalled_ticks = 0;
+                                        frames_at_check = decoded_frames.load(Ordering::Relaxed);
+                                        last_nal_at_check = nal_count;
                                     }
                                 }
                                 if nal_count % 300 == 0 {
@@ -2516,6 +2605,9 @@ async fn run_mirror() -> Result<()> {
                                 }
                             };
                             telemetry.decode_ok.fetch_add(1, Ordering::Relaxed);
+                            if pcm.is_empty() {
+                                continue;
+                            }
                             if let Some((pcm_dump, _)) = audio_dump.as_mut() {
                                 let _ = pcm_dump.write_all(&pcm);
                             }
@@ -2672,7 +2764,7 @@ async fn run_mirror() -> Result<()> {
                         } else {
                             decoder_stalled_ticks += 1;
                         }
-                        if decoder_stalled_ticks >= 3
+                        if decoder_stalled_ticks >= 5
                             && nal_count > last_nal_at_check + 30
                             && decoder_sets.is_some()
                         {

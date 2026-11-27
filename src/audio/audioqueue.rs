@@ -60,8 +60,39 @@ impl AudioQueueOutput {
             .spawn(move || {
                 let mut samples = vec![0_i16; SAMPLES_PER_PACKET];
                 let mut bytes = vec![0_u8; PCM_BYTES];
+                let tick = Duration::from_millis(10);
+                let mut next_tick = std::time::Instant::now() + tick;
+                let mut prebuffering = true;
+
                 while !stop.load(Ordering::Acquire) {
+                    let available = ring.frames_available();
+                    if prebuffering {
+                        if available < FRAMES_PER_PACKET * 3 {
+                            let now = std::time::Instant::now();
+                            if next_tick > now {
+                                thread::sleep(next_tick - now);
+                            } else if now.duration_since(next_tick) > Duration::from_millis(50) {
+                                next_tick = now;
+                            }
+                            next_tick += tick;
+                            continue;
+                        }
+                        prebuffering = false;
+                    }
+
+                    // Keep jitter buffer bounded around ~60ms on Wi-Fi bursts or clock skew.
+                    while ring.frames_available() > FRAMES_PER_PACKET * 12 {
+                        let dropped = ring.read(&mut samples);
+                        if dropped == 0 {
+                            break;
+                        }
+                    }
+
                     let copied = ring.read(&mut samples);
+                    if copied == 0 {
+                        prebuffering = true;
+                    }
+
                     let muted = mute.get();
                     let source = if muted {
                         for s in samples.iter_mut() {
@@ -85,7 +116,14 @@ impl AudioQueueOutput {
                     if let Err(error) = player.play(&bytes) {
                         tracing::debug!(%error, "AudioQueue pump failed to enqueue");
                     }
-                    thread::sleep(Duration::from_millis(10));
+
+                    let now = std::time::Instant::now();
+                    if next_tick > now {
+                        thread::sleep(next_tick - now);
+                    } else if now.duration_since(next_tick) > Duration::from_millis(50) {
+                        next_tick = now;
+                    }
+                    next_tick += tick;
                 }
                 drop(player);
             })?;

@@ -56,30 +56,49 @@ impl BonjourRegistration {
         ];
 
         #[cfg(not(target_os = "macos"))]
-        if let (Ok(airplay), Ok(raop)) = (
-            Command::new("avahi-publish-service")
-                .args([name, "_airplay._tcp", &port_str])
-                .args(airplay_txt)
+        {
+            let _ = std::process::Command::new("pkill")
+                .args(["-f", "avahi-publish-service.*(_airplay|_raop)\\._tcp"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .kill_on_drop(true)
-                .spawn(),
-            Command::new("avahi-publish-service")
-                .args([&raop_name, "_raop._tcp", &port_str])
-                .args(raop_txt)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .kill_on_drop(true)
-                .spawn(),
-        ) {
-            info!(
-                name,
-                port, device_id, "Registered AirPlay services via avahi-publish-service"
-            );
-            return Ok(Self {
-                _airplay: airplay,
-                _raop: raop,
-            });
+                .status();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            let spawn_avahi = |svc_name: &str, svc_type: &str, txt: &[&str]| {
+                let mut cmd = Command::new("avahi-publish-service");
+                cmd.args([svc_name, svc_type, &port_str])
+                    .args(txt)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .kill_on_drop(true);
+                #[cfg(target_os = "linux")]
+                unsafe {
+                    cmd.pre_exec(|| {
+                        extern "C" {
+                            fn prctl(option: std::ffi::c_int, ...) -> std::ffi::c_int;
+                        }
+                        const PR_SET_PDEATHSIG: std::ffi::c_int = 1;
+                        const SIGTERM: std::ffi::c_int = 15;
+                        prctl(PR_SET_PDEATHSIG, SIGTERM);
+                        Ok(())
+                    });
+                }
+                cmd.spawn()
+            };
+
+            if let (Ok(airplay), Ok(raop)) = (
+                spawn_avahi(name, "_airplay._tcp", &airplay_txt),
+                spawn_avahi(&raop_name, "_raop._tcp", &raop_txt),
+            ) {
+                info!(
+                    name,
+                    port, device_id, "Registered AirPlay services via avahi-publish-service"
+                );
+                return Ok(Self {
+                    _airplay: airplay,
+                    _raop: raop,
+                });
+            }
         }
 
         let airplay = Command::new("dns-sd")

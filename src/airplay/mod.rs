@@ -11,7 +11,6 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use anyhow::Result;
-use rand::RngCore;
 use tokio::sync::{mpsc, watch};
 
 use crate::airplay::bonjour::BonjourRegistration;
@@ -38,15 +37,7 @@ impl AirPlayReceiver {
         let server = RtspServer::bind().await?;
         let port = server.port;
         let pk_hex = server.public_key_hex();
-
-        let mut mac = [0u8; 6];
-        rand::thread_rng().fill_bytes(&mut mac);
-        // Locally administered unicast MAC address
-        mac[0] = (mac[0] & 0xfe) | 0x02;
-        let device_id = format!(
-            "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-        );
+        let device_id = server.device_id();
 
         let bonjour = BonjourRegistration::register(&receiver_name, port, &device_id, &pk_hex)?;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);

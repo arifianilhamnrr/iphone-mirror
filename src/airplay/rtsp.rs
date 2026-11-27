@@ -42,17 +42,23 @@ pub struct RtspServer {
 }
 
 impl RtspServer {
-    /// Binds TCP port 7000 if available, otherwise falls back to an ephemeral port
-    /// (useful when macOS AirPlay Receiver already holds port 7000).
+    /// Binds TCP port 7000 (dual-stack `[::]` then `0.0.0.0`) if available,
+    /// otherwise falls back to an ephemeral port.
     pub async fn bind() -> Result<Self> {
-        let listener = match TcpListener::bind("0.0.0.0:7000").await {
+        let listener = match TcpListener::bind("[::]:7000").await {
             Ok(l) => l,
-            Err(err) => {
-                warn!("Port 7000 unavailable ({err}); binding ephemeral AirPlay RTSP port");
-                TcpListener::bind("0.0.0.0:0")
-                    .await
-                    .context("Failed to bind fallback AirPlay RTSP listener")?
-            }
+            Err(_) => match TcpListener::bind("0.0.0.0:7000").await {
+                Ok(l) => l,
+                Err(err) => {
+                    warn!("Port 7000 unavailable ({err}); binding ephemeral AirPlay RTSP port");
+                    match TcpListener::bind("[::]:0").await {
+                        Ok(l) => l,
+                        Err(_) => TcpListener::bind("0.0.0.0:0")
+                            .await
+                            .context("Failed to bind fallback AirPlay RTSP listener")?,
+                    }
+                }
+            },
         };
         let port = listener.local_addr()?.port();
         Ok(Self {
@@ -60,6 +66,10 @@ impl RtspServer {
             listener,
             identity: Arc::new(ServerIdentity::generate()),
         })
+    }
+
+    pub fn device_id(&self) -> String {
+        self.identity.device_id()
     }
 
     pub fn public_key_hex(&self) -> String {
@@ -301,7 +311,7 @@ async fn dispatch_request(
     callbacks: &Arc<AirPlayCallbacks>,
 ) -> RtspResponse {
     let path_base = req.path.split('?').next().unwrap_or(&req.path);
-    debug!(method = %req.method, path = %req.path, len = req.body.len(), "AirPlay RTSP request");
+    info!(method = %req.method, path = %req.path, len = req.body.len(), "AirPlay RTSP request");
 
     match (req.method.as_str(), path_base) {
         ("OPTIONS", _) => {

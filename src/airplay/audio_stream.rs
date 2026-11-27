@@ -23,12 +23,18 @@ pub struct AudioStreamListener {
 
 impl AudioStreamListener {
     pub async fn bind() -> Result<Self> {
-        let data_socket = UdpSocket::bind("0.0.0.0:0")
-            .await
-            .context("Failed to bind AirPlay audio data UDP socket")?;
-        let control_socket = UdpSocket::bind("0.0.0.0:0")
-            .await
-            .context("Failed to bind AirPlay audio control UDP socket")?;
+        let data_socket = match UdpSocket::bind("[::]:0").await {
+            Ok(s) => s,
+            Err(_) => UdpSocket::bind("0.0.0.0:0")
+                .await
+                .context("Failed to bind AirPlay audio data UDP socket")?,
+        };
+        let control_socket = match UdpSocket::bind("[::]:0").await {
+            Ok(s) => s,
+            Err(_) => UdpSocket::bind("0.0.0.0:0")
+                .await
+                .context("Failed to bind AirPlay audio control UDP socket")?,
+        };
         let data_port = data_socket.local_addr()?.port();
         let control_port = control_socket.local_addr()?.port();
         Ok(Self {
