@@ -105,6 +105,7 @@ struct SessionState {
     aes_iv: Option<[u8; 16]>,
     ntp_port: Option<u16>,
     stream_shutdown: watch::Sender<bool>,
+    audio_shutdown: Option<watch::Sender<bool>>,
 }
 
 impl SessionState {
@@ -117,6 +118,14 @@ impl SessionState {
             aes_iv: None,
             ntp_port: None,
             stream_shutdown,
+            audio_shutdown: None,
+        }
+    }
+
+    fn shutdown_streams(&mut self) {
+        let _ = self.stream_shutdown.send(true);
+        if let Some(audio_sd) = self.audio_shutdown.take() {
+            let _ = audio_sd.send(true);
         }
     }
 }
@@ -199,7 +208,7 @@ async fn handle_rtsp_connection(
         let req = tokio::select! {
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
-                    let _ = state.stream_shutdown.send(true);
+                    state.shutdown_streams();
                     return Ok(());
                 }
                 continue;
@@ -207,7 +216,7 @@ async fn handle_rtsp_connection(
             res = read_rtsp_request(&mut reader) => match res? {
                 Some(r) => r,
                 None => {
-                    let _ = state.stream_shutdown.send(true);
+                    state.shutdown_streams();
                     return Ok(());
                 }
             }
@@ -379,7 +388,7 @@ async fn dispatch_request(
         }
         ("SET_PARAMETER", _) | ("FLUSH", _) | ("POST", "/feedback") => RtspResponse::ok(),
         ("TEARDOWN", _) => {
-            let _ = state.stream_shutdown.send(true);
+            state.shutdown_streams();
             RtspResponse::ok()
         }
         _ => RtspResponse::ok(),
@@ -493,15 +502,19 @@ async fn handle_setup(
                 }
                 96 => {
                     let ct = dict.get("ct").and_then(plist_as_u64).unwrap_or(8) as u8;
+                    if let Some(prev_audio_sd) = state.audio_shutdown.take() {
+                        let _ = prev_audio_sd.send(true);
+                    }
                     match AudioStreamListener::bind().await {
                         Ok(listener) => {
                             let data_port = listener.data_port;
                             let control_port = listener.control_port;
                             let iv = state.aes_iv.unwrap_or([0u8; 16]);
                             let ring = Arc::clone(&callbacks.audio_ring);
-                            let sd = state.stream_shutdown.subscribe();
+                            let (audio_tx, audio_rx) = watch::channel(false);
+                            state.audio_shutdown = Some(audio_tx);
                             tokio::spawn(async move {
-                                listener.run(aes_key, iv, ct, ring, sd).await;
+                                listener.run(aes_key, iv, ct, ring, audio_rx).await;
                             });
                             let mut entry = plist::Dictionary::new();
                             entry.insert("type".into(), Value::Integer(96u64.into()));

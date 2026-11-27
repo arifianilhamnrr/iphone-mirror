@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::airplay::crypto::aes_cbc_decrypt_in_place;
 use crate::audio::ring_buffer::PcmRing;
@@ -71,6 +71,8 @@ impl AudioStreamListener {
         let mut data_buf = vec![0u8; 4096];
         let mut ctrl_buf = vec![0u8; 2048];
         let mut last_seq: Option<u16> = None;
+        let mut decoded_packets: u64 = 0;
+        let mut decode_errors: u32 = 0;
 
         loop {
             tokio::select! {
@@ -84,7 +86,7 @@ impl AudioStreamListener {
                         Ok(len) if len > 12 => {
                             let pkt = &mut data_buf[..len];
                             let seq = u16::from_be_bytes([pkt[2], pkt[3]]);
-                            if !is_newer_seq(seq, last_seq) {
+                            if !should_accept_seq(seq, last_seq) {
                                 continue;
                             }
                             last_seq = Some(seq);
@@ -94,6 +96,8 @@ impl AudioStreamListener {
                                 &aes_iv,
                                 decoder.as_mut(),
                                 &ring,
+                                &mut decoded_packets,
+                                &mut decode_errors,
                             );
                         }
                         Ok(_) => {}
@@ -111,7 +115,7 @@ impl AudioStreamListener {
                             if type_c == 0x56 && len > 16 {
                                 let pkt = &mut ctrl_buf[4..len];
                                 let seq = u16::from_be_bytes([pkt[2], pkt[3]]);
-                                if is_newer_seq(seq, last_seq) {
+                                if should_accept_seq(seq, last_seq) {
                                     last_seq = Some(seq);
                                     decode_and_push_rtp(
                                         pkt,
@@ -119,6 +123,8 @@ impl AudioStreamListener {
                                         &aes_iv,
                                         decoder.as_mut(),
                                         &ring,
+                                        &mut decoded_packets,
+                                        &mut decode_errors,
                                     );
                                 }
                             }
@@ -135,12 +141,12 @@ impl AudioStreamListener {
     }
 }
 
-fn is_newer_seq(seq: u16, last: Option<u16>) -> bool {
+fn should_accept_seq(seq: u16, last: Option<u16>) -> bool {
     match last {
         None => true,
         Some(prev) => {
             let diff = seq.wrapping_sub(prev);
-            diff != 0 && diff < 0x8000
+            diff != 0 && diff <= 0xFFC0
         }
     }
 }
@@ -151,6 +157,8 @@ fn decode_and_push_rtp(
     aes_iv: &[u8; 16],
     decoder: Option<&mut AacEldDecoder>,
     ring: &PcmRing,
+    decoded_packets: &mut u64,
+    decode_errors: &mut u32,
 ) {
     if packet.len() <= 12 {
         return;
@@ -168,6 +176,14 @@ fn decode_and_push_rtp(
     match dec.decode(payload) {
         Ok(pcm_bytes) => {
             if pcm_bytes.len() >= 4 {
+                *decoded_packets += 1;
+                if *decoded_packets == 1 || *decoded_packets % 500 == 0 {
+                    info!(
+                        packets = *decoded_packets,
+                        pcm_bytes = pcm_bytes.len(),
+                        "AirPlay audio playing"
+                    );
+                }
                 let samples: Vec<i16> = pcm_bytes
                     .chunks_exact(2)
                     .map(|c| i16::from_le_bytes([c[0], c[1]]))
@@ -176,7 +192,10 @@ fn decode_and_push_rtp(
             }
         }
         Err(err) => {
-            debug!("AirPlay AAC-ELD decode failed: {err}");
+            *decode_errors += 1;
+            if *decode_errors == 1 || *decode_errors % 100 == 0 {
+                warn!(decode_errors = *decode_errors, "AirPlay AAC-ELD decode failed: {err}");
+            }
         }
     }
 }
