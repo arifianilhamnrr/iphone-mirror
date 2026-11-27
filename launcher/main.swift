@@ -347,26 +347,30 @@ final class LauncherModel: ObservableObject {
     }
 
     func scan() async {
-        isScanning = true
-        defer { isScanning = false }
-        let process = Process()
-        let pipe = Pipe()
-        process.executableURL = backendURL
-        process.arguments = ["devices", "--json"]
-        process.standardOutput = pipe
-        process.standardError = Pipe()
+        let executableURL = backendURL
         do {
-            try process.run()
-            process.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            guard process.terminationStatus == 0 else {
-                throw NSError(domain: "iPhoneMirror", code: Int(process.terminationStatus), userInfo: nil)
-            }
-            devices = try JSONDecoder().decode([Device].self, from: data)
-                .sorted { lhs, rhs in
-                    if lhs.udid == rhs.udid { return lhs.connection_type == .usb }
-                    return lhs.udid < rhs.udid
+            let scanned: [Device] = try await Task.detached(priority: .utility) {
+                let process = Process()
+                let pipe = Pipe()
+                process.executableURL = executableURL
+                process.arguments = ["devices", "--json"]
+                process.standardOutput = pipe
+                process.standardError = Pipe()
+                try process.run()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                guard process.terminationStatus == 0 else {
+                    throw NSError(domain: "iPhoneMirror", code: Int(process.terminationStatus), userInfo: nil)
                 }
+                return try JSONDecoder().decode([Device].self, from: data)
+                    .sorted { lhs, rhs in
+                        if lhs.udid == rhs.udid { return lhs.connection_type == .usb }
+                        return lhs.udid < rhs.udid
+                    }
+            }.value
+            if scanned != devices {
+                devices = scanned
+            }
             error = nil
             if selectedID == nil || !filteredDevices.contains(where: { $0.id == selectedID }) {
                 selectedID = filteredDevices.first?.id
@@ -376,7 +380,9 @@ final class LauncherModel: ObservableObject {
                 connect()
             }
         } catch {
-            devices = []
+            if !devices.isEmpty {
+                devices = []
+            }
             if transport != "airplay" {
                 self.error = "Couldn’t scan for iPhones. Check that Apple Mobile Device services are running."
             }
@@ -507,7 +513,7 @@ struct WindowGlassConfigurator: NSViewRepresentable {
             window.titlebarAppearsTransparent = true
             window.titleVisibility = .hidden
             window.styleMask.insert(.fullSizeContentView)
-            window.isMovableByWindowBackground = true
+            window.isMovableByWindowBackground = false
             window.isOpaque = false
             window.backgroundColor = .clear
         }
@@ -675,7 +681,9 @@ struct GlassModeSelector: View {
                         RoundedRectangle(cornerRadius: 9, style: .continuous)
                             .strokeBorder(Color.white.opacity(isSelected ? 0.32 : 0.0), lineWidth: 1)
                     )
+                    .contentShape(Rectangle())
                 }
+                .contentShape(Rectangle())
                 .buttonStyle(.plain)
             }
         }
@@ -731,9 +739,6 @@ struct ContentView: View {
                         .font(.system(size: 14, weight: .bold))
                         .foregroundColor(.white)
                     Spacer()
-                    if model.isScanning {
-                        ProgressView().controlSize(.small)
-                    }
                     Button { Task { await model.scan() } } label: {
                         Image(systemName: "arrow.clockwise")
                             .font(.system(size: 12, weight: .semibold))
@@ -748,7 +753,6 @@ struct ContentView: View {
 
                 GlassModeSelector(selection: $model.transport) {
                     model.selectedID = model.filteredDevices.first?.id
-                    Task { await model.scan() }
                 }
 
                 if model.transport == "airplay" {
@@ -840,7 +844,7 @@ struct ContentView: View {
                             Circle()
                                 .fill(model.error == nil ? Color.green : Color.orange)
                                 .frame(width: 6, height: 6)
-                            Text(model.isScanning ? "Scanning…" : (model.transport == "airplay" ? "AirPlay ready" : "Discovery active"))
+                            Text(model.transport == "airplay" ? "AirPlay ready" : "Discovery active")
                         }
                         Text(AppInfo.label)
                             .foregroundColor(Color.white.opacity(0.42))
