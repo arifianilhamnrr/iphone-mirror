@@ -204,8 +204,7 @@ impl MetalRenderer {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let rotation =
-                DisplayRotation::from_shader_mode(self.rotation.load(Ordering::Relaxed));
+            let rotation = DisplayRotation::from_shader_mode(self.rotation.load(Ordering::Relaxed));
             if let Ok(mut state) = self.linux.lock() {
                 state.render_frame(frame, rotation)?;
             }
@@ -543,7 +542,13 @@ mod linux_impl {
             };
             let len = (self.width as usize) * (self.height as usize);
             let dst = unsafe { std::slice::from_raw_parts_mut(self.pixel_buf, len) };
-            render_nv12_to_xrgb(cpu, rotation, self.width as usize, self.height as usize, dst);
+            render_nv12_to_xrgb(
+                cpu,
+                rotation,
+                self.width as usize,
+                self.height as usize,
+                dst,
+            );
             unsafe {
                 (self.x_put_image)(
                     self.display,
@@ -637,14 +642,9 @@ mod linux_impl {
         shm: *mut c_void,
         wl_shm_pool_interface: *const c_void,
         wl_buffer_interface: *const c_void,
-        proxy_marshal_array:
-            unsafe extern "C" fn(*mut c_void, u32, *mut WlArgument),
-        proxy_marshal_array_constructor: unsafe extern "C" fn(
-            *mut c_void,
-            u32,
-            *mut WlArgument,
-            *const c_void,
-        ) -> *mut c_void,
+        proxy_marshal_array: unsafe extern "C" fn(*mut c_void, u32, *mut WlArgument),
+        proxy_marshal_array_constructor:
+            unsafe extern "C" fn(*mut c_void, u32, *mut WlArgument, *const c_void) -> *mut c_void,
         proxy_destroy: unsafe extern "C" fn(*mut c_void),
         display_flush: unsafe extern "C" fn(*mut c_void) -> c_int,
         fd: c_int,
@@ -659,7 +659,12 @@ mod linux_impl {
     unsafe impl Send for WaylandBackend {}
 
     impl WaylandBackend {
-        fn new(display: *mut c_void, surface: *mut c_void, width: u32, height: u32) -> Result<Self> {
+        fn new(
+            display: *mut c_void,
+            surface: *mut c_void,
+            width: u32,
+            height: u32,
+        ) -> Result<Self> {
             unsafe {
                 let lib = open_any_lib(&[b"libwayland-client.so.0\0", b"libwayland-client.so\0"])
                     .context("Failed to dynamically open libwayland-client.so.0")?;
@@ -668,8 +673,7 @@ mod linux_impl {
                 let wl_shm_interface: *const c_void = load_sym(lib, b"wl_shm_interface\0")?;
                 let wl_shm_pool_interface: *const c_void =
                     load_sym(lib, b"wl_shm_pool_interface\0")?;
-                let wl_buffer_interface: *const c_void =
-                    load_sym(lib, b"wl_buffer_interface\0")?;
+                let wl_buffer_interface: *const c_void = load_sym(lib, b"wl_buffer_interface\0")?;
 
                 let proxy_marshal_array: unsafe extern "C" fn(*mut c_void, u32, *mut WlArgument) =
                     load_sym(lib, b"wl_proxy_marshal_array\0")?;
@@ -678,8 +682,8 @@ mod linux_impl {
                     u32,
                     *mut WlArgument,
                     *const c_void,
-                ) -> *mut c_void =
-                    load_sym(lib, b"wl_proxy_marshal_array_constructor\0")?;
+                )
+                    -> *mut c_void = load_sym(lib, b"wl_proxy_marshal_array_constructor\0")?;
                 let proxy_add_listener: unsafe extern "C" fn(
                     *mut c_void,
                     *const c_void,
@@ -886,7 +890,13 @@ mod linux_impl {
             let dst = unsafe {
                 std::slice::from_raw_parts_mut(self.mmap_ptr.add(offset).cast::<u32>(), pixels)
             };
-            render_nv12_to_xrgb(cpu, rotation, self.width as usize, self.height as usize, dst);
+            render_nv12_to_xrgb(
+                cpu,
+                rotation,
+                self.width as usize,
+                self.height as usize,
+                dst,
+            );
 
             let buffer = self.buffers[self.slot];
             self.slot = 1 - self.slot;
@@ -994,7 +1004,11 @@ mod linux_impl {
             }
         }
 
-        pub fn render_frame(&mut self, frame: &DecodedFrame, rotation: DisplayRotation) -> Result<()> {
+        pub fn render_frame(
+            &mut self,
+            frame: &DecodedFrame,
+            rotation: DisplayRotation,
+        ) -> Result<()> {
             match &mut self.backend {
                 LinuxBackend::Wayland(w) => w.present(frame, rotation),
                 LinuxBackend::X11(x) => x.present(frame, rotation),

@@ -56,7 +56,10 @@ impl AudioStreamListener {
                 }
             },
             other => {
-                warn!(codec_type = other, "AirPlay audio codec other than AAC-ELD (ct=8) received; audio may be silent");
+                warn!(
+                    codec_type = other,
+                    "AirPlay audio codec other than AAC-ELD (ct=8) received; audio may be silent"
+                );
                 None
             }
         };
@@ -194,7 +197,10 @@ fn decode_and_push_rtp(
         Err(err) => {
             *decode_errors += 1;
             if *decode_errors == 1 || *decode_errors % 100 == 0 {
-                warn!(decode_errors = *decode_errors, "AirPlay AAC-ELD decode failed: {err}");
+                warn!(
+                    decode_errors = *decode_errors,
+                    "AirPlay AAC-ELD decode failed: {err}"
+                );
             }
         }
     }

@@ -282,7 +282,12 @@ impl HardwareDecoder {
                     }
                 })?;
 
-            info!(width, height, codec = codec_fmt, "Linux ffmpeg video decoder initialized");
+            info!(
+                width,
+                height,
+                codec = codec_fmt,
+                "Linux ffmpeg video decoder initialized"
+            );
             Ok(Self {
                 stdin: Some(stdin),
                 child,

@@ -119,8 +119,7 @@ impl PcmRing {
             *slot = 0;
         }
 
-        self.read_pos
-            .store(read + copy as u64, Ordering::Release);
+        self.read_pos.store(read + copy as u64, Ordering::Release);
         self.frames_read
             .fetch_add((copy / CHANNELS) as u64, Ordering::Relaxed);
         if copy < out_len {

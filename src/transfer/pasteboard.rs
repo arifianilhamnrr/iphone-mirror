@@ -5,8 +5,8 @@
 //! this implements the same `SET` verb with arbitrary UTIs.
 
 use idevice::{
-    IdeviceError, RsdService, RemoteXpcClient, ReadWrite,
     xpc::{Dictionary, XPCObject},
+    IdeviceError, ReadWrite, RemoteXpcClient, RsdService,
 };
 use std::borrow::Cow;
 
@@ -103,10 +103,7 @@ impl UrlPasteboard {
 
         let mut message = Dictionary::new();
         message.insert("command".into(), XPCObject::String("SET".into()));
-        message.insert(
-            "pasteboardName".into(),
-            XPCObject::String("general".into()),
-        );
+        message.insert("pasteboardName".into(), XPCObject::String("general".into()));
         message.insert("items".into(), XPCObject::Array(items));
         message.insert(
             "sourceMetadata".into(),
@@ -153,10 +150,7 @@ impl UrlPasteboard {
 
         let mut message = Dictionary::new();
         message.insert("command".into(), XPCObject::String("SET".into()));
-        message.insert(
-            "pasteboardName".into(),
-            XPCObject::String("general".into()),
-        );
+        message.insert("pasteboardName".into(), XPCObject::String("general".into()));
         message.insert("items".into(), XPCObject::Array(items));
         message.insert("sourceMetadata".into(), XPCObject::Null);
 

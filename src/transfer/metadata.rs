@@ -24,7 +24,7 @@ pub fn sanitize_file_name(name: &str) -> String {
     if out.is_empty() || out == "." || out == ".." {
         out = "file".to_string();
     }
-    while out.as_bytes().len() > MAX_NAME_BYTES {
+    while out.len() > MAX_NAME_BYTES {
         out.pop();
     }
     out
@@ -66,11 +66,7 @@ pub fn validate_paths(paths: &[PathBuf]) -> Result<Vec<ValidatedFile>> {
             });
         }
 
-        let base = sanitize_file_name(
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("file"),
-        );
+        let base = sanitize_file_name(path.file_name().and_then(|n| n.to_str()).unwrap_or("file"));
         let name = unique_name(&base, &mut used);
         result.push(ValidatedFile {
             path: path.clone(),
@@ -128,8 +124,9 @@ fn percent_encode_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for byte in path.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/'
-            | b':' => out.push(byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' | b':' => {
+                out.push(byte as char)
+            }
             _ => out.push_str(&format!("%{byte:02X}")),
         }
     }

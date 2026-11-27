@@ -105,7 +105,10 @@ impl DdiMounter {
             );
             let client: CryptexdClient<Box<dyn idevice::ReadWrite>> =
                 CryptexdClient::connect_rsd(provider, handshake).await?;
-            if let Err(error) = client.uninstall(&current.identifier, Some(&current.version)).await {
+            if let Err(error) = client
+                .uninstall(&current.identifier, Some(&current.version))
+                .await
+            {
                 warn!(%error, "Could not uninstall the previous DeveloperDiskImage; continuing");
             }
         }
@@ -215,9 +218,7 @@ async fn cached_build_is_stale(dir: &Path) -> bool {
         );
         return true;
     }
-    ASSET_FILES
-        .iter()
-        .any(|file| !dir.join(file).is_file())
+    ASSET_FILES.iter().any(|file| !dir.join(file).is_file())
 }
 
 async fn fetch_asset(dir: &Path, name: &str) -> Result<Vec<u8>> {

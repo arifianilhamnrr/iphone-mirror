@@ -5,15 +5,15 @@
 
 use super::{
     output::{AudioOutput, AudioOutputStats, AudioRestartReason, MuteState},
-    ring_buffer::{CHANNELS, PcmRing},
+    ring_buffer::{PcmRing, CHANNELS},
 };
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use std::{
     ffi::c_void,
     ptr,
     sync::{
-        Arc,
         atomic::{AtomicU64, Ordering},
+        Arc,
     },
 };
 
@@ -81,14 +81,7 @@ struct AudioBufferList {
 #[derive(Clone, Copy)]
 struct AURenderCallbackStruct {
     input_proc: Option<
-        extern "C" fn(
-            *mut c_void,
-            *mut u32,
-            *const c_void,
-            u32,
-            u32,
-            *mut AudioBufferList,
-        ) -> i32,
+        extern "C" fn(*mut c_void, *mut u32, *const c_void, u32, u32, *mut AudioBufferList) -> i32,
     >,
     input_proc_ref_con: *mut c_void,
 }
@@ -107,10 +100,14 @@ type AudioComponentInstance = *mut c_void;
 #[cfg(target_os = "macos")]
 #[link(name = "AudioToolbox", kind = "framework")]
 extern "C" {
-    fn AudioComponentFindNext(component: AudioComponent, desc: *const AudioComponentDescription)
-        -> AudioComponent;
-    fn AudioComponentInstanceNew(component: AudioComponent, instance: *mut AudioComponentInstance)
-        -> i32;
+    fn AudioComponentFindNext(
+        component: AudioComponent,
+        desc: *const AudioComponentDescription,
+    ) -> AudioComponent;
+    fn AudioComponentInstanceNew(
+        component: AudioComponent,
+        instance: *mut AudioComponentInstance,
+    ) -> i32;
     fn AudioUnitSetProperty(
         unit: AudioComponentInstance,
         property_id: u32,
@@ -172,9 +169,7 @@ extern "C" fn render_callback(
     let out = if buffer.data.is_null() {
         return 0;
     } else {
-        unsafe {
-            std::slice::from_raw_parts_mut(buffer.data as *mut i16, samples)
-        }
+        unsafe { std::slice::from_raw_parts_mut(buffer.data as *mut i16, samples) }
     };
 
     let copied = ctx.ring.read(out);
@@ -265,7 +260,11 @@ impl AudioUnitOutput {
                 &mut device as *mut u32 as *mut c_void,
             )
         };
-        if status == 0 { Some(device) } else { None }
+        if status == 0 {
+            Some(device)
+        } else {
+            None
+        }
     }
 
     fn create_unit(&mut self) -> Result<()> {
@@ -409,7 +408,9 @@ impl AudioOutput for AudioUnitOutput {
 
     fn restart(&mut self, reason: AudioRestartReason) -> Result<()> {
         self.generation.fetch_add(1, Ordering::Relaxed);
-        self.context.generation.store(self.generation.load(Ordering::Relaxed), Ordering::Release);
+        self.context
+            .generation
+            .store(self.generation.load(Ordering::Relaxed), Ordering::Release);
         self.destroy_unit();
         self.create_unit()?;
         let status = unsafe { AudioOutputUnitStart(self.unit) };

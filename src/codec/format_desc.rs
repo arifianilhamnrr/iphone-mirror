@@ -273,7 +273,7 @@ impl<'a> BitReader<'a> {
 
     fn read_se(&mut self) -> Option<i32> {
         let ue = self.read_ue()?;
-        let val = ((ue + 1) / 2) as i32;
+        let val = ue.div_ceil(2) as i32;
         Some(if ue % 2 == 0 { -val } else { val })
     }
 }
@@ -311,7 +311,11 @@ pub fn parse_h264_sps_dimensions(sps_nal: &[u8]) -> Option<(usize, usize)> {
                             let delta = br.read_se()?;
                             next_scale = (last_scale + delta + 256) % 256;
                         }
-                        last_scale = if next_scale == 0 { last_scale } else { next_scale };
+                        last_scale = if next_scale == 0 {
+                            last_scale
+                        } else {
+                            next_scale
+                        };
                     }
                 }
             }

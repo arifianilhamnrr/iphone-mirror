@@ -88,7 +88,7 @@ impl RtcpReportStats {
 
         let expected_interval = received_delta + self.interval_lost;
         self.fraction_lost = if expected_interval > 0 {
-            (((self.interval_lost as f32 / expected_interval as f32) * 256.0) as u8).min(255)
+            ((self.interval_lost as f32 / expected_interval as f32) * 256.0) as u8
         } else {
             0
         };
@@ -106,13 +106,19 @@ impl RtcpReportStats {
         if self.lsr != 0 {
             if let Some(arrival) = self.last_arrival {
                 let d = arrival.elapsed().as_secs_f64() * 65536.0;
-                self.dlsr = (d as u32).min(u32::MAX);
+                self.dlsr = d as u32;
             }
         }
     }
 
     pub fn extended_highest(&self) -> u32 {
         self.extended_max
+    }
+}
+
+impl Default for RtcpReportStats {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

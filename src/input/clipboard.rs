@@ -77,10 +77,9 @@ impl SystemClipboard {
         #[cfg(not(target_os = "macos"))]
         {
             let now = std::time::Instant::now();
-            if self
-                .last_poll
-                .is_some_and(|prev| now.duration_since(prev) < std::time::Duration::from_millis(1500))
-            {
+            if self.last_poll.is_some_and(|prev| {
+                now.duration_since(prev) < std::time::Duration::from_millis(1500)
+            }) {
                 return None;
             }
             self.last_poll = Some(now);
@@ -200,11 +199,7 @@ fn linux_read_text() -> Option<String> {
         ("xclip", &["-selection", "clipboard", "-o"][..]),
         ("xsel", &["--clipboard", "--output"][..]),
     ] {
-        if let Ok(out) = Command::new(bin)
-            .args(args)
-            .stderr(Stdio::null())
-            .output()
-        {
+        if let Ok(out) = Command::new(bin).args(args).stderr(Stdio::null()).output() {
             if out.status.success() {
                 let s = String::from_utf8_lossy(&out.stdout).into_owned();
                 if !s.is_empty() {
@@ -253,7 +248,9 @@ fn linux_write_bytes(mime: &str, bytes: &[u8]) -> Result<()> {
             }
         }
     }
-    bail!("No Linux clipboard utility found (install wl-clipboard for Wayland or xclip/xsel for X11)")
+    bail!(
+        "No Linux clipboard utility found (install wl-clipboard for Wayland or xclip/xsel for X11)"
+    )
 }
 
 impl Default for SystemClipboard {

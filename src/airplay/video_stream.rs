@@ -38,29 +38,25 @@ impl VideoStreamListener {
         frame_count: Arc<AtomicU64>,
         orientation_cb: Arc<dyn Fn(DisplayRotation) + Send + Sync>,
     ) {
-        loop {
-            match self.listener.accept().await {
-                Ok((stream, addr)) => {
-                    info!(%addr, port = self.port, "AirPlay video stream connected");
-                    let _ = stream.set_nodelay(true);
-                    if let Err(err) = handle_video_connection(
-                        stream,
-                        key,
-                        iv,
-                        &frame_tx,
-                        &frame_count,
-                        &orientation_cb,
-                    )
-                    .await
-                    {
-                        warn!("AirPlay video connection ended: {err}");
-                    }
-                    break;
+        match self.listener.accept().await {
+            Ok((stream, addr)) => {
+                info!(%addr, port = self.port, "AirPlay video stream connected");
+                let _ = stream.set_nodelay(true);
+                if let Err(err) = handle_video_connection(
+                    stream,
+                    key,
+                    iv,
+                    &frame_tx,
+                    &frame_count,
+                    &orientation_cb,
+                )
+                .await
+                {
+                    warn!("AirPlay video connection ended: {err}");
                 }
-                Err(err) => {
-                    warn!("AirPlay video accept error: {err}");
-                    break;
-                }
+            }
+            Err(err) => {
+                warn!("AirPlay video accept error: {err}");
             }
         }
     }
@@ -90,7 +86,8 @@ async fn handle_video_connection(
             return Err(err).context("Failed reading 128-byte AirPlay video header");
         }
 
-        let payload_size = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let payload_size =
+            u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
         let payload_type = header[4];
 
         // Cap at 32 MiB to prevent malformed headers from OOM'ing the receiver.
@@ -195,8 +192,7 @@ async fn handle_video_connection(
             other => {
                 debug!(
                     payload_type = other,
-                    payload_size,
-                    "Ignoring unknown AirPlay video packet type"
+                    payload_size, "Ignoring unknown AirPlay video packet type"
                 );
             }
         }

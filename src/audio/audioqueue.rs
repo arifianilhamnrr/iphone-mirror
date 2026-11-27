@@ -10,8 +10,8 @@ use super::{
 use anyhow::Result;
 use std::{
     sync::{
-        Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
     },
     thread::{self, JoinHandle},
     time::Duration,

@@ -66,7 +66,11 @@ impl RtspServer {
         self.identity.public_key_hex()
     }
 
-    pub async fn serve(self, callbacks: Arc<AirPlayCallbacks>, mut shutdown: watch::Receiver<bool>) {
+    pub async fn serve(
+        self,
+        callbacks: Arc<AirPlayCallbacks>,
+        mut shutdown: watch::Receiver<bool>,
+    ) {
         info!(port = self.port, "AirPlay RTSP server listening");
         loop {
             tokio::select! {
@@ -139,7 +143,9 @@ struct RtspRequest {
     body: Vec<u8>,
 }
 
-async fn read_rtsp_request(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Result<Option<RtspRequest>> {
+async fn read_rtsp_request(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+) -> Result<Option<RtspRequest>> {
     let mut request_line = String::new();
     let n = reader.read_line(&mut request_line).await?;
     if n == 0 {
@@ -280,7 +286,8 @@ impl RtspResponse {
     }
 
     fn with_body(mut self, content_type: &'static str, body: Vec<u8>) -> Self {
-        self.headers.push(("Content-Type", content_type.to_string()));
+        self.headers
+            .push(("Content-Type", content_type.to_string()));
         self.body = body;
         self
     }
@@ -313,12 +320,10 @@ async fn dispatch_request(
             );
             RtspResponse::ok().with_body("application/x-apple-binary-plist", bplist)
         }
-        ("POST", "/pair-setup") => {
-            RtspResponse::ok().with_body(
-                "application/octet-stream",
-                identity.public_key_bytes().to_vec(),
-            )
-        }
+        ("POST", "/pair-setup") => RtspResponse::ok().with_body(
+            "application/octet-stream",
+            identity.public_key_bytes().to_vec(),
+        ),
         ("POST", "/pair-verify") => {
             if req.body.len() < 4 {
                 return RtspResponse::bad_request();
@@ -334,9 +339,7 @@ async fn dispatch_request(
                     }
                 },
                 0 => match state.pair_verify.step2(&req.body) {
-                    Ok(()) => {
-                        RtspResponse::ok().with_body("application/octet-stream", Vec::new())
-                    }
+                    Ok(()) => RtspResponse::ok().with_body("application/octet-stream", Vec::new()),
                     Err(err) => {
                         warn!("pair-verify stage 2 failed: {err}");
                         RtspResponse::bad_request()
@@ -421,11 +424,13 @@ async fn handle_setup(
 
     let mut res_dict = plist::Dictionary::new();
 
-    if let (Some(Value::Data(ekey)), Some(Value::Data(eiv))) =
-        (root.get("ekey"), root.get("eiv"))
-    {
+    if let (Some(Value::Data(ekey)), Some(Value::Data(eiv))) = (root.get("ekey"), root.get("eiv")) {
         if eiv.len() != 16 || ekey.len() != 72 {
-            warn!(eiv = eiv.len(), ekey = ekey.len(), "Invalid SETUP ekey/eiv size");
+            warn!(
+                eiv = eiv.len(),
+                ekey = ekey.len(),
+                "Invalid SETUP ekey/eiv size"
+            );
             return RtspResponse::bad_request();
         }
         let fp_key = match state.fairplay.decrypt_key(ekey) {
@@ -441,24 +446,28 @@ async fn handle_setup(
         state.aes_key = Some(session_key);
         state.aes_iv = Some(iv);
 
-        let timing_rport = root
-            .get("timingPort")
-            .and_then(plist_as_u64)
-            .unwrap_or(0) as u16;
+        let timing_rport = root.get("timingPort").and_then(plist_as_u64).unwrap_or(0) as u16;
         let ntp_port = match state.ntp_port {
             Some(p) => p,
-            None => match spawn_ntp_client(peer_ip, timing_rport, state.stream_shutdown.subscribe()).await {
-                Ok(p) => {
-                    state.ntp_port = Some(p);
-                    p
+            None => {
+                match spawn_ntp_client(peer_ip, timing_rport, state.stream_shutdown.subscribe())
+                    .await
+                {
+                    Ok(p) => {
+                        state.ntp_port = Some(p);
+                        p
+                    }
+                    Err(err) => {
+                        warn!("Failed to bind AirPlay NTP timing socket: {err}");
+                        0
+                    }
                 }
-                Err(err) => {
-                    warn!("Failed to bind AirPlay NTP timing socket: {err}");
-                    0
-                }
-            },
+            }
         };
-        res_dict.insert("timingPort".into(), Value::Integer((ntp_port as u64).into()));
+        res_dict.insert(
+            "timingPort".into(),
+            Value::Integer((ntp_port as u64).into()),
+        );
         res_dict.insert("eventPort".into(), Value::Integer(0u64.into()));
     }
 
@@ -527,7 +536,10 @@ async fn handle_setup(
                                 Value::Integer((control_port as u64).into()),
                             );
                             res_streams.push(Value::Dictionary(entry));
-                            info!(data_port, control_port, ct, "AirPlay audio stream listening");
+                            info!(
+                                data_port,
+                                control_port, ct, "AirPlay audio stream listening"
+                            );
                         }
                         Err(err) => {
                             warn!("Failed to bind AirPlay audio listener: {err}");
@@ -535,7 +547,10 @@ async fn handle_setup(
                     }
                 }
                 other => {
-                    debug!(stream_type = other, "Ignoring unsupported AirPlay stream type");
+                    debug!(
+                        stream_type = other,
+                        "Ignoring unsupported AirPlay stream type"
+                    );
                 }
             }
         }
@@ -565,7 +580,11 @@ async fn spawn_ntp_client(
     timing_rport: u16,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<u16> {
-    let bind_addr = if peer_ip.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let bind_addr = if peer_ip.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
     let sock = UdpSocket::bind(bind_addr).await?;
     let port = sock.local_addr()?.port();
     let remote = if timing_rport > 0 {
@@ -660,8 +679,14 @@ pub fn build_info_plist(name: &str, device_id: &str, pk: &[u8; 32]) -> Vec<u8> {
 
     let mut fmt0 = plist::Dictionary::new();
     fmt0.insert("type".into(), Value::Integer(100u64.into()));
-    fmt0.insert("audioInputFormats".into(), Value::Integer(0x3fffffcu64.into()));
-    fmt0.insert("audioOutputFormats".into(), Value::Integer(0x3fffffcu64.into()));
+    fmt0.insert(
+        "audioInputFormats".into(),
+        Value::Integer(0x3fffffcu64.into()),
+    );
+    fmt0.insert(
+        "audioOutputFormats".into(),
+        Value::Integer(0x3fffffcu64.into()),
+    );
     let mut fmt1 = fmt0.clone();
     fmt1.insert("type".into(), Value::Integer(101u64.into()));
     dict.insert(
@@ -685,7 +710,10 @@ pub fn build_info_plist(name: &str, device_id: &str, pk: &[u8; 32]) -> Vec<u8> {
     disp.insert("maxFPS".into(), Value::Integer(60u64.into()));
     disp.insert("overscanned".into(), Value::Boolean(false));
     disp.insert("features".into(), Value::Integer(14u64.into()));
-    dict.insert("displays".into(), Value::Array(vec![Value::Dictionary(disp)]));
+    dict.insert(
+        "displays".into(),
+        Value::Array(vec![Value::Dictionary(disp)]),
+    );
 
     let mut out = Vec::new();
     Value::Dictionary(dict)
@@ -710,8 +738,14 @@ mod tests {
         let info = build_info_plist("iPhone Mirror", "4A:11:22:33:44:55", &[0x55u8; 32]);
         let parsed = Value::from_reader(Cursor::new(info)).unwrap();
         let dict = parsed.as_dictionary().unwrap();
-        assert_eq!(dict.get("model").and_then(|v| v.as_string()), Some("AppleTV3,2"));
-        assert_eq!(dict.get("name").and_then(|v| v.as_string()), Some("iPhone Mirror"));
+        assert_eq!(
+            dict.get("model").and_then(|v| v.as_string()),
+            Some("AppleTV3,2")
+        );
+        assert_eq!(
+            dict.get("name").and_then(|v| v.as_string()),
+            Some("iPhone Mirror")
+        );
     }
 
     #[test]

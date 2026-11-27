@@ -1,7 +1,7 @@
 // language: Rust, file: src/audio/mod.rs, target: macOS AudioToolbox & Linux PipeWire/Pulse/ALSA
+pub mod audioqueue;
 #[cfg(target_os = "macos")]
 pub mod audiounit;
-pub mod audioqueue;
 pub mod jitter;
 pub mod output;
 pub mod reorder;
@@ -903,10 +903,10 @@ fn pcm_format_with_rate(sample_rate: f64) -> AudioStreamBasicDescription {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::{
-        AacEldDecoder, AudioBuffer, AudioBufferList, AudioConverterDispose,
-        AudioConverterFillComplexBuffer, AudioConverterNew, AudioConverterRef, AudioPlayer,
-        AudioStreamBasicDescription, AudioStreamPacketDescription, CHANNELS, FRAMES_PER_PACKET,
-        PCM_BYTES, fourcc, pcm_format_with_rate,
+        fourcc, pcm_format_with_rate, AacEldDecoder, AudioBuffer, AudioBufferList,
+        AudioConverterDispose, AudioConverterFillComplexBuffer, AudioConverterNew,
+        AudioConverterRef, AudioPlayer, AudioStreamBasicDescription, AudioStreamPacketDescription,
+        CHANNELS, FRAMES_PER_PACKET, PCM_BYTES,
     };
     use std::{
         ffi::c_void,
@@ -996,8 +996,7 @@ mod tests {
 
     #[test]
     fn audio_queue_can_play_silence_then_resume_pcm() {
-        let mut player =
-            AudioPlayer::new(Arc::new(AtomicU64::new(0))).expect("create AudioQueue");
+        let mut player = AudioPlayer::new(Arc::new(AtomicU64::new(0))).expect("create AudioQueue");
         let silence = vec![0_u8; PCM_BYTES];
         player.play(&silence).expect("initial enqueue");
         player.play_silence().expect("software-muted enqueue");

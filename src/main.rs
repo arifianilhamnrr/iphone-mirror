@@ -12,12 +12,12 @@ use idevice::{
 use iphone_mirror_rs::{
     airplay::AirPlayReceiver,
     audio::{
-        AacEldDecoder,
         jitter::AudioJitter,
         output::{
-            AudioOutput, AudioRestartReason, AudioTelemetry, create_output, diagnostics_enabled,
+            create_output, diagnostics_enabled, AudioOutput, AudioRestartReason, AudioTelemetry,
         },
         reorder::{AudioPacket, AudioReorder, ReorderedAudio},
+        AacEldDecoder,
     },
     codec::{
         decoder::{DecodedFrame, HardwareDecoder},
@@ -55,10 +55,18 @@ use tracing::{debug, info, warn};
 enum Command {
     Mirror,
     Airplay,
-    Devices { json: bool },
-    Diagnose { udid: Option<String> },
-    Pair { udid: Option<String> },
-    ProbeFiles { udid: Option<String> },
+    Devices {
+        json: bool,
+    },
+    Diagnose {
+        udid: Option<String>,
+    },
+    Pair {
+        udid: Option<String>,
+    },
+    ProbeFiles {
+        udid: Option<String>,
+    },
     SendFiles {
         udid: Option<String>,
         paths: Vec<std::path::PathBuf>,
@@ -304,11 +312,7 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                         file_index,
                         file_count,
                     } => {
-                        let percent = if total == 0 {
-                            100
-                        } else {
-                            (sent * 100 / total).min(100)
-                        };
+                        let percent = (sent * 100).checked_div(total).unwrap_or(100).min(100);
                         self.transfer_status = Some(format!(
                             "Sending {name} ({percent}%) — {file_index}/{file_count}"
                         ));
@@ -320,9 +324,8 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                         info!(files, "File URLs published on iPhone pasteboard");
                     }
                     Completed { files } => {
-                        self.transfer_status = Some(format!(
-                            "Sent {files} file(s) — paste on iPhone (⌘V)"
-                        ));
+                        self.transfer_status =
+                            Some(format!("Sent {files} file(s) — paste on iPhone (⌘V)"));
                     }
                     Failed { name, message } => {
                         warn!(?name, %message, "File transfer failed");
@@ -469,7 +472,8 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                             // here would read as a tap when the fingers lift.
                             if matches!(
                                 phase,
-                                winit::event::TouchPhase::Ended | winit::event::TouchPhase::Cancelled
+                                winit::event::TouchPhase::Ended
+                                    | winit::event::TouchPhase::Cancelled
                             ) {
                                 self.end_scroll();
                             }
@@ -498,9 +502,7 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                             )
                         })
                         .unwrap_or((100.0, 100.0));
-                    let (dx, dy) = self
-                        .rotation
-                        .rotate_delta_f64(ax * scale.0, ay * scale.1);
+                    let (dx, dy) = self.rotation.rotate_delta_f64(ax * scale.0, ay * scale.1);
                     let _ = self.input_tx.send(InputCommand::ScrollMove(
                         dx.round() as i32,
                         dy.round() as i32,
@@ -521,8 +523,7 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
             winit::event::WindowEvent::KeyboardInput { event, .. } => {
                 if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
                     match code {
-                        winit::keyboard::KeyCode::ArrowUp
-                        | winit::keyboard::KeyCode::ArrowDown => {
+                        winit::keyboard::KeyCode::ArrowUp | winit::keyboard::KeyCode::ArrowDown => {
                             match event.state {
                                 winit::event::ElementState::Pressed => {
                                     let direction = if code == winit::keyboard::KeyCode::ArrowUp {
@@ -537,8 +538,7 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                             return;
                         }
                         winit::keyboard::KeyCode::Escape => {
-                            if event.state == winit::event::ElementState::Pressed && !event.repeat
-                            {
+                            if event.state == winit::event::ElementState::Pressed && !event.repeat {
                                 self.end_scroll();
                                 let _ = self
                                     .input_tx
@@ -675,10 +675,8 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
                 // winit sends one event per file; batch a multi-file drop.
                 self.drop_deadline =
                     Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
-                self.transfer_status = Some(format!(
-                    "Preparing {} file(s)…",
-                    self.drop_candidates.len()
-                ));
+                self.transfer_status =
+                    Some(format!("Preparing {} file(s)…", self.drop_candidates.len()));
                 self.update_window_title();
             }
             _ => {}
@@ -690,10 +688,7 @@ impl winit::application::ApplicationHandler<UiEvent> for MirrorApp {
         if self.scroll_active && self.scroll_deadline.is_some_and(|deadline| now >= deadline) {
             self.end_scroll();
         }
-        if self
-            .drop_deadline
-            .is_some_and(|deadline| now >= deadline)
-        {
+        if self.drop_deadline.is_some_and(|deadline| now >= deadline) {
             self.drop_deadline = None;
             let paths = std::mem::take(&mut self.drop_candidates);
             if !paths.is_empty() {
@@ -860,13 +855,14 @@ impl MirrorApp {
             renderer.set_rotation(rotation);
         }
         let landscape = rotation.is_landscape()
-            || self.frame_size.is_some_and(|(width, height)| width > height);
+            || self
+                .frame_size
+                .is_some_and(|(width, height)| width > height);
         if !self.fullscreen && self.frame_is_landscape != Some(landscape) {
             self.frame_is_landscape = Some(landscape);
             if let Some(window) = &self.window {
                 let current = window.inner_size();
-                let (width, height) =
-                    rotated_window_size(current.width, current.height, landscape);
+                let (width, height) = rotated_window_size(current.width, current.height, landscape);
                 let target = winit::dpi::PhysicalSize::new(width, height);
                 let _ = window.request_inner_size(target);
                 info!(
@@ -1136,7 +1132,7 @@ end run
                 _ => break,
             }
         }
-        return save_settings(settings);
+        save_settings(settings)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1487,7 +1483,9 @@ async fn list_devices(json: bool) -> Result<()> {
             connection_type: match device.connection_type {
                 iphone_mirror_rs::transport::device_scanner::ConnectionType::Usb => "usb",
                 iphone_mirror_rs::transport::device_scanner::ConnectionType::Network => "network",
-                iphone_mirror_rs::transport::device_scanner::ConnectionType::Unknown(_) => "unknown",
+                iphone_mirror_rs::transport::device_scanner::ConnectionType::Unknown(_) => {
+                    "unknown"
+                }
             },
             device_id: device.device_id,
             host: None,
@@ -1540,10 +1538,9 @@ async fn list_devices(json: bool) -> Result<()> {
 
     for device in devices {
         match (device.host, device.port) {
-            (Some(host), Some(port)) => println!(
-                "{}\t{}\t{host}:{port}",
-                device.udid, device.connection_type
-            ),
+            (Some(host), Some(port)) => {
+                println!("{}\t{}\t{host}:{port}", device.udid, device.connection_type)
+            }
             _ => println!(
                 "{}\t{}\tdevice-id={}",
                 device.udid, device.connection_type, device.device_id
@@ -1598,7 +1595,10 @@ async fn probe_files(udid: Option<&str>) -> Result<()> {
         TunnelSource::Usb(usb_device.as_ref().expect("USB device selected"))
     };
 
-    let mut tunnel = source.connect().await.context("CoreDevice/RSD connect failed")?;
+    let mut tunnel = source
+        .connect()
+        .await
+        .context("CoreDevice/RSD connect failed")?;
     let mut afc = AfcTransfer::connect(&mut tunnel.adapter, &mut tunnel.handshake)
         .await
         .context("AFC file service is unavailable on this device")?;
@@ -1619,7 +1619,10 @@ async fn probe_files(udid: Option<&str>) -> Result<()> {
         .await
         .context("Probe upload failed")?;
 
-    let downloaded = afc.read_file(&remote).await.context("Probe readback failed")?;
+    let downloaded = afc
+        .read_file(&remote)
+        .await
+        .context("Probe readback failed")?;
     anyhow::ensure!(downloaded == payload, "probe file checksum mismatch");
     println!("Upload verified: {remote} ({} bytes)", downloaded.len());
 
@@ -1628,11 +1631,13 @@ async fn probe_files(udid: Option<&str>) -> Result<()> {
         .await
         .context("Pasteboard service is unavailable")?;
     pasteboard
-        .set_file_urls(&[url.clone()])
+        .set_file_urls(std::slice::from_ref(&url))
         .await
         .context("Could not publish file URL on the device pasteboard")?;
     println!("Published on iPhone pasteboard: {url}");
-    println!("Open Files or Notes on the iPhone and paste to check whether the file URL is accepted.");
+    println!(
+        "Open Files or Notes on the iPhone and paste to check whether the file URL is accepted."
+    );
 
     afc.remove_file(&remote).await.ok();
     tokio::fs::remove_file(&local).await.ok();
@@ -1646,11 +1651,14 @@ async fn send_files(udid: Option<&str>, paths: Vec<std::path::PathBuf>) -> Resul
 
     let mut wifi_device = wifi::endpoint_from_env();
     if wifi_device.is_none() {
-        wifi_device = wifi::WifiDiscovery::discover().await.ok().and_then(|devices| {
-            devices
-                .into_iter()
-                .find(|device| udid.is_none() || device.identifier == udid.unwrap_or_default())
-        });
+        wifi_device = wifi::WifiDiscovery::discover()
+            .await
+            .ok()
+            .and_then(|devices| {
+                devices
+                    .into_iter()
+                    .find(|device| udid.is_none() || device.identifier == udid.unwrap_or_default())
+            });
     }
     let usb_device = if wifi_device.is_none() {
         Some(DeviceScanner::select_device(udid).await?)
@@ -1663,7 +1671,10 @@ async fn send_files(udid: Option<&str>, paths: Vec<std::path::PathBuf>) -> Resul
         TunnelSource::Usb(usb_device.as_ref().expect("USB device selected"))
     };
 
-    let mut tunnel = source.connect().await.context("CoreDevice/RSD connect failed")?;
+    let mut tunnel = source
+        .connect()
+        .await
+        .context("CoreDevice/RSD connect failed")?;
     let afc = AfcTransfer::connect(&mut tunnel.adapter, &mut tunnel.handshake)
         .await
         .context("AFC file service is unavailable")?;
@@ -1686,13 +1697,15 @@ async fn send_files(udid: Option<&str>, paths: Vec<std::path::PathBuf>) -> Resul
                 file_index,
                 file_count,
             } => {
-                let percent = if total == 0 { 100 } else { sent * 100 / total };
+                let percent = (sent * 100).checked_div(total).unwrap_or(100);
                 println!("  [{file_index}/{file_count}] {name}: {percent}%");
             }
             TransferEvent::FileStaged { name, url, .. } => {
                 println!("  Staged {name}: {url}");
             }
-            TransferEvent::Published { files } => println!("Published {files} file URL(s) on iPhone"),
+            TransferEvent::Published { files } => {
+                println!("Published {files} file URL(s) on iPhone")
+            }
             TransferEvent::Completed { files } => {
                 println!("Done: {files} file(s) sent");
                 return Ok(());
@@ -1721,7 +1734,10 @@ async fn diagnose(udid: Option<&str>) -> Result<()> {
         TunnelSource::Usb(device)
     };
 
-    let tunnel = source.connect().await.context("CoreDevice/RSD diagnostics failed")?;
+    let tunnel = source
+        .connect()
+        .await
+        .context("CoreDevice/RSD diagnostics failed")?;
 
     println!("RSD: connected ({} services)", tunnel.services.len());
     println!(
@@ -1867,7 +1883,10 @@ async fn connect_tunnel_with_ddi(source: &TunnelSource<'_>) -> Result<RsdTunnel>
             info!(attempt, "Display service available after DDI install");
             return Ok(tunnel);
         }
-        warn!(attempt, "Display service still absent; waiting for DDI daemons");
+        warn!(
+            attempt,
+            "Display service still absent; waiting for DDI daemons"
+        );
     }
 
     anyhow::bail!(
@@ -2023,34 +2042,37 @@ async fn run_mirror() -> Result<()> {
     // File-transfer pipeline. AFC and the pasteboard writer are independent
     // tunnel connections, so the media task can keep owning the main tunnel.
     let (paste_tx, mut paste_rx) = tokio::sync::mpsc::unbounded_channel();
-    let transfer_command_tx =
-        match AfcTransfer::connect(&mut tunnel.adapter, &mut tunnel.handshake).await {
-            Ok(afc) => {
-                match TransferManager::spawn(afc, &mut tunnel.adapter, &mut tunnel.handshake, paste_tx).await {
-                    Ok(mut manager) => {
-                        let tx = manager.sender();
-                        let transfer_proxy = proxy.clone();
-                        tokio::spawn(async move {
-                            while let Some(event) = manager.next_event().await {
-                                if transfer_proxy.send_event(UiEvent::Transfer(event)).is_err() {
-                                    break;
-                                }
+    let transfer_command_tx = match AfcTransfer::connect(&mut tunnel.adapter, &mut tunnel.handshake)
+        .await
+    {
+        Ok(afc) => {
+            match TransferManager::spawn(afc, &mut tunnel.adapter, &mut tunnel.handshake, paste_tx)
+                .await
+            {
+                Ok(mut manager) => {
+                    let tx = manager.sender();
+                    let transfer_proxy = proxy.clone();
+                    tokio::spawn(async move {
+                        while let Some(event) = manager.next_event().await {
+                            if transfer_proxy.send_event(UiEvent::Transfer(event)).is_err() {
+                                break;
                             }
-                        });
-                        info!("File transfer ready");
-                        Some(tx)
-                    }
-                    Err(error) => {
-                        warn!(%error, "Could not initialize the file transfer manager");
-                        None
-                    }
+                        }
+                    });
+                    info!("File transfer ready");
+                    Some(tx)
+                }
+                Err(error) => {
+                    warn!(%error, "Could not initialize the file transfer manager");
+                    None
                 }
             }
-            Err(error) => {
-                warn!(%error, "AFC file service unavailable; drag-and-drop disabled");
-                None
-            }
-        };
+        }
+        Err(error) => {
+            warn!(%error, "AFC file service unavailable; drag-and-drop disabled");
+            None
+        }
+    };
 
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel(3);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -2891,11 +2913,9 @@ async fn connect_optional_hid_tunnel() -> Result<RsdTunnel> {
         return TunnelSource::Wifi(&wifi_device).connect().await;
     }
     let udid = env::var("IPHONE_MIRROR_UDID").ok();
-    let device = DeviceScanner::select_device_with_transport(
-        udid.as_deref(),
-        TransportPreference::Auto,
-    )
-    .await?;
+    let device =
+        DeviceScanner::select_device_with_transport(udid.as_deref(), TransportPreference::Auto)
+            .await?;
     TunnelSource::Usb(&device).connect().await
 }
 
@@ -2915,12 +2935,24 @@ async fn run_airplay_hybrid_hid(
         Ok(Ok(t)) => t,
         Ok(Err(err)) => {
             info!("AirPlay running in view + audio mode (no paired CoreDevice HID: {err})");
-            drain_airplay_inputs(&mut input_rx, &mut button_rx, &mut clipboard_rx, &mut shutdown_rx).await;
+            drain_airplay_inputs(
+                &mut input_rx,
+                &mut button_rx,
+                &mut clipboard_rx,
+                &mut shutdown_rx,
+            )
+            .await;
             return;
         }
         Err(_) => {
             info!("AirPlay running in view + audio mode (HID tunnel timed out)");
-            drain_airplay_inputs(&mut input_rx, &mut button_rx, &mut clipboard_rx, &mut shutdown_rx).await;
+            drain_airplay_inputs(
+                &mut input_rx,
+                &mut button_rx,
+                &mut clipboard_rx,
+                &mut shutdown_rx,
+            )
+            .await;
             return;
         }
     };
@@ -2941,7 +2973,13 @@ async fn run_airplay_hybrid_hid(
     .await
     else {
         warn!("Hybrid HID unavailable over AirPlay; falling back to view + audio mode");
-        drain_airplay_inputs(&mut input_rx, &mut button_rx, &mut clipboard_rx, &mut shutdown_rx).await;
+        drain_airplay_inputs(
+            &mut input_rx,
+            &mut button_rx,
+            &mut clipboard_rx,
+            &mut shutdown_rx,
+        )
+        .await;
         return;
     };
 
@@ -2952,7 +2990,13 @@ async fn run_airplay_hybrid_hid(
     .await
     else {
         warn!("Hybrid keyboard unavailable over AirPlay; falling back to view + audio mode");
-        drain_airplay_inputs(&mut input_rx, &mut button_rx, &mut clipboard_rx, &mut shutdown_rx).await;
+        drain_airplay_inputs(
+            &mut input_rx,
+            &mut button_rx,
+            &mut clipboard_rx,
+            &mut shutdown_rx,
+        )
+        .await;
         return;
     };
 
@@ -3090,7 +3134,10 @@ async fn run_airplay_mirror(settings: AppSettings) -> Result<()> {
     let (mut audio_output, audio_ring, audio_mute) = create_output(14_400);
     audio_output.prepare()?;
     audio_output.start()?;
-    info!(backend = audio_output.backend_name(), "AirPlay audio output started");
+    info!(
+        backend = audio_output.backend_name(),
+        "AirPlay audio output started"
+    );
 
     let event_loop = winit::event_loop::EventLoop::<UiEvent>::with_user_event()
         .build()
@@ -3098,11 +3145,10 @@ async fn run_airplay_mirror(settings: AppSettings) -> Result<()> {
     let proxy = event_loop.create_proxy();
 
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel(4);
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
     let (button_tx, button_rx) = tokio::sync::mpsc::unbounded_channel::<HardwareButton>();
-    let (clipboard_tx, clipboard_rx) =
-        tokio::sync::mpsc::unbounded_channel::<ClipboardContent>();
+    let (clipboard_tx, clipboard_rx) = tokio::sync::mpsc::unbounded_channel::<ClipboardContent>();
     let audio_muted = Arc::new(AtomicBool::new(false));
     let decoded_frames = Arc::new(AtomicU64::new(0));
 
@@ -3249,8 +3295,8 @@ async fn run_airplay_mirror(settings: AppSettings) -> Result<()> {
         .run_app(&mut app)
         .context("macOS window event loop failed");
     airplay.stop();
-    let _ = audio_output;
-    let _ = shutdown_rx.changed();
+    drop(audio_output);
+    drop(shutdown_rx);
     loop_result?;
     if let Some(error) = app.stream_error {
         anyhow::bail!("AirPlay mirror session failed: {error}");

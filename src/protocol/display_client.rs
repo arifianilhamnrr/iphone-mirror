@@ -74,7 +74,12 @@ impl DisplayClient {
         client: &mut DisplayServiceClient<Box<dyn ReadWrite>>,
         tunnel: &mut RsdTunnel,
         display_id: i64,
-    ) -> Result<(UdpSocketHandle, Option<RtcpSession>, UdpSocketHandle, Option<RtcpSession>)> {
+    ) -> Result<(
+        UdpSocketHandle,
+        Option<RtcpSession>,
+        UdpSocketHandle,
+        Option<RtcpSession>,
+    )> {
         let audio_udp = tunnel
             .adapter
             .bind_udp(0)
@@ -144,7 +149,9 @@ impl DisplayClient {
         dump_answer("video", &video_answer);
         let video_session = rtcp_session_from_answer(&video_answer);
         if video_session.is_none() {
-            tracing::warn!("Video streamConfig is missing SSRC/RTCP fields; loss recovery disabled");
+            tracing::warn!(
+                "Video streamConfig is missing SSRC/RTCP fields; loss recovery disabled"
+            );
         }
 
         info!(
@@ -185,18 +192,12 @@ impl DisplayClient {
         packet
     }
 
-    pub fn audio_rtcp_report(
-        &self,
-        stats: &super::rtcp_stats::RtcpReportStats,
-    ) -> Option<Vec<u8>> {
+    pub fn audio_rtcp_report(&self, stats: &super::rtcp_stats::RtcpReportStats) -> Option<Vec<u8>> {
         self.audio_session
             .map(|session| Self::receiver_report(&session, stats.extended_highest(), stats))
     }
 
-    pub fn video_rtcp_report(
-        &self,
-        stats: &super::rtcp_stats::RtcpReportStats,
-    ) -> Option<Vec<u8>> {
+    pub fn video_rtcp_report(&self, stats: &super::rtcp_stats::RtcpReportStats) -> Option<Vec<u8>> {
         self.video_session
             .map(|session| Self::receiver_report(&session, stats.extended_highest(), stats))
     }

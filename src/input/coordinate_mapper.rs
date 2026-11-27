@@ -180,11 +180,12 @@ impl CoordinateMapper {
         x: f64,
         y: f64,
     ) -> Option<(f32, f32)> {
-        let (content_width, content_height) = if rotation.is_landscape() && frame_width < frame_height {
-            (frame_height, frame_width)
-        } else {
-            (frame_width, frame_height)
-        };
+        let (content_width, content_height) =
+            if rotation.is_landscape() && frame_width < frame_height {
+                (frame_height, frame_width)
+            } else {
+                (frame_width, frame_height)
+            };
         let (u, v) = Self::map_aspect_fit(
             window_width,
             window_height,

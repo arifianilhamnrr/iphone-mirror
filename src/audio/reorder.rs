@@ -62,8 +62,8 @@ impl AudioReorder {
                 return;
             }
         }
-        if !self.pending.contains_key(&seq) {
-            self.pending.insert(seq, packet);
+        if let std::collections::btree_map::Entry::Vacant(entry) = self.pending.entry(seq) {
+            entry.insert(packet);
             if self.first_pending.is_none() {
                 self.first_pending = Some(Instant::now());
             }
@@ -89,8 +89,7 @@ impl AudioReorder {
 
         // If a gap remains and the oldest buffered packet has waited long
         // enough, emit silence for the missing sequence and continue draining.
-        loop {
-            let Some(&oldest) = self.pending.keys().next() else { break };
+        while let Some(&oldest) = self.pending.keys().next() {
             if oldest == next {
                 break;
             }
@@ -144,7 +143,11 @@ mod tests {
     use super::*;
 
     fn pkt(seq: u32) -> AudioPacket {
-        AudioPacket { sequence: seq, timestamp: seq * 960, payload: vec![seq as u8] }
+        AudioPacket {
+            sequence: seq,
+            timestamp: seq * 960,
+            payload: vec![seq as u8],
+        }
     }
 
     #[test]
@@ -153,7 +156,10 @@ mod tests {
         r.push(pkt(10));
         let out = r.pop_ready();
         assert_eq!(out.len(), 1);
-        match &out[0] { ReorderedAudio::Packet(p) => assert_eq!(p.sequence, 10), _ => panic!() }
+        match &out[0] {
+            ReorderedAudio::Packet(p) => assert_eq!(p.sequence, 10),
+            _ => panic!(),
+        }
     }
 
     #[test]
@@ -163,8 +169,14 @@ mod tests {
         r.push(pkt(10)); // 10 arrives after 11 but before timeout
         let out = r.pop_ready();
         assert_eq!(out.len(), 2);
-        match &out[0] { ReorderedAudio::Packet(p) => assert_eq!(p.sequence, 10), _ => panic!() }
-        match &out[1] { ReorderedAudio::Packet(p) => assert_eq!(p.sequence, 11), _ => panic!() }
+        match &out[0] {
+            ReorderedAudio::Packet(p) => assert_eq!(p.sequence, 10),
+            _ => panic!(),
+        }
+        match &out[1] {
+            ReorderedAudio::Packet(p) => assert_eq!(p.sequence, 11),
+            _ => panic!(),
+        }
     }
 
     #[test]
@@ -177,7 +189,10 @@ mod tests {
         let out = r.pop_ready();
         assert_eq!(out.len(), 2);
         assert!(matches!(out[0], ReorderedAudio::Silence));
-        match &out[1] { ReorderedAudio::Packet(p) => assert_eq!(p.sequence, 12), _ => panic!() }
+        match &out[1] {
+            ReorderedAudio::Packet(p) => assert_eq!(p.sequence, 12),
+            _ => panic!(),
+        }
     }
 
     #[test]
@@ -188,7 +203,6 @@ mod tests {
         assert_eq!(r.stats().buffered, 1);
     }
 
-
     #[test]
     fn accepts_sequences_near_zero() {
         let mut r = AudioReorder::new(8, Duration::from_millis(20));
@@ -198,7 +212,10 @@ mod tests {
         r.push(pkt(2));
         let out = r.pop_ready();
         assert_eq!(out.len(), 1);
-        match &out[0] { ReorderedAudio::Packet(p) => assert_eq!(p.sequence, 2), _ => panic!() }
+        match &out[0] {
+            ReorderedAudio::Packet(p) => assert_eq!(p.sequence, 2),
+            _ => panic!(),
+        }
     }
 
     #[test]
@@ -212,7 +229,10 @@ mod tests {
         let out = r.pop_ready();
         assert_eq!(out.len(), 20); // 19 silence + 1 packet
         assert!(matches!(out[0], ReorderedAudio::Silence));
-        match out.last().unwrap() { ReorderedAudio::Packet(p) => assert_eq!(p.sequence, 120), _ => panic!() }
+        match out.last().unwrap() {
+            ReorderedAudio::Packet(p) => assert_eq!(p.sequence, 120),
+            _ => panic!(),
+        }
     }
     #[test]
     fn huge_or_backward_gap_resyncs_without_oom() {

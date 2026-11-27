@@ -225,8 +225,14 @@ fn test_rotated_landscape_coordinate_and_delta_mapping() {
     assert!(by.abs() < 1e-5);
 
     // Visual scroll down (dy > 0) in LandscapeRight drags toward bx=0 (dbx < 0, dby = 0).
-    assert_eq!(DisplayRotation::LandscapeRight.rotate_delta(0, 1000), (-1000, 0));
-    assert_eq!(DisplayRotation::LandscapeLeft.rotate_delta(0, 1000), (1000, 0));
+    assert_eq!(
+        DisplayRotation::LandscapeRight.rotate_delta(0, 1000),
+        (-1000, 0)
+    );
+    assert_eq!(
+        DisplayRotation::LandscapeLeft.rotate_delta(0, 1000),
+        (1000, 0)
+    );
 
     // Esc back gesture starts at visual left edge (x=128, y=32768) -> (bx=32767, by=128) in LandscapeRight.
     assert_eq!(

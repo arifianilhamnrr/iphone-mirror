@@ -2,8 +2,8 @@
 use super::{
     afc::AfcTransfer,
     error::{Result, TransferError},
-    metadata::{MAX_FILE_BYTES, file_url, validate_paths},
-    pasteboard::{PasteboardFile, UrlPasteboard, uti_for_name},
+    metadata::{file_url, validate_paths, MAX_FILE_BYTES},
+    pasteboard::{uti_for_name, PasteboardFile, UrlPasteboard},
 };
 use idevice::RsdService;
 use std::path::PathBuf;
@@ -18,7 +18,9 @@ pub enum TransferCommand {
 
 #[derive(Debug, Clone)]
 pub enum TransferEvent {
-    Started { files: usize },
+    Started {
+        files: usize,
+    },
     Progress {
         name: String,
         file_index: usize,
@@ -31,9 +33,16 @@ pub enum TransferEvent {
         remote_path: String,
         url: String,
     },
-    Published { files: usize },
-    Completed { files: usize },
-    Failed { name: Option<String>, message: String },
+    Published {
+        files: usize,
+    },
+    Completed {
+        files: usize,
+    },
+    Failed {
+        name: Option<String>,
+        message: String,
+    },
 }
 
 pub struct TransferManager {
@@ -136,7 +145,11 @@ async fn send_batch(
 
         let url = file_url(&remote);
         let bytes = tokio::fs::read(&file.path).await.unwrap_or_default();
-        let data = if bytes.len() <= inline_limit { bytes } else { Vec::new() };
+        let data = if bytes.len() <= inline_limit {
+            bytes
+        } else {
+            Vec::new()
+        };
         pasted.push(PasteboardFile {
             url: url.clone(),
             name: name.clone(),

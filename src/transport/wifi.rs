@@ -7,14 +7,14 @@
 
 use anyhow::{Context, Result};
 use idevice::{
-    IdeviceService, RemoteXpcClient,
     core_device_proxy::CoreDeviceProxy,
     provider::IdeviceProvider,
     remote_pairing::{
-        RemotePairingClient, RpPairingFile, RpPairingSocket, connect_tls_psk_tunnel_native,
+        connect_tls_psk_tunnel_native, RemotePairingClient, RpPairingFile, RpPairingSocket,
     },
     rsd::RsdHandshake,
     tcp::handle::AdapterHandle,
+    IdeviceService, RemoteXpcClient,
 };
 use serde::Serialize;
 use std::{path::PathBuf, process::Stdio, time::Duration};
@@ -304,14 +304,13 @@ fn unescape_avahi_text(input: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'\\' && i + 3 < bytes.len() {
-            if let Ok(code) =
-                std::str::from_utf8(&bytes[i + 1..i + 4]).and_then(|s| Ok(u8::from_str_radix(s, 10)))
+            if let Some(ch) = std::str::from_utf8(&bytes[i + 1..i + 4])
+                .ok()
+                .and_then(|s| s.parse::<u8>().ok())
             {
-                if let Ok(ch) = code {
-                    out.push(ch as char);
-                    i += 4;
-                    continue;
-                }
+                out.push(ch as char);
+                i += 4;
+                continue;
             }
         }
         out.push(bytes[i] as char);

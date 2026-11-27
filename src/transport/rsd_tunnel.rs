@@ -18,7 +18,10 @@ pub struct RsdTunnel {
 impl RsdTunnel {
     /// Build a tunnel from an already-established adapter and RSD handshake
     /// (used by the Wi-Fi RemotePairing path).
-    pub fn from_parts(adapter: idevice::tcp::handle::AdapterHandle, handshake: RsdHandshake) -> Self {
+    pub fn from_parts(
+        adapter: idevice::tcp::handle::AdapterHandle,
+        handshake: RsdHandshake,
+    ) -> Self {
         let services: Vec<String> = handshake.services.keys().cloned().collect();
         info!(available_services = ?services, "RSD Handshake succeeded");
         if !services.iter().any(|s| s == DISPLAY_SERVICE) {

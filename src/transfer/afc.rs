@@ -6,10 +6,10 @@ use super::{
     metadata::{remote_path, staging_root},
 };
 use idevice::{
-    RsdService,
-    afc::{AfcClient, opcode::AfcFopenMode},
+    afc::{opcode::AfcFopenMode, AfcClient},
     provider::RsdProvider,
     rsd::RsdHandshake,
+    RsdService,
 };
 use std::path::Path;
 use tokio::io::AsyncReadExt;
