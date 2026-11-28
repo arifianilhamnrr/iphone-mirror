@@ -23,11 +23,17 @@ pub struct VideoStreamListener {
 
 impl VideoStreamListener {
     pub async fn bind() -> Result<Self> {
-        let listener = match TcpListener::bind("[::]:0").await {
+        let listener = match TcpListener::bind("[::]:7100").await {
             Ok(l) => l,
-            Err(_) => TcpListener::bind("0.0.0.0:0")
-                .await
-                .context("Failed to bind AirPlay video TCP listener")?,
+            Err(_) => match TcpListener::bind("0.0.0.0:7100").await {
+                Ok(l) => l,
+                Err(_) => match TcpListener::bind("[::]:0").await {
+                    Ok(l) => l,
+                    Err(_) => TcpListener::bind("0.0.0.0:0")
+                        .await
+                        .context("Failed to bind AirPlay video TCP listener")?,
+                },
+            },
         };
         let port = listener.local_addr()?.port();
         Ok(Self { port, listener })

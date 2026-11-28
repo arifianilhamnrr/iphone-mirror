@@ -229,7 +229,7 @@ impl HardwareDecoder {
                     if !format_desc.annex_b_params.is_empty() {
                         libav.send_annex_b(&format_desc.annex_b_params, |_, _, _, _, _| {});
                     }
-                    let (packet_tx, packet_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+                    let (packet_tx, packet_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(12);
                     let worker = std::thread::Builder::new()
                         .name("linux-video-decoder".to_string())
                         .spawn(move || {
@@ -904,7 +904,11 @@ mod libav_video {
                 codec_name,
                 true,
                 None,
-                &[(c"threads", c"1"), (c"flags", c"low_delay")],
+                &[
+                    (c"threads", c"4"),
+                    (c"thread_type", c"slice"),
+                    (c"flags", c"low_delay"),
+                ],
             )?;
             Ok(Self {
                 dec,

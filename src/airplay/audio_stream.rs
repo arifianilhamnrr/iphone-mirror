@@ -21,20 +21,27 @@ pub struct AudioStreamListener {
     control_socket: UdpSocket,
 }
 
+async fn bind_udp_with_preferred_port(preferred_port: u16, label: &str) -> Result<UdpSocket> {
+    let v6_pref = format!("[::]:{preferred_port}");
+    if let Ok(s) = UdpSocket::bind(&v6_pref).await {
+        return Ok(s);
+    }
+    let v4_pref = format!("0.0.0.0:{preferred_port}");
+    if let Ok(s) = UdpSocket::bind(&v4_pref).await {
+        return Ok(s);
+    }
+    match UdpSocket::bind("[::]:0").await {
+        Ok(s) => Ok(s),
+        Err(_) => UdpSocket::bind("0.0.0.0:0")
+            .await
+            .with_context(|| format!("Failed to bind AirPlay audio {label} UDP socket")),
+    }
+}
+
 impl AudioStreamListener {
     pub async fn bind() -> Result<Self> {
-        let data_socket = match UdpSocket::bind("[::]:0").await {
-            Ok(s) => s,
-            Err(_) => UdpSocket::bind("0.0.0.0:0")
-                .await
-                .context("Failed to bind AirPlay audio data UDP socket")?,
-        };
-        let control_socket = match UdpSocket::bind("[::]:0").await {
-            Ok(s) => s,
-            Err(_) => UdpSocket::bind("0.0.0.0:0")
-                .await
-                .context("Failed to bind AirPlay audio control UDP socket")?,
-        };
+        let data_socket = bind_udp_with_preferred_port(6000, "data").await?;
+        let control_socket = bind_udp_with_preferred_port(6001, "control").await?;
         let data_port = data_socket.local_addr()?.port();
         let control_port = control_socket.local_addr()?.port();
         Ok(Self {

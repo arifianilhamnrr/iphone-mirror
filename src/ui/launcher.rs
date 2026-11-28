@@ -300,6 +300,7 @@ enum LauncherEvent {
     PairFinished(Result<String, String>),
     ScanRequested,
     BluezStatusUpdated(String),
+    StreamActive,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1613,13 +1614,27 @@ impl LauncherApp {
                 self.status_notice =
                     Some("Mirror session active — waiting for iPhone video stream…".to_string());
                 let proxy = self.proxy.clone();
+                let watch_log_path = log_path.clone();
                 tokio::spawn(async move {
-                    let exit_ok = tokio::select! {
-                        status = child.wait() => status.map(|s| s.success()).unwrap_or(false),
-                        _ = &mut cancel_rx => {
-                            let _ = child.kill().await;
-                            let _ = child.wait().await;
-                            true
+                    let mut stream_tick = tokio::time::interval(Duration::from_millis(400));
+                    stream_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    let mut stream_active_sent = false;
+                    let exit_ok = loop {
+                        tokio::select! {
+                            status = child.wait() => break status.map(|s| s.success()).unwrap_or(false),
+                            _ = &mut cancel_rx => {
+                                let _ = child.kill().await;
+                                let _ = child.wait().await;
+                                break true;
+                            }
+                            _ = stream_tick.tick(), if !stream_active_sent => {
+                                if let Ok(text) = fs::read_to_string(&watch_log_path) {
+                                    if text.contains("Presenting Metal frame") {
+                                        stream_active_sent = true;
+                                        let _ = proxy.send_event(LauncherEvent::StreamActive);
+                                    }
+                                }
+                            }
                         }
                     };
                     let error_detail = if exit_ok {
@@ -3219,6 +3234,12 @@ impl ApplicationHandler<LauncherEvent> for LauncherApp {
             LauncherEvent::BluezStatusUpdated(detail) => {
                 self.bluez_status = detail;
                 self.request_redraw();
+            }
+            LauncherEvent::StreamActive => {
+                if self.backend_running {
+                    self.status_notice = Some("Mirror session active".to_string());
+                    self.request_redraw();
+                }
             }
         }
     }

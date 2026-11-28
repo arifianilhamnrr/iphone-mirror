@@ -781,7 +781,7 @@ impl AudioPlayer {
                         "--format=s16",
                         "--rate=48000",
                         "--channels=2",
-                        "--latency=40ms",
+                        "--latency=80ms",
                         "-",
                     ],
                 ),
@@ -793,7 +793,7 @@ impl AudioPlayer {
                         "--format=s16le",
                         "--rate=48000",
                         "--channels=2",
-                        "--latency-msec=40",
+                        "--latency-msec=80",
                     ],
                 ),
                 (

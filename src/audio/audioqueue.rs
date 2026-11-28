@@ -67,7 +67,7 @@ impl AudioQueueOutput {
                 while !stop.load(Ordering::Acquire) {
                     let available = ring.frames_available();
                     if prebuffering {
-                        if available < FRAMES_PER_PACKET * 3 {
+                        if available < FRAMES_PER_PACKET * 5 {
                             let now = std::time::Instant::now();
                             if next_tick > now {
                                 thread::sleep(next_tick - now);
@@ -80,8 +80,8 @@ impl AudioQueueOutput {
                         prebuffering = false;
                     }
 
-                    // Keep jitter buffer bounded around ~60ms on Wi-Fi bursts or clock skew.
-                    while ring.frames_available() > FRAMES_PER_PACKET * 12 {
+                    // Keep jitter buffer bounded around ~80ms on Wi-Fi bursts or clock skew.
+                    while ring.frames_available() > FRAMES_PER_PACKET * 16 {
                         let dropped = ring.read(&mut samples);
                         if dropped == 0 {
                             break;

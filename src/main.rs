@@ -2455,7 +2455,7 @@ async fn run_mirror() -> Result<()> {
             info!(backend = audio_backend_name, "Audio output started");
             let telemetry = Arc::new(AudioTelemetry::new());
             let mut audio_jitter = AudioJitter::new(8_000); // ~167 ms initial target
-            let mut audio_reorder = AudioReorder::new(8, std::time::Duration::from_millis(25));
+            let mut audio_reorder = AudioReorder::new(8, std::time::Duration::from_millis(60));
             let mut audio_rtcp_stats = RtcpReportStats::new();
             let mut video_rtcp_stats = RtcpReportStats::new();
             let mut ring_underflows_at_check = 0_u64;

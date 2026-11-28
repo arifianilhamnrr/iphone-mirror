@@ -602,15 +602,33 @@ async fn spawn_ntp_client(
         },
         SocketAddr::V4(v4) => SocketAddr::V4(std::net::SocketAddrV4::new(*v4.ip(), timing_rport)),
     };
-    let bind_addr = if target_addr.is_ipv6() {
-        "[::]:0"
-    } else {
-        "0.0.0.0:0"
+    let sock = match UdpSocket::bind("[::]:7011").await {
+        Ok(s) => s,
+        Err(_) => match UdpSocket::bind("0.0.0.0:7011").await {
+            Ok(s) => s,
+            Err(_) => {
+                let bind_addr = if target_addr.is_ipv6() {
+                    "[::]:0"
+                } else {
+                    "0.0.0.0:0"
+                };
+                UdpSocket::bind(bind_addr).await?
+            }
+        },
     };
-    let sock = UdpSocket::bind(bind_addr).await?;
     let port = sock.local_addr()?.port();
+    let local_is_v6 = sock.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
     let remote = if timing_rport > 0 {
-        Some(target_addr)
+        let adjusted = match (local_is_v6, target_addr) {
+            (true, SocketAddr::V4(v4)) => SocketAddr::V6(std::net::SocketAddrV6::new(
+                v4.ip().to_ipv6_mapped(),
+                v4.port(),
+                0,
+                0,
+            )),
+            _ => target_addr,
+        };
+        Some(adjusted)
     } else {
         None
     };
