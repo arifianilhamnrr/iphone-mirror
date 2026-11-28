@@ -211,6 +211,14 @@ impl MetalRenderer {
         }
         Ok(())
     }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn present_xrgb(&self, pixels: &[u32], width: u32, height: u32) -> Result<()> {
+        if let Ok(mut state) = self.linux.lock() {
+            state.present_xrgb(pixels, width, height)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -404,7 +412,7 @@ mod linux_impl {
 
     // ---- X11 Backend --------------------------------------------------------
 
-    struct X11Backend {
+    pub(super) struct X11Backend {
         lib: *mut c_void,
         display: *mut c_void,
         window: c_ulong,
@@ -530,6 +538,27 @@ mod linux_impl {
                 self.pixel_buf = data.cast();
                 self.width = width;
                 self.height = height;
+                let len = (width as usize) * (height as usize);
+                std::slice::from_raw_parts_mut(self.pixel_buf, len).fill(CLEAR_XRGB);
+                self.flush_image();
+            }
+        }
+
+        fn flush_image(&self) {
+            unsafe {
+                (self.x_put_image)(
+                    self.display,
+                    self.window,
+                    self.gc,
+                    self.image,
+                    0,
+                    0,
+                    0,
+                    0,
+                    self.width,
+                    self.height,
+                );
+                (self.x_flush)(self.display);
             }
         }
 
@@ -549,21 +578,25 @@ mod linux_impl {
                 self.height as usize,
                 dst,
             );
-            unsafe {
-                (self.x_put_image)(
-                    self.display,
-                    self.window,
-                    self.gc,
-                    self.image,
-                    0,
-                    0,
-                    0,
-                    0,
-                    self.width,
-                    self.height,
-                );
-                (self.x_flush)(self.display);
+            self.flush_image();
+            Ok(())
+        }
+
+        fn present_xrgb(&mut self, pixels: &[u32], width: u32, height: u32) -> Result<()> {
+            let w = width.max(1);
+            let h = height.max(1);
+            self.resize(w, h);
+            if self.image.is_null() || self.pixel_buf.is_null() {
+                return Ok(());
             }
+            let len = (self.width as usize) * (self.height as usize);
+            let copy_len = len.min(pixels.len());
+            let dst = unsafe { std::slice::from_raw_parts_mut(self.pixel_buf, len) };
+            dst[..copy_len].copy_from_slice(&pixels[..copy_len]);
+            if copy_len < len {
+                dst[copy_len..].fill(CLEAR_XRGB);
+            }
+            self.flush_image();
             Ok(())
         }
     }
@@ -635,7 +668,7 @@ mod linux_impl {
     ) {
     }
 
-    struct WaylandBackend {
+    pub(super) struct WaylandBackend {
         lib: *mut c_void,
         display: *mut c_void,
         surface: *mut c_void,
@@ -807,7 +840,7 @@ mod linux_impl {
             let frame_bytes = stride * (height as usize);
             let total_bytes = frame_bytes * 2;
             unsafe {
-                let fd = memfd_create(b"iphone-mirror-shm\0".as_ptr().cast(), 0);
+                let fd = memfd_create(c"iphone-mirror-shm".as_ptr(), 0);
                 if fd < 0 {
                     return;
                 }
@@ -874,30 +907,17 @@ mod linux_impl {
                 self.mmap_len = total_bytes;
                 self.width = width;
                 self.height = height;
+                let len = (width as usize) * (height as usize);
+                let offset = self.slot * len * 4;
+                std::slice::from_raw_parts_mut(self.mmap_ptr.add(offset).cast::<u32>(), len)
+                    .fill(CLEAR_XRGB);
+                if !self.buffers[self.slot].is_null() {
+                    self.commit_current_slot();
+                }
             }
         }
 
-        fn present(&mut self, frame: &DecodedFrame, rotation: DisplayRotation) -> Result<()> {
-            if self.mmap_ptr.is_null() || self.buffers[self.slot].is_null() {
-                return Ok(());
-            }
-            let Some(cpu) = frame.cpu_frame() else {
-                return Ok(());
-            };
-            let pixels = (self.width as usize) * (self.height as usize);
-            let frame_bytes = pixels * 4;
-            let offset = self.slot * frame_bytes;
-            let dst = unsafe {
-                std::slice::from_raw_parts_mut(self.mmap_ptr.add(offset).cast::<u32>(), pixels)
-            };
-            render_nv12_to_xrgb(
-                cpu,
-                rotation,
-                self.width as usize,
-                self.height as usize,
-                dst,
-            );
-
+        fn commit_current_slot(&mut self) {
             let buffer = self.buffers[self.slot];
             self.slot = 1 - self.slot;
 
@@ -927,6 +947,50 @@ mod linux_impl {
                 (self.proxy_marshal_array)(self.surface, 6, ptr::null_mut());
                 (self.display_flush)(self.display);
             }
+        }
+
+        fn present(&mut self, frame: &DecodedFrame, rotation: DisplayRotation) -> Result<()> {
+            if self.mmap_ptr.is_null() || self.buffers[self.slot].is_null() {
+                return Ok(());
+            }
+            let Some(cpu) = frame.cpu_frame() else {
+                return Ok(());
+            };
+            let pixels = (self.width as usize) * (self.height as usize);
+            let frame_bytes = pixels * 4;
+            let offset = self.slot * frame_bytes;
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut(self.mmap_ptr.add(offset).cast::<u32>(), pixels)
+            };
+            render_nv12_to_xrgb(
+                cpu,
+                rotation,
+                self.width as usize,
+                self.height as usize,
+                dst,
+            );
+            self.commit_current_slot();
+            Ok(())
+        }
+
+        fn present_xrgb(&mut self, pixels: &[u32], width: u32, height: u32) -> Result<()> {
+            let w = width.max(1);
+            let h = height.max(1);
+            self.resize(w, h);
+            if self.mmap_ptr.is_null() || self.buffers[self.slot].is_null() {
+                return Ok(());
+            }
+            let len = (self.width as usize) * (self.height as usize);
+            let copy_len = len.min(pixels.len());
+            let offset = self.slot * len * 4;
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut(self.mmap_ptr.add(offset).cast::<u32>(), len)
+            };
+            dst[..copy_len].copy_from_slice(&pixels[..copy_len]);
+            if copy_len < len {
+                dst[copy_len..].fill(CLEAR_XRGB);
+            }
+            self.commit_current_slot();
             Ok(())
         }
     }
@@ -1012,6 +1076,14 @@ mod linux_impl {
             match &mut self.backend {
                 LinuxBackend::Wayland(w) => w.present(frame, rotation),
                 LinuxBackend::X11(x) => x.present(frame, rotation),
+                LinuxBackend::Null => Ok(()),
+            }
+        }
+
+        pub fn present_xrgb(&mut self, pixels: &[u32], width: u32, height: u32) -> Result<()> {
+            match &mut self.backend {
+                LinuxBackend::Wayland(w) => w.present_xrgb(pixels, width, height),
+                LinuxBackend::X11(x) => x.present_xrgb(pixels, width, height),
                 LinuxBackend::Null => Ok(()),
             }
         }

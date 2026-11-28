@@ -23,7 +23,7 @@ use tokio::{
     net::TcpStream,
     process::Command,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Stable host name presented during RemotePairing. It must not change
 /// between runs, otherwise the saved pairing file no longer matches.
@@ -137,6 +137,80 @@ pub fn pairing_file_path() -> Result<PathBuf> {
     }
 }
 
+fn read_local_hostname() -> String {
+    if let Ok(name) = std::fs::read_to_string("/etc/hostname") {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    std::env::var("HOSTNAME").unwrap_or_else(|_| SENDING_HOST.to_string())
+}
+
+fn try_import_pymobiledevice3_pairing() -> Option<RpPairingFile> {
+    let home = std::env::var_os("HOME")?;
+    let dir = PathBuf::from(home).join(".local/share/pymobiledevice3");
+    let entries = std::fs::read_dir(&dir).ok()?;
+    let mut candidates: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("remote_") && n.ends_with(".plist"))
+        })
+        .collect();
+    candidates.sort();
+
+    let hostname = read_local_hostname();
+    let fallback_id = uuid::Uuid::new_v3(&uuid::Uuid::NAMESPACE_DNS, hostname.as_bytes())
+        .to_string()
+        .to_uppercase();
+
+    for path in candidates {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(mut dict) = plist::from_bytes::<plist::Dictionary>(&bytes) else {
+            continue;
+        };
+        let Some(pub_bytes) = dict.remove("public_key").and_then(|v| v.into_data()) else {
+            continue;
+        };
+        let Some(priv_bytes) = dict.remove("private_key").and_then(|v| v.into_data()) else {
+            continue;
+        };
+        let identifier = dict
+            .remove("host_identifier")
+            .or_else(|| dict.remove("identifier"))
+            .and_then(|v| v.into_string())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| fallback_id.clone());
+        let alt_irk = dict
+            .remove("peer_alt_irk")
+            .or_else(|| dict.remove("alt_irk"))
+            .and_then(|v| v.into_data());
+
+        let mut out = plist::Dictionary::new();
+        out.insert("public_key".into(), plist::Value::Data(pub_bytes));
+        out.insert("private_key".into(), plist::Value::Data(priv_bytes));
+        out.insert("identifier".into(), plist::Value::String(identifier));
+        if let Some(irk) = alt_irk {
+            out.insert("alt_irk".into(), plist::Value::Data(irk));
+        }
+        let mut xml = Vec::new();
+        if plist::Value::Dictionary(out)
+            .to_writer_xml(&mut xml)
+            .is_ok()
+        {
+            if let Ok(rp) = RpPairingFile::from_bytes(&xml) {
+                info!(source = %path.display(), "Imported existing RemotePairing record");
+                return Some(rp);
+            }
+        }
+    }
+    None
+}
+
 async fn load_or_create_pairing_file() -> Result<RpPairingFile> {
     let path = pairing_file_path()?;
     if let Some(parent) = path.parent() {
@@ -145,9 +219,10 @@ async fn load_or_create_pairing_file() -> Result<RpPairingFile> {
     match RpPairingFile::read_from_file(&path).await {
         Ok(file) => Ok(file),
         Err(_) => {
-            let file = RpPairingFile::generate(SENDING_HOST);
+            let file = try_import_pymobiledevice3_pairing()
+                .unwrap_or_else(|| RpPairingFile::generate(SENDING_HOST));
             file.write_to_file(&path).await?;
-            info!(path = %path.display(), "Generated a new RemotePairing identity");
+            info!(path = %path.display(), "Saved RemotePairing identity");
             Ok(file)
         }
     }
@@ -238,10 +313,22 @@ pub async fn connect(device: &WifiDevice) -> Result<(AdapterHandle, RsdHandshake
     let stream = connect_tcp_prefer_ipv4(&pairing_addr).await?;
     let socket = RpPairingSocket::new(stream);
     let mut pairing = RemotePairingClient::new(socket, SENDING_HOST);
-    pairing
+    if let Err(err) = pairing
         .connect(&mut file, || async { "000000".to_string() })
         .await
-        .context("RemotePairing with the Wi-Fi device failed")?;
+    {
+        warn!(%err, "Saved RemotePairing identity failed; retrying with fresh identity");
+        file = RpPairingFile::generate(SENDING_HOST);
+        let retry_stream = TcpStream::connect(&pairing_addr)
+            .await
+            .with_context(|| format!("Could not reach {pairing_addr}"))?;
+        let retry_socket = RpPairingSocket::new(retry_stream);
+        pairing = RemotePairingClient::new(retry_socket, SENDING_HOST);
+        pairing
+            .connect(&mut file, || async { "000000".to_string() })
+            .await
+            .context("RemotePairing with the Wi-Fi device failed")?;
+    }
     file.write_to_file(&path)
         .await
         .context("Could not persist the RemotePairing file")?;

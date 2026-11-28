@@ -7,18 +7,16 @@ pub mod output;
 pub mod reorder;
 pub mod ring_buffer;
 
-use anyhow::{bail, Result};
-use std::{
-    ffi::c_void,
-    ptr,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+#[cfg(target_os = "macos")]
+use anyhow::bail;
+use anyhow::Result;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
 };
 
 #[cfg(target_os = "macos")]
-use std::{collections::VecDeque, sync::Mutex};
+use std::{collections::VecDeque, ffi::c_void, ptr, sync::Mutex};
 
 #[cfg(not(target_os = "macos"))]
 use std::{
@@ -215,12 +213,22 @@ pub struct AacEldDecoder {
 }
 
 #[cfg(not(target_os = "macos"))]
+enum LinuxAacBackend {
+    LibAv(libav_aac::LibAvAacContext),
+    Ffmpeg {
+        child: Option<Child>,
+        stdin: Option<ChildStdin>,
+        pcm_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+        seq: u32,
+    },
+}
+
+#[cfg(not(target_os = "macos"))]
 pub struct AacEldDecoder {
-    child: Option<Child>,
-    stdin: Option<ChildStdin>,
-    pcm_rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    seq: u32,
+    backend: LinuxAacBackend,
     source_sample_rate: f64,
+    resample_phase: f64,
+    prev_stereo_frame: Option<[i16; 2]>,
 }
 
 unsafe impl Send for AacEldDecoder {}
@@ -274,6 +282,24 @@ impl AacEldDecoder {
 
         #[cfg(not(target_os = "macos"))]
         {
+            match libav_aac::LibAvAacContext::new(source_sample_rate) {
+                Ok(ctx) => {
+                    tracing::info!(
+                        source_sample_rate,
+                        "Linux in-process libavcodec AAC-ELD decoder initialized"
+                    );
+                    return Ok(Self {
+                        backend: LinuxAacBackend::LibAv(ctx),
+                        source_sample_rate,
+                        resample_phase: 0.0,
+                        prev_stereo_frame: None,
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "libavcodec AAC decoder unavailable; falling back to ffmpeg subprocess");
+                }
+            }
+
             let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(32);
             let spawned = Command::new("ffmpeg")
                 .args([
@@ -323,21 +349,29 @@ impl AacEldDecoder {
                             });
                     }
                     Ok(Self {
-                        child: Some(child),
-                        stdin,
-                        pcm_rx,
-                        seq: 1,
+                        backend: LinuxAacBackend::Ffmpeg {
+                            child: Some(child),
+                            stdin,
+                            pcm_rx,
+                            seq: 1,
+                        },
                         source_sample_rate,
+                        resample_phase: 0.0,
+                        prev_stereo_frame: None,
                     })
                 }
                 Err(error) => {
                     tracing::warn!(%error, "ffmpeg unavailable for Linux AAC-ELD decoding; audio disabled");
                     Ok(Self {
-                        child: None,
-                        stdin: None,
-                        pcm_rx,
-                        seq: 1,
+                        backend: LinuxAacBackend::Ffmpeg {
+                            child: None,
+                            stdin: None,
+                            pcm_rx,
+                            seq: 1,
+                        },
                         source_sample_rate,
+                        resample_phase: 0.0,
+                        prev_stereo_frame: None,
                     })
                 }
             }
@@ -395,23 +429,36 @@ impl AacEldDecoder {
 
         #[cfg(not(target_os = "macos"))]
         {
-            if let Some(stdin) = self.stdin.as_mut() {
-                let frag = build_fmp4_fragment(self.seq, self.source_sample_rate, access_unit);
-                self.seq = self.seq.wrapping_add(1);
-                if stdin.write_all(&frag).is_err() || stdin.flush().is_err() {
-                    self.stdin = None;
+            match &mut self.backend {
+                LinuxAacBackend::LibAv(ctx) => {
+                    let pcm = ctx.decode_packet(access_unit)?;
+                    if (self.source_sample_rate - SAMPLE_RATE).abs() < 1.0 || pcm.len() < 4 {
+                        return Ok(pcm);
+                    }
+                    Ok(resample_stereo_pcm(
+                        &pcm,
+                        self.source_sample_rate,
+                        SAMPLE_RATE,
+                        &mut self.resample_phase,
+                        &mut self.prev_stereo_frame,
+                    ))
                 }
-            }
-            if let Ok(pcm) = self.pcm_rx.try_recv() {
-                return Ok(pcm);
-            }
-            // Wait briefly for the first packet so live stream doesn't slip behind
-            match self
-                .pcm_rx
-                .recv_timeout(std::time::Duration::from_millis(8))
-            {
-                Ok(pcm) => Ok(pcm),
-                Err(_) => Ok(vec![0_u8; PCM_BYTES]),
+                LinuxAacBackend::Ffmpeg {
+                    stdin, pcm_rx, seq, ..
+                } => {
+                    if let Some(sin) = stdin.as_mut() {
+                        let frag = build_fmp4_fragment(*seq, self.source_sample_rate, access_unit);
+                        *seq = seq.wrapping_add(1);
+                        if sin.write_all(&frag).is_err() || sin.flush().is_err() {
+                            *stdin = None;
+                        }
+                    }
+                    let mut out = Vec::new();
+                    while let Ok(chunk) = pcm_rx.try_recv() {
+                        out.extend_from_slice(&chunk);
+                    }
+                    Ok(out)
+                }
             }
         }
     }
@@ -470,10 +517,12 @@ impl Drop for AacEldDecoder {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            drop(self.stdin.take());
-            if let Some(mut child) = self.child.take() {
-                let _ = child.kill();
-                let _ = child.wait();
+            if let LinuxAacBackend::Ffmpeg { child, stdin, .. } = &mut self.backend {
+                drop(stdin.take());
+                if let Some(mut child) = child.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
             }
         }
     }
@@ -732,7 +781,7 @@ impl AudioPlayer {
                         "--format=s16",
                         "--rate=48000",
                         "--channels=2",
-                        "--latency=20ms",
+                        "--latency=40ms",
                         "-",
                     ],
                 ),
@@ -744,7 +793,7 @@ impl AudioPlayer {
                         "--format=s16le",
                         "--rate=48000",
                         "--channels=2",
-                        "--latency-msec=20",
+                        "--latency-msec=40",
                     ],
                 ),
                 (
@@ -839,7 +888,7 @@ impl AudioPlayer {
         {
             if let Some(stdin_mutex) = &self.sink_stdin {
                 if let Ok(mut stdin) = stdin_mutex.lock() {
-                    if stdin.write_all(pcm).is_err() || stdin.flush().is_err() {
+                    if stdin.write_all(pcm).is_err() {
                         self.dropped += 1;
                         return Ok(());
                     }
@@ -897,6 +946,138 @@ fn pcm_format_with_rate(sample_rate: f64) -> AudioStreamBasicDescription {
         channels_per_frame: CHANNELS,
         bits_per_channel: 16,
         reserved: 0,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod libav_aac {
+    use crate::codec::decoder::libav_sys::*;
+    use anyhow::Result;
+
+    const AV_SAMPLE_FMT_S16: i32 = 1;
+    const AV_SAMPLE_FMT_FLT: i32 = 3;
+    const AV_SAMPLE_FMT_S16P: i32 = 6;
+    const AV_SAMPLE_FMT_FLTP: i32 = 8;
+
+    pub struct LibAvAacContext {
+        dec: LibAvDecoder,
+    }
+
+    impl LibAvAacContext {
+        pub fn new(source_sample_rate: f64) -> Result<Self> {
+            let (asc, ar_opt) = if (source_sample_rate - 44_100.0).abs() < 100.0 {
+                ([0xF8, 0xE8, 0x50, 0x00], c"44100")
+            } else {
+                ([0xF8, 0xE6, 0x50, 0x00], c"48000")
+            };
+            let dec = LibAvDecoder::open(c"aac", false, Some(&asc), &[(c"ar", ar_opt)])?;
+            Ok(Self { dec })
+        }
+
+        pub fn decode_packet(&mut self, access_unit: &[u8]) -> Result<Vec<u8>> {
+            let mut out = Vec::with_capacity(super::PCM_BYTES);
+            self.dec.send_packet_and_drain(access_unit, |frame| unsafe {
+                let nb_samples = frame
+                    .add(AVFRAME_NB_SAMPLES_OFFSET)
+                    .cast::<i32>()
+                    .read_unaligned();
+                let sample_fmt = frame
+                    .add(AVFRAME_FORMAT_OFFSET)
+                    .cast::<i32>()
+                    .read_unaligned();
+                if nb_samples <= 0 {
+                    return;
+                }
+                let n = nb_samples as usize;
+                let data_ptrs = frame
+                    .add(AVFRAME_DATA_OFFSET)
+                    .cast::<[*const u8; 2]>()
+                    .read_unaligned();
+                if data_ptrs[0].is_null() {
+                    return;
+                }
+
+                let push_i16 = |out: &mut Vec<u8>, s: i16| {
+                    out.extend_from_slice(&s.to_le_bytes());
+                };
+                let f32_to_i16 = |v: f32| -> i16 { (v.clamp(-1.0, 1.0) * 32767.0).round() as i16 };
+
+                match sample_fmt {
+                    AV_SAMPLE_FMT_FLTP => {
+                        let l_ptr = data_ptrs[0].cast::<f32>();
+                        let r_ptr = if data_ptrs[1].is_null() {
+                            l_ptr
+                        } else {
+                            data_ptrs[1].cast::<f32>()
+                        };
+                        let l = std::slice::from_raw_parts(l_ptr, n);
+                        let r = std::slice::from_raw_parts(r_ptr, n);
+                        out.reserve(n * 4);
+                        for i in 0..n {
+                            push_i16(&mut out, f32_to_i16(l[i]));
+                            push_i16(&mut out, f32_to_i16(r[i]));
+                        }
+                    }
+                    AV_SAMPLE_FMT_FLT => {
+                        let interleaved =
+                            std::slice::from_raw_parts(data_ptrs[0].cast::<f32>(), n * 2);
+                        out.reserve(n * 4);
+                        for &v in interleaved {
+                            push_i16(&mut out, f32_to_i16(v));
+                        }
+                    }
+                    AV_SAMPLE_FMT_S16P => {
+                        let l_ptr = data_ptrs[0].cast::<i16>();
+                        let r_ptr = if data_ptrs[1].is_null() {
+                            l_ptr
+                        } else {
+                            data_ptrs[1].cast::<i16>()
+                        };
+                        let l = std::slice::from_raw_parts(l_ptr, n);
+                        let r = std::slice::from_raw_parts(r_ptr, n);
+                        out.reserve(n * 4);
+                        for i in 0..n {
+                            push_i16(&mut out, l[i]);
+                            push_i16(&mut out, r[i]);
+                        }
+                    }
+                    AV_SAMPLE_FMT_S16 => {
+                        let bytes = std::slice::from_raw_parts(data_ptrs[0], n * 4);
+                        out.extend_from_slice(bytes);
+                    }
+                    other => {
+                        tracing::debug!(
+                            sample_fmt = other,
+                            "Unsupported AAC AVFrame sample format"
+                        );
+                    }
+                }
+            });
+            Ok(out)
+        }
+    }
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod linux_tests {
+    use super::AacEldDecoder;
+
+    #[test]
+    fn aac_eld_libav_decoder_initializes_at_48k_and_44k() {
+        let silent_eld = [0x00_u8, 0x06, 0x20, 0x00, 0x00];
+        let mut d48 = AacEldDecoder::new_with_source_rate(48_000.0)
+            .expect("48kHz AAC-ELD decoder should initialize");
+        let pcm48 = d48.decode(&silent_eld).expect("48kHz AAC-ELD decode");
+        assert_eq!(pcm48.len(), 1920);
+
+        let mut d44 = AacEldDecoder::new_with_source_rate(44_100.0)
+            .expect("44.1kHz AAC-ELD decoder should initialize");
+        let pcm44 = d44.decode(&silent_eld).expect("44.1kHz AAC-ELD decode");
+        assert!(
+            pcm44.len() >= 1920,
+            "expected resampled 44.1kHz PCM >= 1920 bytes, got {}",
+            pcm44.len()
+        );
     }
 }
 

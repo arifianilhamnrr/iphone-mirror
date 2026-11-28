@@ -17,7 +17,7 @@ pub struct SystemClipboard {
     #[cfg(not(target_os = "macos"))]
     last_text: Option<String>,
     #[cfg(not(target_os = "macos"))]
-    last_poll: Option<std::time::Instant>,
+    latest_text: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl SystemClipboard {
@@ -34,9 +34,20 @@ impl SystemClipboard {
         #[cfg(not(target_os = "macos"))]
         {
             let initial = linux_read_text();
+            let latest_text = std::sync::Arc::new(std::sync::Mutex::new(initial.clone()));
+            let watcher_state = latest_text.clone();
+            let _ = std::thread::Builder::new()
+                .name("linux-clipboard-watcher".to_string())
+                .spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    let current = linux_read_text();
+                    if let Ok(mut guard) = watcher_state.lock() {
+                        *guard = current;
+                    }
+                });
             Self {
                 last_text: initial,
-                last_poll: Some(std::time::Instant::now()),
+                latest_text,
             }
         }
     }
@@ -76,14 +87,7 @@ impl SystemClipboard {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let now = std::time::Instant::now();
-            if self.last_poll.is_some_and(|prev| {
-                now.duration_since(prev) < std::time::Duration::from_millis(1500)
-            }) {
-                return None;
-            }
-            self.last_poll = Some(now);
-            let current = linux_read_text()?;
+            let current = self.latest_text.try_lock().ok()?.clone()?;
             if self.last_text.as_deref() == Some(current.as_str()) {
                 return None;
             }

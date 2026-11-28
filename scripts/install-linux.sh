@@ -75,35 +75,27 @@ if [ -n "$ICON_SRC" ]; then
   install -m 0644 "$ICON_SRC" "$ICON_DIR/iphone-mirror.png"
 fi
 
+rm -f "$APP_DIR/iphone-mirror-airplay.desktop"
+
 cat > "$APP_DIR/iphone-mirror.desktop" <<EOF
 [Desktop Entry]
 Name=iPhone Mirror
-Comment=Native iPhone Screen Mirroring (Wayland & X11)
-Exec=$BIN_DIR/iphone-mirror mirror
+Comment=Native iPhone Screen Mirroring & AirPlay Receiver (Wayland & X11)
+Exec=$BIN_DIR/iphone-mirror
 Icon=iphone-mirror
 Terminal=false
 Type=Application
 Categories=Utility;AudioVideo;
+StartupNotify=true
+StartupWMClass=iphone-mirror
 EOF
 
-cat > "$APP_DIR/iphone-mirror-airplay.desktop" <<EOF
-[Desktop Entry]
-Name=iPhone Mirror (AirPlay Receiver)
-Comment=Wireless AirPlay H.264 Screen Mirroring Receiver
-Exec=$BIN_DIR/iphone-mirror airplay
-Icon=iphone-mirror
-Terminal=false
-Type=Application
-Categories=Utility;AudioVideo;
-EOF
-
-chmod +x "$APP_DIR/iphone-mirror.desktop" "$APP_DIR/iphone-mirror-airplay.desktop"
+chmod +x "$APP_DIR/iphone-mirror.desktop"
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APP_DIR" >/dev/null 2>&1 || true
 
 echo ""
 echo "Installation complete!"
 echo "  Binary:   $BIN_DIR/iphone-mirror"
 echo "  Desktop:  $APP_DIR/iphone-mirror.desktop"
-echo "  AirPlay:  $APP_DIR/iphone-mirror-airplay.desktop"
 echo ""
-echo "Run 'iphone-mirror' or 'iphone-mirror airplay' from your application menu or terminal."
+echo "Run 'iphone-mirror' from your application menu or terminal."

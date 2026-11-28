@@ -1,9 +1,10 @@
 // language: Rust, file: src/codec/decoder.rs
-use crate::codec::format_desc::FormatDescription;
+use crate::codec::format_desc::{FormatDescription, VideoCodec};
 use crate::codec::videotoolbox_sys::*;
 use anyhow::{bail, Result};
+#[cfg(target_os = "macos")]
+use std::ffi::c_void;
 use std::{
-    ffi::c_void,
     ptr,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -108,19 +109,27 @@ struct CallbackContext {
     frame_count: Arc<AtomicU64>,
 }
 
+#[cfg(not(target_os = "macos"))]
+enum LinuxVideoBackend {
+    LibAv {
+        packet_tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+        worker: Option<JoinHandle<()>>,
+    },
+    Ffmpeg {
+        stdin: Option<ChildStdin>,
+        child: Child,
+        stop: Arc<AtomicBool>,
+        reader_thread: Option<JoinHandle<()>>,
+    },
+}
+
 pub struct HardwareDecoder {
     #[cfg(target_os = "macos")]
     session: VTDecompressionSessionRef,
     #[cfg(target_os = "macos")]
     _callback_context: Box<CallbackContext>,
     #[cfg(not(target_os = "macos"))]
-    stdin: Option<ChildStdin>,
-    #[cfg(not(target_os = "macos"))]
-    child: Child,
-    #[cfg(not(target_os = "macos"))]
-    stop: Arc<AtomicBool>,
-    #[cfg(not(target_os = "macos"))]
-    reader_thread: Option<JoinHandle<()>>,
+    backend: LinuxVideoBackend,
     _format_desc: FormatDescription,
 }
 
@@ -210,6 +219,49 @@ impl HardwareDecoder {
             if width == 0 || height == 0 {
                 bail!("Invalid decoded frame dimensions {width}x{height}");
             }
+
+            match libav_video::LibAvVideoContext::new(format_desc.codec) {
+                Ok(mut libav) => {
+                    if !format_desc.annex_b_params.is_empty() {
+                        libav.send_annex_b(&format_desc.annex_b_params, |_, _, _, _, _| {});
+                    }
+                    let (packet_tx, packet_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+                    let worker = std::thread::Builder::new()
+                        .name("linux-video-decoder".to_string())
+                        .spawn(move || {
+                            while let Ok(annex_b) = packet_rx.recv() {
+                                libav.send_annex_b(&annex_b, |w, h, nv12, full_range, _| {
+                                    frame_count.fetch_add(1, Ordering::Relaxed);
+                                    let frame = DecodedFrame::from_nv12(w, h, nv12, full_range);
+                                    if let Err(error) = frame_tx.try_send(frame) {
+                                        tracing::debug!(
+                                            %error,
+                                            "Dropping decoded frame because the renderer is behind"
+                                        );
+                                    }
+                                });
+                            }
+                        })?;
+
+                    info!(
+                        width,
+                        height,
+                        codec = format_desc.codec.ffmpeg_format(),
+                        "Linux in-process libavcodec video decoder initialized"
+                    );
+                    return Ok(Self {
+                        backend: LinuxVideoBackend::LibAv {
+                            packet_tx: Some(packet_tx),
+                            worker: Some(worker),
+                        },
+                        _format_desc: format_desc,
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "libavcodec unavailable; falling back to ffmpeg video subprocess");
+                }
+            }
+
             let frame_bytes = width * height * 3 / 2;
             let codec_fmt = format_desc.codec.ffmpeg_format();
 
@@ -218,15 +270,15 @@ impl HardwareDecoder {
                     "-hide_banner",
                     "-loglevel",
                     "error",
-                    "-hwaccel",
-                    "auto",
-                    "-fflags",
-                    "nobuffer",
+                    "-threads",
+                    "1",
                     "-flags",
                     "low_delay",
                     "-probesize",
-                    "32",
+                    "4096",
                     "-analyzeduration",
+                    "0",
+                    "-fpsprobesize",
                     "0",
                     "-f",
                     codec_fmt,
@@ -289,10 +341,12 @@ impl HardwareDecoder {
                 "Linux ffmpeg video decoder initialized"
             );
             Ok(Self {
-                stdin: Some(stdin),
-                child,
-                stop,
-                reader_thread: Some(reader_thread),
+                backend: LinuxVideoBackend::Ffmpeg {
+                    stdin: Some(stdin),
+                    child,
+                    stop,
+                    reader_thread: Some(reader_thread),
+                },
                 _format_desc: format_desc,
             })
         }
@@ -383,13 +437,33 @@ impl HardwareDecoder {
 
         #[cfg(not(target_os = "macos"))]
         {
-            let annex_b = avcc_to_annex_b(avcc, self._format_desc.nal_length_size);
+            let mut annex_b = avcc_to_annex_b(avcc, self._format_desc.nal_length_size);
             if annex_b.is_empty() {
                 return Ok(());
             }
-            if let Some(stdin) = self.stdin.as_mut() {
-                stdin.write_all(&annex_b)?;
-                stdin.flush()?;
+            match &mut self.backend {
+                LinuxVideoBackend::LibAv { packet_tx, .. } => {
+                    if let Some(tx) = packet_tx {
+                        if let Err(error) = tx.try_send(annex_b) {
+                            tracing::debug!(%error, "Dropping video access unit because decoder queue is full");
+                        }
+                    }
+                }
+                LinuxVideoBackend::Ffmpeg { stdin, .. } => {
+                    // Append an Access Unit Delimiter + zero-byte Annex-B padding so
+                    // ffmpeg's parser and AVIOContext emit each frame immediately.
+                    match self._format_desc.codec {
+                        VideoCodec::Hevc => {
+                            annex_b.extend_from_slice(&[0, 0, 0, 1, 0x46, 0x01, 0x50])
+                        }
+                        VideoCodec::H264 => annex_b.extend_from_slice(&[0, 0, 0, 1, 0x09, 0xF0]),
+                    }
+                    annex_b.resize(annex_b.len() + 2048, 0);
+                    if let Some(sin) = stdin.as_mut() {
+                        sin.write_all(&annex_b)?;
+                        sin.flush()?;
+                    }
+                }
             }
             Ok(())
         }
@@ -462,13 +536,479 @@ impl Drop for HardwareDecoder {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            self.stop.store(true, Ordering::Release);
-            drop(self.stdin.take());
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-            if let Some(handle) = self.reader_thread.take() {
-                let _ = handle.join();
+            match &mut self.backend {
+                LinuxVideoBackend::LibAv { packet_tx, worker } => {
+                    drop(packet_tx.take());
+                    if let Some(handle) = worker.take() {
+                        let _ = handle.join();
+                    }
+                }
+                LinuxVideoBackend::Ffmpeg {
+                    stdin,
+                    child,
+                    stop,
+                    reader_thread,
+                } => {
+                    stop.store(true, Ordering::Release);
+                    drop(stdin.take());
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    if let Some(handle) = reader_thread.take() {
+                        let _ = handle.join();
+                    }
+                }
             }
         }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) mod libav_sys {
+    use anyhow::{bail, Result};
+    use std::{
+        ffi::{c_char, c_int, c_void, CStr},
+        ptr,
+    };
+
+    const RTLD_LAZY: c_int = 0x00001;
+
+    pub const AV_CODEC_FLAG_LOW_DELAY: i32 = 1 << 19;
+    pub const AV_INPUT_BUFFER_PADDING_SIZE: usize = 64;
+
+    pub const AVCTX_FLAGS_OFFSET: usize = 64;
+    pub const AVCTX_EXTRADATA_OFFSET: usize = 72;
+    pub const AVCTX_EXTRADATA_SIZE_OFFSET: usize = 80;
+
+    pub const AVPKT_DATA_OFFSET: usize = 24;
+    pub const AVPKT_SIZE_OFFSET: usize = 32;
+
+    pub const AVFRAME_DATA_OFFSET: usize = 0;
+    pub const AVFRAME_LINESIZE_OFFSET: usize = 64;
+    pub const AVFRAME_WIDTH_OFFSET: usize = 104;
+    pub const AVFRAME_HEIGHT_OFFSET: usize = 108;
+    pub const AVFRAME_NB_SAMPLES_OFFSET: usize = 112;
+    pub const AVFRAME_FORMAT_OFFSET: usize = 116;
+
+    #[cfg(target_os = "linux")]
+    extern "C" {
+        fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+        fn dlclose(handle: *mut c_void) -> c_int;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    unsafe fn dlopen(_filename: *const c_char, _flags: c_int) -> *mut c_void {
+        ptr::null_mut()
+    }
+    #[cfg(not(target_os = "linux"))]
+    unsafe fn dlsym(_handle: *mut c_void, _symbol: *const c_char) -> *mut c_void {
+        ptr::null_mut()
+    }
+    #[cfg(not(target_os = "linux"))]
+    unsafe fn dlclose(_handle: *mut c_void) -> c_int {
+        0
+    }
+
+    unsafe fn load_any(candidates: &[&[u8]]) -> Result<*mut c_void> {
+        for name in candidates {
+            let h = dlopen(name.as_ptr().cast(), RTLD_LAZY);
+            if !h.is_null() {
+                return Ok(h);
+            }
+        }
+        bail!("Could not load shared library")
+    }
+
+    unsafe fn load_sym<T>(handle: *mut c_void, name: &CStr) -> Result<T> {
+        let ptr = dlsym(handle, name.as_ptr());
+        if ptr.is_null() {
+            bail!("Missing symbol {}", name.to_string_lossy());
+        }
+        Ok(std::mem::transmute_copy(&ptr))
+    }
+
+    /// Runtime-loaded `libavcodec` + `libavutil` dispatch table and owned decoder structs.
+    pub struct LibAvDecoder {
+        avcodec_lib: *mut c_void,
+        avutil_lib: *mut c_void,
+        pub ctx: *mut u8,
+        pub pkt: *mut u8,
+        pub frame: *mut u8,
+        avcodec_free_context: unsafe extern "C" fn(*mut *mut u8),
+        av_packet_free: unsafe extern "C" fn(*mut *mut u8),
+        av_frame_free: unsafe extern "C" fn(*mut *mut u8),
+        av_frame_unref: unsafe extern "C" fn(*mut u8),
+        avcodec_send_packet: unsafe extern "C" fn(*mut u8, *const u8) -> c_int,
+        avcodec_receive_frame: unsafe extern "C" fn(*mut u8, *mut u8) -> c_int,
+    }
+
+    unsafe impl Send for LibAvDecoder {}
+
+    impl LibAvDecoder {
+        pub fn open(
+            codec_name: &CStr,
+            low_delay: bool,
+            extradata: Option<&[u8]>,
+            options: &[(&CStr, &CStr)],
+        ) -> Result<Self> {
+            unsafe {
+                let avcodec_lib = load_any(&[
+                    b"libavcodec.so.63\0",
+                    b"libavcodec.so.62\0",
+                    b"libavcodec.so.61\0",
+                    b"libavcodec.so.60\0",
+                    b"libavcodec.so.59\0",
+                    b"libavcodec.so.58\0",
+                    b"libavcodec.so\0",
+                ])?;
+                let avutil_lib = match load_any(&[
+                    b"libavutil.so.61\0",
+                    b"libavutil.so.60\0",
+                    b"libavutil.so.59\0",
+                    b"libavutil.so.58\0",
+                    b"libavutil.so.57\0",
+                    b"libavutil.so.56\0",
+                    b"libavutil.so\0",
+                ]) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        dlclose(avcodec_lib);
+                        return Err(e);
+                    }
+                };
+
+                let find_decoder_by_name: unsafe extern "C" fn(*const c_char) -> *const c_void =
+                    load_sym(avcodec_lib, c"avcodec_find_decoder_by_name")?;
+                let alloc_context3: unsafe extern "C" fn(*const c_void) -> *mut u8 =
+                    load_sym(avcodec_lib, c"avcodec_alloc_context3")?;
+                let open2: unsafe extern "C" fn(*mut u8, *const c_void, *mut *mut c_void) -> c_int =
+                    load_sym(avcodec_lib, c"avcodec_open2")?;
+                let avcodec_free_context: unsafe extern "C" fn(*mut *mut u8) =
+                    load_sym(avcodec_lib, c"avcodec_free_context")?;
+                let av_packet_alloc: unsafe extern "C" fn() -> *mut u8 =
+                    load_sym(avcodec_lib, c"av_packet_alloc")?;
+                let av_packet_free: unsafe extern "C" fn(*mut *mut u8) =
+                    load_sym(avcodec_lib, c"av_packet_free")?;
+                let avcodec_send_packet: unsafe extern "C" fn(*mut u8, *const u8) -> c_int =
+                    load_sym(avcodec_lib, c"avcodec_send_packet")?;
+                let avcodec_receive_frame: unsafe extern "C" fn(*mut u8, *mut u8) -> c_int =
+                    load_sym(avcodec_lib, c"avcodec_receive_frame")?;
+
+                let av_frame_alloc: unsafe extern "C" fn() -> *mut u8 =
+                    load_sym(avutil_lib, c"av_frame_alloc")?;
+                let av_frame_free: unsafe extern "C" fn(*mut *mut u8) =
+                    load_sym(avutil_lib, c"av_frame_free")?;
+                let av_frame_unref: unsafe extern "C" fn(*mut u8) =
+                    load_sym(avutil_lib, c"av_frame_unref")?;
+                let av_dict_set: unsafe extern "C" fn(
+                    *mut *mut c_void,
+                    *const c_char,
+                    *const c_char,
+                    c_int,
+                ) -> c_int = load_sym(avutil_lib, c"av_dict_set")?;
+                let av_dict_free: unsafe extern "C" fn(*mut *mut c_void) =
+                    load_sym(avutil_lib, c"av_dict_free")?;
+                let av_mallocz: unsafe extern "C" fn(usize) -> *mut u8 =
+                    load_sym(avutil_lib, c"av_mallocz")?;
+
+                let codec = find_decoder_by_name(codec_name.as_ptr());
+                if codec.is_null() {
+                    dlclose(avutil_lib);
+                    dlclose(avcodec_lib);
+                    bail!(
+                        "avcodec_find_decoder_by_name returned null for {}",
+                        codec_name.to_string_lossy()
+                    );
+                }
+
+                let mut ctx = alloc_context3(codec);
+                let mut pkt = av_packet_alloc();
+                let mut frame = av_frame_alloc();
+                if ctx.is_null() || pkt.is_null() || frame.is_null() {
+                    if !frame.is_null() {
+                        av_frame_free(&mut frame);
+                    }
+                    if !pkt.is_null() {
+                        av_packet_free(&mut pkt);
+                    }
+                    if !ctx.is_null() {
+                        avcodec_free_context(&mut ctx);
+                    }
+                    dlclose(avutil_lib);
+                    dlclose(avcodec_lib);
+                    bail!("Failed to allocate libavcodec context/packet/frame");
+                }
+
+                if low_delay {
+                    let flags_ptr = ctx.add(AVCTX_FLAGS_OFFSET).cast::<i32>();
+                    let cur = flags_ptr.read_unaligned();
+                    flags_ptr.write_unaligned(cur | AV_CODEC_FLAG_LOW_DELAY);
+                }
+
+                if let Some(extra) = extradata {
+                    if !extra.is_empty() {
+                        let buf = av_mallocz(extra.len() + AV_INPUT_BUFFER_PADDING_SIZE);
+                        if buf.is_null() {
+                            av_frame_free(&mut frame);
+                            av_packet_free(&mut pkt);
+                            avcodec_free_context(&mut ctx);
+                            dlclose(avutil_lib);
+                            dlclose(avcodec_lib);
+                            bail!("av_mallocz failed for extradata");
+                        }
+                        ptr::copy_nonoverlapping(extra.as_ptr(), buf, extra.len());
+                        ctx.add(AVCTX_EXTRADATA_OFFSET)
+                            .cast::<*mut u8>()
+                            .write_unaligned(buf);
+                        ctx.add(AVCTX_EXTRADATA_SIZE_OFFSET)
+                            .cast::<i32>()
+                            .write_unaligned(extra.len() as i32);
+                    }
+                }
+
+                let mut opts: *mut c_void = ptr::null_mut();
+                for &(k, v) in options {
+                    av_dict_set(&mut opts, k.as_ptr(), v.as_ptr(), 0);
+                }
+                let rc = open2(ctx, codec, &mut opts);
+                av_dict_free(&mut opts);
+                if rc < 0 {
+                    av_frame_free(&mut frame);
+                    av_packet_free(&mut pkt);
+                    avcodec_free_context(&mut ctx);
+                    dlclose(avutil_lib);
+                    dlclose(avcodec_lib);
+                    bail!("avcodec_open2 failed with code {rc}");
+                }
+
+                Ok(Self {
+                    avcodec_lib,
+                    avutil_lib,
+                    ctx,
+                    pkt,
+                    frame,
+                    avcodec_free_context,
+                    av_packet_free,
+                    av_frame_free,
+                    av_frame_unref,
+                    avcodec_send_packet,
+                    avcodec_receive_frame,
+                })
+            }
+        }
+
+        pub fn send_packet_and_drain<F>(&mut self, payload: &[u8], mut on_frame: F) -> i32
+        where
+            F: FnMut(*const u8),
+        {
+            unsafe {
+                self.pkt
+                    .add(AVPKT_DATA_OFFSET)
+                    .cast::<*mut u8>()
+                    .write_unaligned(payload.as_ptr().cast_mut());
+                self.pkt
+                    .add(AVPKT_SIZE_OFFSET)
+                    .cast::<i32>()
+                    .write_unaligned(payload.len() as i32);
+
+                let send_rc = (self.avcodec_send_packet)(self.ctx, self.pkt);
+
+                self.pkt
+                    .add(AVPKT_DATA_OFFSET)
+                    .cast::<*mut u8>()
+                    .write_unaligned(ptr::null_mut());
+                self.pkt
+                    .add(AVPKT_SIZE_OFFSET)
+                    .cast::<i32>()
+                    .write_unaligned(0);
+
+                if send_rc >= 0 {
+                    while (self.avcodec_receive_frame)(self.ctx, self.frame) == 0 {
+                        on_frame(self.frame);
+                        (self.av_frame_unref)(self.frame);
+                    }
+                }
+                send_rc
+            }
+        }
+    }
+
+    impl Drop for LibAvDecoder {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.frame.is_null() {
+                    (self.av_frame_free)(&mut self.frame);
+                }
+                if !self.pkt.is_null() {
+                    (self.av_packet_free)(&mut self.pkt);
+                }
+                if !self.ctx.is_null() {
+                    (self.avcodec_free_context)(&mut self.ctx);
+                }
+                if !self.avutil_lib.is_null() {
+                    dlclose(self.avutil_lib);
+                }
+                if !self.avcodec_lib.is_null() {
+                    dlclose(self.avcodec_lib);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod libav_video {
+    use super::libav_sys::*;
+    use crate::codec::format_desc::VideoCodec;
+    use anyhow::Result;
+    use std::ptr;
+
+    const AV_PIX_FMT_YUV420P: i32 = 0;
+    const AV_PIX_FMT_YUVJ420P: i32 = 12;
+    const AV_PIX_FMT_NV12: i32 = 23;
+
+    pub struct LibAvVideoContext {
+        dec: LibAvDecoder,
+        warned_unexpected_fmt: bool,
+    }
+
+    impl LibAvVideoContext {
+        pub fn new(codec: VideoCodec) -> Result<Self> {
+            let codec_name = match codec {
+                VideoCodec::Hevc => c"hevc",
+                VideoCodec::H264 => c"h264",
+            };
+            let dec = LibAvDecoder::open(
+                codec_name,
+                true,
+                None,
+                &[(c"threads", c"1"), (c"flags", c"low_delay")],
+            )?;
+            Ok(Self {
+                dec,
+                warned_unexpected_fmt: false,
+            })
+        }
+
+        pub fn send_annex_b<F>(&mut self, annex_b: &[u8], mut on_frame: F)
+        where
+            F: FnMut(usize, usize, Vec<u8>, bool, usize),
+        {
+            let mut warned = self.warned_unexpected_fmt;
+            let mut count = 0usize;
+            self.dec.send_packet_and_drain(annex_b, |frame| unsafe {
+                let w = frame
+                    .add(AVFRAME_WIDTH_OFFSET)
+                    .cast::<i32>()
+                    .read_unaligned();
+                let h = frame
+                    .add(AVFRAME_HEIGHT_OFFSET)
+                    .cast::<i32>()
+                    .read_unaligned();
+                let pix_fmt = frame
+                    .add(AVFRAME_FORMAT_OFFSET)
+                    .cast::<i32>()
+                    .read_unaligned();
+                if w <= 0 || h <= 0 {
+                    return;
+                }
+                let width = w as usize;
+                let height = h as usize;
+                let data_ptrs = frame
+                    .add(AVFRAME_DATA_OFFSET)
+                    .cast::<[*const u8; 3]>()
+                    .read_unaligned();
+                let linesizes = frame
+                    .add(AVFRAME_LINESIZE_OFFSET)
+                    .cast::<[i32; 3]>()
+                    .read_unaligned();
+
+                if let Some(nv12) = frame_to_nv12(width, height, pix_fmt, data_ptrs, linesizes) {
+                    let full_range = pix_fmt == AV_PIX_FMT_YUVJ420P;
+                    count += 1;
+                    on_frame(width, height, nv12, full_range, count);
+                } else if !warned {
+                    warned = true;
+                    tracing::warn!(pix_fmt, "Unsupported AVFrame pixel format from libavcodec");
+                }
+            });
+            self.warned_unexpected_fmt = warned;
+        }
+    }
+
+    unsafe fn frame_to_nv12(
+        width: usize,
+        height: usize,
+        pix_fmt: i32,
+        data: [*const u8; 3],
+        linesize: [i32; 3],
+    ) -> Option<Vec<u8>> {
+        let y_src = data[0];
+        if y_src.is_null() {
+            return None;
+        }
+        let uv_h = height / 2;
+        let uv_w = width / 2;
+        let mut nv12 = vec![0_u8; width * height * 3 / 2];
+        let y_stride = linesize[0] as isize;
+
+        for row in 0..height {
+            let src = y_src.offset(row as isize * y_stride);
+            let dst = &mut nv12[row * width..(row + 1) * width];
+            ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), width);
+        }
+
+        let uv_dst_base = width * height;
+        match pix_fmt {
+            AV_PIX_FMT_NV12 => {
+                let uv_src = data[1];
+                if uv_src.is_null() {
+                    return None;
+                }
+                let uv_stride = linesize[1] as isize;
+                for row in 0..uv_h {
+                    let src = uv_src.offset(row as isize * uv_stride);
+                    let dst = &mut nv12[uv_dst_base + row * width..uv_dst_base + (row + 1) * width];
+                    ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), uv_w * 2);
+                }
+                Some(nv12)
+            }
+            AV_PIX_FMT_YUV420P | AV_PIX_FMT_YUVJ420P => {
+                let u_src = data[1];
+                let v_src = data[2];
+                if u_src.is_null() || v_src.is_null() {
+                    return None;
+                }
+                let u_stride = linesize[1] as isize;
+                let v_stride = linesize[2] as isize;
+                for row in 0..uv_h {
+                    let u_row =
+                        std::slice::from_raw_parts(u_src.offset(row as isize * u_stride), uv_w);
+                    let v_row =
+                        std::slice::from_raw_parts(v_src.offset(row as isize * v_stride), uv_w);
+                    let dst = &mut nv12[uv_dst_base + row * width..uv_dst_base + (row + 1) * width];
+                    for col in 0..uv_w {
+                        dst[col * 2] = u_row[col];
+                        dst[col * 2 + 1] = v_row[col];
+                    }
+                }
+                Some(nv12)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod tests {
+    use super::libav_video::LibAvVideoContext;
+    use crate::codec::format_desc::VideoCodec;
+
+    #[test]
+    fn libav_video_decoder_initializes_for_hevc_and_h264() {
+        let _hevc = LibAvVideoContext::new(VideoCodec::Hevc)
+            .expect("libavcodec HEVC decoder should initialize on Linux");
+        let _h264 = LibAvVideoContext::new(VideoCodec::H264)
+            .expect("libavcodec H.264 decoder should initialize on Linux");
     }
 }

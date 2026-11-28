@@ -1,6 +1,6 @@
 [package]
 name = "iphone-mirror-rs"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 rust-version = "1.85"
 description = "Native zero-copy 60fps iPhone screen mirroring & HID touch control for macOS/Hackintosh"
@@ -49,6 +49,11 @@ rand = "0.8"
 # Windowing & Raw Handles (macOS AppKit + Linux Wayland/X11 dynamic loading)
 winit = "0.30"
 raw-window-handle = "0.6"
+
+# Linux 2D UI Font Rasterization (Pure Rust, already in Cargo.lock)
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+ttf-parser = "0.25"
+ab_glyph_rasterizer = "0.1"
 
 # macOS Native Frameworks (macOS 12 Monterey .. macOS 26 Tahoe)
 [target.'cfg(target_os = "macos")'.dependencies]
