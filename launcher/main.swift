@@ -178,6 +178,9 @@ final class LauncherModel: ObservableObject {
     @Published var devices: [Device] = []
     @Published var selectedID: String?
     @Published var isScanning = false
+    @Published var isManualScanning = false
+    @Published var isPairing = false
+    @Published var pairingStatus: String?
     @Published var nearbyDevices: [NearbyDevice] = []
     @Published var bonjourScanning = false
     @Published var error: String?
@@ -204,6 +207,10 @@ final class LauncherModel: ObservableObject {
         )
     }
 
+    var usbDevice: Device? {
+        devices.first(where: { $0.connection_type == .usb })
+    }
+
     var filteredDevices: [Device] {
         let matches = devices.filter { device in
             transport == "auto"
@@ -211,12 +218,41 @@ final class LauncherModel: ObservableObject {
                 || (transport == "usb" && device.connection_type == .usb)
                 || (transport == "wifi" && device.connection_type == .network)
         }
-        var seen = Set<String>()
+        var seenUDIDs = Set<String>()
+        var seenHosts = Set<String>()
+        var seenNames = Set<String>()
         return matches.filter { device in
-            if transport == "auto" || transport == "airplay", seen.contains(device.udid) {
+            let hostKey = device.host?
+                .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+                .lowercased()
+            let nameKey = device.resolvedUserName.lowercased()
+
+            if seenUDIDs.contains(device.udid) {
                 return false
             }
-            seen.insert(device.udid)
+            if let hostKey, !hostKey.isEmpty, seenHosts.contains(hostKey) {
+                return false
+            }
+            if (transport == "auto" || transport == "airplay"), seenNames.contains(nameKey) {
+                return false
+            }
+            seenUDIDs.insert(device.udid)
+            if let hostKey, !hostKey.isEmpty {
+                seenHosts.insert(hostKey)
+            }
+            seenNames.insert(nameKey)
+            return true
+        }
+    }
+
+    var uniqueNearbyDevices: [NearbyDevice] {
+        var seen = Set<String>()
+        return nearbyDevices.filter { item in
+            let key = item.displayName.lowercased()
+            if seen.contains(key) {
+                return false
+            }
+            seen.insert(key)
             return true
         }
     }
@@ -237,7 +273,7 @@ final class LauncherModel: ObservableObject {
         }
         scanTask = Task {
             while !Task.isCancelled {
-                await scan()
+                await scan(manual: false)
                 try? await Task.sleep(nanoseconds: 4_000_000_000)
             }
         }
@@ -346,7 +382,16 @@ final class LauncherModel: ObservableObject {
         }
     }
 
-    func scan() async {
+    func scan(manual: Bool = false) async {
+        if manual {
+            isManualScanning = true
+        }
+        defer {
+            if manual {
+                isManualScanning = false
+            }
+        }
+        let startedAt = Date()
         let executableURL = backendURL
         do {
             let scanned: [Device] = try await Task.detached(priority: .utility) {
@@ -364,10 +409,21 @@ final class LauncherModel: ObservableObject {
                 }
                 return try JSONDecoder().decode([Device].self, from: data)
                     .sorted { lhs, rhs in
-                        if lhs.udid == rhs.udid { return lhs.connection_type == .usb }
+                        if lhs.connection_type != rhs.connection_type {
+                            return lhs.connection_type == .usb
+                        }
+                        if lhs.udid == rhs.udid {
+                            return lhs.connection_type == .usb
+                        }
                         return lhs.udid < rhs.udid
                     }
             }.value
+            if manual {
+                let elapsed = Date().timeIntervalSince(startedAt)
+                if elapsed < 0.55 {
+                    try? await Task.sleep(nanoseconds: UInt64((0.55 - elapsed) * 1_000_000_000))
+                }
+            }
             if scanned != devices {
                 devices = scanned
             }
@@ -386,6 +442,48 @@ final class LauncherModel: ObservableObject {
             if transport != "airplay" {
                 self.error = "Couldn’t scan for iPhones. Check that Apple Mobile Device services are running."
             }
+        }
+    }
+
+    func pairWifi() async {
+        guard !isPairing else { return }
+        guard let usb = usbDevice else {
+            self.error = "Connect your iPhone via USB cable first, then click Pair Wi-Fi."
+            return
+        }
+        isPairing = true
+        error = nil
+        pairingStatus = "Pairing with \(usb.displayName) over USB…"
+        defer { isPairing = false }
+
+        let executableURL = backendURL
+        let udid = usb.udid
+        do {
+            try await Task.detached(priority: .userInitiated) {
+                let process = Process()
+                let errPipe = Pipe()
+                process.executableURL = executableURL
+                process.arguments = ["pair", "--udid", udid]
+                process.standardOutput = Pipe()
+                process.standardError = errPipe
+                try process.run()
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                guard process.terminationStatus == 0 else {
+                    let msg = String(data: errData, encoding: .utf8)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    throw NSError(
+                        domain: "iPhoneMirrorPair",
+                        code: Int(process.terminationStatus),
+                        userInfo: [NSLocalizedDescriptionKey: msg.isEmpty ? "Pairing failed. Unlock iPhone and tap Trust if prompted." : msg]
+                    )
+                }
+            }.value
+            pairingStatus = "Wi-Fi paired! Direct Wi-Fi mirroring is ready."
+            await scan(manual: false)
+        } catch {
+            pairingStatus = nil
+            self.error = error.localizedDescription
         }
     }
 
@@ -739,14 +837,27 @@ struct ContentView: View {
                         .font(.system(size: 14, weight: .bold))
                         .foregroundColor(.white)
                     Spacer()
-                    Button { Task { await model.scan() } } label: {
+                    Button { Task { await model.scan(manual: true) } } label: {
                         Image(systemName: "arrow.clockwise")
                             .font(.system(size: 12, weight: .semibold))
-                            .foregroundColor(Color.white.opacity(0.8))
+                            .foregroundColor(model.isManualScanning ? .white : Color.white.opacity(0.8))
+                            .rotationEffect(.degrees(model.isManualScanning ? 360 : 0))
+                            .animation(
+                                model.isManualScanning
+                                    ? .linear(duration: 0.7).repeatForever(autoreverses: false)
+                                    : .easeOut(duration: 0.2),
+                                value: model.isManualScanning
+                            )
                             .padding(6)
-                            .background(Color.white.opacity(0.08), in: Circle())
+                            .background(
+                                (model.isManualScanning
+                                    ? Color(red: 0.28, green: 0.62, blue: 1.0).opacity(0.45)
+                                    : Color.white.opacity(0.08)),
+                                in: Circle()
+                            )
                     }
                     .buttonStyle(.plain)
+                    .disabled(model.isManualScanning)
                     .keyboardShortcut("r", modifiers: .command)
                     .help("Scan again")
                 }
@@ -811,12 +922,12 @@ struct ContentView: View {
                     }
                 }
 
-                if model.transport != "usb", !model.nearbyDevices.isEmpty {
+                if model.filteredDevices.isEmpty, model.transport != "usb", !model.uniqueNearbyDevices.isEmpty {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("Discovered on Wi-Fi")
                             .font(.system(size: 11, weight: .semibold))
                             .foregroundColor(Color.white.opacity(0.55))
-                        ForEach(model.nearbyDevices.prefix(3)) { device in
+                        ForEach(model.uniqueNearbyDevices.prefix(3)) { device in
                             HStack(spacing: 8) {
                                 Image(systemName: "wifi")
                                     .font(.system(size: 11))
@@ -841,10 +952,18 @@ struct ContentView: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(spacing: 6) {
-                            Circle()
-                                .fill(model.error == nil ? Color.green : Color.orange)
-                                .frame(width: 6, height: 6)
-                            Text(model.transport == "airplay" ? "AirPlay ready" : "Discovery active")
+                            if model.isManualScanning {
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .scaleEffect(0.58)
+                                    .frame(width: 10, height: 10)
+                                Text("Scanning…")
+                            } else {
+                                Circle()
+                                    .fill(model.error == nil ? Color.green : Color.orange)
+                                    .frame(width: 6, height: 6)
+                                Text(model.transport == "airplay" ? "AirPlay ready" : "Discovery active")
+                            }
                         }
                         Text(AppInfo.label)
                             .foregroundColor(Color.white.opacity(0.42))
@@ -984,6 +1103,11 @@ struct ContentView: View {
                         model.backendRunning ? model.disconnect() : model.connect()
                     }
                     .padding(.top, 26)
+
+                    if !model.backendRunning, (model.usbDevice != nil || model.transport == "wifi") {
+                        glassPairButton
+                            .padding(.top, 10)
+                    }
                 } else {
                     Image(systemName: "rectangle.on.rectangle.slash")
                         .font(.system(size: 56, weight: .ultraLight))
@@ -1000,6 +1124,31 @@ struct ContentView: View {
                         .multilineTextAlignment(.center)
                         .frame(maxWidth: 380)
                         .padding(.top, 8)
+
+                    if model.usbDevice != nil || model.transport == "wifi" {
+                        glassPairButton
+                            .padding(.top, 18)
+                    }
+                }
+
+                if let status = model.pairingStatus {
+                    HStack(spacing: 8) {
+                        Image(systemName: model.isPairing ? "arrow.triangle.2.circlepath" : "checkmark.circle.fill")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(Color(red: 0.45, green: 0.90, blue: 0.62))
+                        Text(status)
+                            .font(.system(size: 12))
+                            .foregroundColor(.white)
+                    }
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(Color.green.opacity(0.14), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .strokeBorder(Color.green.opacity(0.32), lineWidth: 1)
+                    )
+                    .padding(.top, 16)
                 }
 
                 if let error = model.error {
@@ -1060,6 +1209,40 @@ struct ContentView: View {
                 .strokeBorder(Color.white.opacity(0.20), lineWidth: 1)
         )
         .padding(.bottom, 12)
+    }
+
+    private var glassPairButton: some View {
+        Button {
+            Task { await model.pairWifi() }
+        } label: {
+            HStack(spacing: 7) {
+                if model.isPairing {
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.7)
+                } else {
+                    Image(systemName: "link.badge.plus")
+                        .font(.system(size: 11.5, weight: .semibold))
+                }
+                Text(model.isPairing ? "Pairing Wi-Fi…" : "Pair Wi-Fi via USB")
+                    .font(.system(size: 12.5, weight: .medium))
+            }
+            .foregroundColor(model.usbDevice != nil ? .white : Color.white.opacity(0.45))
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .background(Color.white.opacity(0.08), in: Capsule())
+            .overlay(
+                Capsule()
+                    .strokeBorder(Color.white.opacity(0.20), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(model.isPairing || model.usbDevice == nil)
+        .help(
+            model.usbDevice != nil
+                ? "Pair the USB iPhone for wireless Wi-Fi mirroring"
+                : "Connect your iPhone via USB cable to pair Wi-Fi"
+        )
     }
 
     private func glassPrimaryButton(title: String, action: @escaping () -> Void) -> some View {

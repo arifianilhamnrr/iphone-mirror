@@ -86,19 +86,33 @@ impl WifiDiscovery {
             return Ok(Vec::new());
         }
 
-        let mut devices = Vec::new();
+        let mut devices: Vec<WifiDevice> = Vec::new();
         for name in names {
             let args = ["-L", name.as_str(), "_remotepairing._tcp", "local."];
             match run_tool("dns-sd", &args, Duration::from_secs(RESOLVE_SECONDS)).await {
                 Ok(output) => {
                     if let Some(device) = parse_resolved(&name, &output) {
-                        devices.push(device);
+                        upsert_wifi_device(&mut devices, device);
                     }
                 }
                 Err(error) => debug!(%error, %name, "Could not resolve RemotePairing service"),
             }
         }
         Ok(devices)
+    }
+}
+
+/// Replace any earlier mDNS entry sharing the same host (ignoring case / trailing dot)
+/// so rotated iOS RemotePairing UUIDs do not produce duplicate devices in the UI.
+pub fn upsert_wifi_device(devices: &mut Vec<WifiDevice>, device: WifiDevice) {
+    let key = device.host.trim_end_matches('.').to_ascii_lowercase();
+    if let Some(existing) = devices
+        .iter_mut()
+        .find(|d| d.host.trim_end_matches('.').to_ascii_lowercase() == key)
+    {
+        *existing = device;
+    } else {
+        devices.push(device);
     }
 }
 
@@ -177,6 +191,43 @@ pub async fn pair_via_usb(provider: &dyn IdeviceProvider) -> Result<()> {
     Ok(())
 }
 
+/// Connect to a TCP host:port preferring IPv4 addresses before IPv6 link-local addresses,
+/// and attach actionable context when macOS Local Network privacy blocks the socket (`EHOSTUNREACH`).
+async fn connect_tcp_prefer_ipv4(addr: &str) -> Result<TcpStream> {
+    let mut addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(addr)
+        .await
+        .with_context(|| format!("Could not resolve {addr}"))?
+        .collect();
+    // Try IPv4 first so link-local IPv6 quirks on macOS don't fail with early EOF
+    // and mask an IPv4 Local Network permission block (os error 65).
+    addrs.sort_by_key(|a| if a.is_ipv4() { 0_u8 } else { 1_u8 });
+
+    let mut last_err: Option<std::io::Error> = None;
+    for target in addrs {
+        match TcpStream::connect(target).await {
+            Ok(stream) => return Ok(stream),
+            Err(err) => {
+                debug!(%target, %err, "TCP connect attempt failed");
+                last_err = Some(err);
+            }
+        }
+    }
+
+    let err = last_err.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "no resolved addresses",
+        )
+    });
+    #[cfg(target_os = "macos")]
+    if err.raw_os_error() == Some(65) {
+        return Err(err).context(format!(
+            "Could not reach {addr} (macOS Local Network permission blocked; enable 'iPhone Mirror' in System Settings -> Privacy & Security -> Local Network)"
+        ));
+    }
+    Err(err).with_context(|| format!("Could not reach {addr}"))
+}
+
 /// Connect to a Wi-Fi device and return a ready RSD adapter + handshake.
 pub async fn connect(device: &WifiDevice) -> Result<(AdapterHandle, RsdHandshake)> {
     let path = pairing_file_path()?;
@@ -184,9 +235,7 @@ pub async fn connect(device: &WifiDevice) -> Result<(AdapterHandle, RsdHandshake
 
     let pairing_addr = format!("{}:{}", device.host, device.port);
     info!(%pairing_addr, "Connecting to the iPhone over Wi-Fi");
-    let stream = TcpStream::connect(&pairing_addr)
-        .await
-        .with_context(|| format!("Could not reach {pairing_addr}"))?;
+    let stream = connect_tcp_prefer_ipv4(&pairing_addr).await?;
     let socket = RpPairingSocket::new(stream);
     let mut pairing = RemotePairingClient::new(socket, SENDING_HOST);
     pairing
@@ -199,9 +248,7 @@ pub async fn connect(device: &WifiDevice) -> Result<(AdapterHandle, RsdHandshake
 
     let tunnel_port = pairing.create_tcp_listener().await?;
     let tunnel_addr = format!("{}:{}", device.host, tunnel_port);
-    let tunnel_stream = TcpStream::connect(&tunnel_addr)
-        .await
-        .with_context(|| format!("Could not reach the tunnel at {tunnel_addr}"))?;
+    let tunnel_stream = connect_tcp_prefer_ipv4(&tunnel_addr).await?;
     let tunnel = connect_tls_psk_tunnel_native(tunnel_stream, pairing.encryption_key())
         .await
         .context("TLS-PSK tunnel handshake failed")?;
@@ -400,7 +447,32 @@ pub fn endpoint_from_env() -> Option<WifiDevice> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_avahi_browse_output;
+    use super::{parse_avahi_browse_output, upsert_wifi_device, WifiDevice};
+
+    #[test]
+    fn deduplicates_wifi_devices_by_host() {
+        let mut devices = Vec::new();
+        upsert_wifi_device(
+            &mut devices,
+            WifiDevice {
+                name: "Ar".to_string(),
+                identifier: "OLD-UUID".to_string(),
+                host: "Ar.local".to_string(),
+                port: 49152,
+            },
+        );
+        upsert_wifi_device(
+            &mut devices,
+            WifiDevice {
+                name: "Ar".to_string(),
+                identifier: "NEW-UUID".to_string(),
+                host: "ar.local.".to_string(),
+                port: 49152,
+            },
+        );
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].identifier, "NEW-UUID");
+    }
 
     #[test]
     fn parses_avahi_remotepairing_resolved_lines() {

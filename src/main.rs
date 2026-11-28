@@ -1497,9 +1497,13 @@ async fn list_devices(json: bool) -> Result<()> {
 
     match wifi::WifiDiscovery::discover().await {
         Ok(remote) => {
+            let mut seen_hosts = std::collections::BTreeSet::new();
             for device in remote {
                 debug!(name = %device.name, host = %device.host, port = device.port, "Found Wi-Fi iPhone");
-                let host_key = device.host.to_ascii_lowercase();
+                let host_key = device.host.trim_end_matches('.').to_ascii_lowercase();
+                if !seen_hosts.insert(host_key.clone()) {
+                    continue;
+                }
                 let cached = cache
                     .get(&device.identifier)
                     .or_else(|| cache.get(&host_key));

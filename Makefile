@@ -9,6 +9,8 @@ BUILD := $(shell /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Info.plist)
 ARCH := $(shell uname -m)
 MACOSX_DEPLOYMENT_TARGET := 12.0
 export MACOSX_DEPLOYMENT_TARGET
+SIGN_IDENTITY ?= $(shell security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/Apple Development/ {print $$2; exit}')
+EFFECTIVE_SIGN := $(if $(strip $(SIGN_IDENTITY)),$(SIGN_IDENTITY),-)
 ZIP := dist/iPhone-Mirror-v$(VERSION)-macOS-$(ARCH).zip
 DMG := dist/iPhone-Mirror-v$(VERSION)-macOS-$(ARCH).dmg
 DMG_ROOT := build/dmg-root
@@ -46,11 +48,13 @@ bundle: build
 	cp "$(ICON)" "$(HELPER)/Contents/Resources/AppIcon.icns"
 	cp "$(LAUNCHER)" "$(APP)/Contents/MacOS/iphone-mirror-launcher"
 	cp "$(TARGET)" "$(HELPER)/Contents/MacOS/iphone-mirror-backend"
-	python3 -c 'import plistlib; plistlib.dump({"CFBundleExecutable":"iphone-mirror-backend","CFBundleIdentifier":"id.web.projectar.iphone-mirror.stream","CFBundleName":"iPhone Mirror Stream","CFBundlePackageType":"APPL","CFBundleShortVersionString":"$(VERSION)","CFBundleVersion":"$(BUILD)","CFBundleIconFile":"AppIcon","LSMinimumSystemVersion":"12.0","LSUIElement":False,"NSHighResolutionCapable":True}, open("$(HELPER)/Contents/Info.plist", "wb"))'
+	python3 -c 'import plistlib; plistlib.dump({"CFBundleExecutable":"iphone-mirror-backend","CFBundleIdentifier":"id.web.projectar.iphone-mirror.stream","CFBundleName":"iPhone Mirror Stream","CFBundlePackageType":"APPL","CFBundleShortVersionString":"$(VERSION)","CFBundleVersion":"$(BUILD)","CFBundleIconFile":"AppIcon","LSMinimumSystemVersion":"12.0","LSUIElement":False,"NSHighResolutionCapable":True,"NSLocalNetworkUsageDescription":"iPhone Mirror connects to your iPhone over Wi-Fi for screen mirroring and input control.","NSBonjourServices":["_remotepairing._tcp","_apple-mobdev2._tcp","_airplay._tcp","_raop._tcp"]}, open("$(HELPER)/Contents/Info.plist", "wb"))'
 	chmod +x "$(APP)/Contents/MacOS/iphone-mirror-launcher" "$(HELPER)/Contents/MacOS/iphone-mirror-backend"
 	plutil -lint "$(APP)/Contents/Info.plist"
-	codesign --force --deep --sign - "$(APP)"
-	@echo "Build complete: $(APP)"
+	plutil -lint "$(HELPER)/Contents/Info.plist"
+	codesign --force --sign "$(EFFECTIVE_SIGN)" "$(HELPER)"
+	codesign --force --deep --sign "$(EFFECTIVE_SIGN)" "$(APP)"
+	@echo "Build complete: $(APP) (signed with: $(EFFECTIVE_SIGN))"
 
 verify: bundle
 	codesign --verify --deep --strict --verbose=2 "$(APP)"
