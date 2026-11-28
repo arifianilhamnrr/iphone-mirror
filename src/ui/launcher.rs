@@ -233,7 +233,9 @@ pub fn filter_devices_for_transport(
     devices: &[LauncherDevice],
     transport: TransportPreference,
 ) -> Vec<LauncherDevice> {
-    let mut seen = BTreeSet::new();
+    let mut seen_udids = BTreeSet::new();
+    let mut seen_hosts = BTreeSet::new();
+    let mut seen_names = BTreeSet::new();
     let mut out = Vec::new();
     for d in devices {
         let matches = match transport {
@@ -244,12 +246,23 @@ pub fn filter_devices_for_transport(
         if !matches {
             continue;
         }
+        if !seen_udids.insert(d.udid.clone()) {
+            continue;
+        }
+        if let Some(host) = &d.host {
+            let host_key = host.trim_end_matches('.').to_ascii_lowercase();
+            if !host_key.is_empty() && !seen_hosts.insert(host_key) {
+                continue;
+            }
+        }
         if matches!(
             transport,
             TransportPreference::Auto | TransportPreference::Airplay
-        ) && !seen.insert(d.udid.clone())
-        {
-            continue;
+        ) {
+            let name_key = d.resolved_user_name().to_ascii_lowercase();
+            if !seen_names.insert(name_key) {
+                continue;
+            }
         }
         out.push(d.clone());
     }
@@ -257,7 +270,10 @@ pub fn filter_devices_for_transport(
 }
 
 enum LauncherEvent {
-    DevicesScanned(Result<Vec<LauncherDevice>, String>),
+    DevicesScanned {
+        manual: bool,
+        result: Result<Vec<LauncherDevice>, String>,
+    },
     NearbyScanned(Vec<NearbyDevice>),
     UpdateChecked {
         silent: bool,
@@ -1290,6 +1306,7 @@ struct LauncherApp {
     selected_id: Option<String>,
     device_scroll: f32,
     is_scanning: bool,
+    is_manual_scanning: bool,
     error: Option<String>,
     status_notice: Option<String>,
     available_update: Option<AvailableUpdate>,
@@ -1321,6 +1338,7 @@ impl LauncherApp {
             selected_id: None,
             device_scroll: 0.0,
             is_scanning: false,
+            is_manual_scanning: false,
             error: None,
             status_notice: None,
             available_update: None,
@@ -1368,15 +1386,30 @@ impl LauncherApp {
         }
     }
 
-    fn trigger_scan(&mut self) {
+    fn trigger_scan(&mut self, manual: bool) {
         if self.is_scanning {
             return;
         }
         self.is_scanning = true;
+        if manual {
+            self.is_manual_scanning = true;
+            self.request_redraw();
+        }
         let proxy = self.proxy.clone();
         tokio::spawn(async move {
+            let started = std::time::Instant::now();
             let devices_res = scan_devices_json().await;
-            let _ = proxy.send_event(LauncherEvent::DevicesScanned(devices_res));
+            if manual {
+                let elapsed = started.elapsed();
+                let min_visual = std::time::Duration::from_millis(550);
+                if elapsed < min_visual {
+                    tokio::time::sleep(min_visual - elapsed).await;
+                }
+            }
+            let _ = proxy.send_event(LauncherEvent::DevicesScanned {
+                manual,
+                result: devices_res,
+            });
             let nearby = scan_nearby_avahi().await;
             let _ = proxy.send_event(LauncherEvent::NearbyScanned(nearby));
         });
@@ -1556,7 +1589,7 @@ impl LauncherApp {
 
     fn handle_action(&mut self, action: HitAction) {
         match action {
-            HitAction::Refresh => self.trigger_scan(),
+            HitAction::Refresh => self.trigger_scan(true),
             HitAction::OpenSettings => {
                 self.show_settings = true;
             }
@@ -1582,8 +1615,13 @@ impl LauncherApp {
                 }
             }
             HitAction::PairWifi => {
-                if let Some(dev) = self.selected_device() {
+                if let Some(dev) = self.devices.iter().find(|d| d.is_usb()).cloned() {
                     self.start_pair_wifi(dev.udid);
+                } else {
+                    self.error = Some(
+                        "Connect your iPhone via USB cable first, then click Pair Wi-Fi via USB."
+                            .to_string(),
+                    );
                 }
             }
             HitAction::CheckOrOpenUpdate => {
@@ -1723,13 +1761,21 @@ impl LauncherApp {
             refresh_rect.x + 12.0,
             refresh_rect.y + 12.0,
             12.0,
-            ColorRgba::white(if refresh_hover { 0.16 } else { 0.08 }),
+            if self.is_manual_scanning {
+                ColorRgba::rgba(0.28, 0.62, 1.0, 0.45)
+            } else {
+                ColorRgba::white(if refresh_hover { 0.16 } else { 0.08 })
+            },
         );
         c.draw_icon_refresh(
             refresh_rect.x + 12.0,
             refresh_rect.y + 12.0,
             5.0,
-            ColorRgba::white(if self.is_scanning { 0.45 } else { 0.85 }),
+            if self.is_manual_scanning {
+                ColorRgba::rgb(0.65, 0.88, 1.0)
+            } else {
+                ColorRgba::white(0.85)
+            },
         );
         self.hit_regions.push(HitRegion {
             rect: refresh_rect,
@@ -1830,16 +1876,25 @@ impl LauncherApp {
             y += 66.0;
         }
 
+        let filtered = self.filtered_devices();
+        let mut seen_nearby = BTreeSet::new();
+        let unique_nearby: Vec<NearbyDevice> = self
+            .nearby_devices
+            .iter()
+            .filter(|n| seen_nearby.insert(n.display_name().to_ascii_lowercase()))
+            .cloned()
+            .collect();
+
         let footer_h = 40.0;
-        let nearby_h = if self.settings.transport != TransportPreference::Usb
-            && !self.nearby_devices.is_empty()
+        let nearby_h = if filtered.is_empty()
+            && self.settings.transport != TransportPreference::Usb
+            && !unique_nearby.is_empty()
         {
-            22.0 + (self.nearby_devices.len().min(3) as f32) * 32.0
+            22.0 + (unique_nearby.len().min(3) as f32) * 32.0
         } else {
             0.0
         };
         let list_bottom = panel.y + panel.h - pad - footer_h - nearby_h - 8.0;
-        let filtered = self.filtered_devices();
 
         if filtered.is_empty() {
             let icon_cy = y + 20.0;
@@ -1981,7 +2036,7 @@ impl LauncherApp {
                 ColorRgba::white(0.55),
             );
             ny += 18.0;
-            for nearby in self.nearby_devices.iter().take(3) {
+            for nearby in unique_nearby.iter().take(3) {
                 c.draw_icon_wifi(ix + 7.0, ny + 10.0, 5.5, ColorRgba::rgb(0.45, 0.80, 1.0));
                 let name =
                     self.fonts
@@ -2010,13 +2065,17 @@ impl LauncherApp {
 
         // Footer
         let fy = panel.y + panel.h - pad - 28.0;
-        let status_dot = if self.error.is_none() {
+        let status_dot = if self.is_manual_scanning {
+            ColorRgba::rgb(0.32, 0.72, 1.0)
+        } else if self.error.is_none() {
             ColorRgba::rgb(0.24, 0.85, 0.45)
         } else {
             ColorRgba::rgb(1.0, 0.62, 0.22)
         };
         c.fill_circle(ix + 4.0, fy + 6.0, 3.0, status_dot);
-        let status_txt = if self.settings.transport == TransportPreference::Airplay {
+        let status_txt = if self.is_manual_scanning {
+            "Scanning…"
+        } else if self.settings.transport == TransportPreference::Airplay {
             "AirPlay ready"
         } else {
             "Discovery active"
@@ -2245,11 +2304,14 @@ impl LauncherApp {
             };
             self.draw_primary_button(c, cx, stage_cy + 62.0, btn_title);
 
-            if dev.is_usb() && !self.backend_running {
+            let has_usb = self.devices.iter().any(|d| d.is_usb());
+            if !self.backend_running
+                && (has_usb || self.settings.transport == TransportPreference::Wifi)
+            {
                 let pair_label = if self.pairing_in_progress {
                     "Pairing Wi-Fi…"
                 } else {
-                    "Pair for Wi-Fi Mirroring"
+                    "Pair Wi-Fi via USB"
                 };
                 let pw = self.fonts.measure_text(pair_label, 11.5, true) + 28.0;
                 let pair_rect = Rect::new(cx - pw * 0.5, stage_cy + 114.0, pw, 28.0);
@@ -2257,7 +2319,7 @@ impl LauncherApp {
                 c.fill_rounded_rect(
                     pair_rect,
                     14.0,
-                    ColorRgba::white(if hover { 0.14 } else { 0.08 }),
+                    ColorRgba::white(if hover && has_usb { 0.14 } else { 0.08 }),
                 );
                 c.stroke_rounded_rect(pair_rect, 14.0, 1.0, ColorRgba::white(0.20));
                 c.draw_text_centered(
@@ -2267,12 +2329,14 @@ impl LauncherApp {
                     pair_rect.y + 7.0,
                     11.5,
                     true,
-                    ColorRgba::white(0.86),
+                    ColorRgba::white(if has_usb { 0.86 } else { 0.45 }),
                 );
-                self.hit_regions.push(HitRegion {
-                    rect: pair_rect,
-                    action: HitAction::PairWifi,
-                });
+                if has_usb && !self.pairing_in_progress {
+                    self.hit_regions.push(HitRegion {
+                        rect: pair_rect,
+                        action: HitAction::PairWifi,
+                    });
+                }
             }
         } else {
             c.draw_icon_iphone(
@@ -2310,6 +2374,38 @@ impl LauncherApp {
                     false,
                     ColorRgba::white(0.70),
                 );
+            }
+            let has_usb = self.devices.iter().any(|d| d.is_usb());
+            if has_usb || self.settings.transport == TransportPreference::Wifi {
+                let pair_label = if self.pairing_in_progress {
+                    "Pairing Wi-Fi…"
+                } else {
+                    "Pair Wi-Fi via USB"
+                };
+                let pw = self.fonts.measure_text(pair_label, 11.5, true) + 28.0;
+                let pair_rect = Rect::new(cx - pw * 0.5, stage_cy + 86.0, pw, 28.0);
+                let hover = self.hovered_action == Some(HitAction::PairWifi);
+                c.fill_rounded_rect(
+                    pair_rect,
+                    14.0,
+                    ColorRgba::white(if hover && has_usb { 0.14 } else { 0.08 }),
+                );
+                c.stroke_rounded_rect(pair_rect, 14.0, 1.0, ColorRgba::white(0.20));
+                c.draw_text_centered(
+                    &mut self.fonts,
+                    pair_label,
+                    cx,
+                    pair_rect.y + 7.0,
+                    11.5,
+                    true,
+                    ColorRgba::white(if has_usb { 0.86 } else { 0.45 }),
+                );
+                if has_usb && !self.pairing_in_progress {
+                    self.hit_regions.push(HitRegion {
+                        rect: pair_rect,
+                        action: HitAction::PairWifi,
+                    });
+                }
             }
         }
 
@@ -2640,7 +2736,7 @@ impl ApplicationHandler<LauncherEvent> for LauncherApp {
                 Ok(renderer) => {
                     self.renderer = Some(renderer);
                     self.window = Some(window);
-                    self.trigger_scan();
+                    self.trigger_scan(false);
                     if self.settings.auto_check_updates {
                         self.trigger_update_check(true);
                     }
@@ -2672,17 +2768,19 @@ impl ApplicationHandler<LauncherEvent> for LauncherApp {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: LauncherEvent) {
         match event {
-            LauncherEvent::ScanRequested => self.trigger_scan(),
-            LauncherEvent::DevicesScanned(result) => {
+            LauncherEvent::ScanRequested => self.trigger_scan(false),
+            LauncherEvent::DevicesScanned { manual, result } => {
                 self.is_scanning = false;
+                if manual {
+                    self.is_manual_scanning = false;
+                }
                 match result {
                     Ok(mut scanned) => {
                         scanned.sort_by(|a, b| {
-                            if a.udid == b.udid {
-                                (!a.is_usb()).cmp(&(!b.is_usb()))
-                            } else {
-                                a.udid.cmp(&b.udid)
+                            if a.is_usb() != b.is_usb() {
+                                return (!a.is_usb()).cmp(&(!b.is_usb()));
                             }
+                            a.udid.cmp(&b.udid)
                         });
                         self.devices = scanned;
                         if !self.backend_running && !self.pairing_in_progress {
@@ -2765,7 +2863,7 @@ impl ApplicationHandler<LauncherEvent> for LauncherApp {
                     Ok(msg) => {
                         self.status_notice = Some(msg);
                         self.error = None;
-                        self.trigger_scan();
+                        self.trigger_scan(false);
                     }
                     Err(err) => {
                         self.status_notice = None;
@@ -2856,7 +2954,7 @@ impl ApplicationHandler<LauncherEvent> for LauncherApp {
                     Key::Character(ch)
                         if self.modifiers.control_key() && ch.eq_ignore_ascii_case("r") =>
                     {
-                        self.trigger_scan();
+                        self.trigger_scan(true);
                     }
                     Key::Character(ch) if self.modifiers.control_key() && ch.as_str() == "," => {
                         self.show_settings = !self.show_settings;

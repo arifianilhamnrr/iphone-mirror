@@ -1,5 +1,7 @@
 // language: Rust, file: src/codec/decoder.rs
-use crate::codec::format_desc::{FormatDescription, VideoCodec};
+use crate::codec::format_desc::FormatDescription;
+#[cfg(not(target_os = "macos"))]
+use crate::codec::format_desc::VideoCodec;
 use crate::codec::videotoolbox_sys::*;
 use anyhow::{bail, Result};
 #[cfg(target_os = "macos")]
@@ -130,6 +132,8 @@ pub struct HardwareDecoder {
     _callback_context: Box<CallbackContext>,
     #[cfg(not(target_os = "macos"))]
     backend: LinuxVideoBackend,
+    #[cfg(not(target_os = "macos"))]
+    needs_params: bool,
     _format_desc: FormatDescription,
 }
 
@@ -249,11 +253,13 @@ impl HardwareDecoder {
                         codec = format_desc.codec.ffmpeg_format(),
                         "Linux in-process libavcodec video decoder initialized"
                     );
+                    let needs_params = !format_desc.annex_b_params.is_empty();
                     return Ok(Self {
                         backend: LinuxVideoBackend::LibAv {
                             packet_tx: Some(packet_tx),
                             worker: Some(worker),
                         },
+                        needs_params,
                         _format_desc: format_desc,
                     });
                 }
@@ -347,6 +353,7 @@ impl HardwareDecoder {
                     stop,
                     reader_thread: Some(reader_thread),
                 },
+                needs_params: false,
                 _format_desc: format_desc,
             })
         }
@@ -437,10 +444,20 @@ impl HardwareDecoder {
 
         #[cfg(not(target_os = "macos"))]
         {
-            let mut annex_b = avcc_to_annex_b(avcc, self._format_desc.nal_length_size);
-            if annex_b.is_empty() {
+            let converted = avcc_to_annex_b(avcc, self._format_desc.nal_length_size);
+            if converted.is_empty() {
                 return Ok(());
             }
+            let mut annex_b = if self.needs_params {
+                self.needs_params = false;
+                let mut combined =
+                    Vec::with_capacity(self._format_desc.annex_b_params.len() + converted.len());
+                combined.extend_from_slice(&self._format_desc.annex_b_params);
+                combined.extend_from_slice(&converted);
+                combined
+            } else {
+                converted
+            };
             match &mut self.backend {
                 LinuxVideoBackend::LibAv { packet_tx, .. } => {
                     if let Some(tx) = packet_tx {
@@ -801,11 +818,16 @@ pub(crate) mod libav_sys {
         where
             F: FnMut(*const u8),
         {
+            // FFmpeg requires AVPacket data to be zero-padded by AV_INPUT_BUFFER_PADDING_SIZE.
+            let mut padded = Vec::with_capacity(payload.len() + AV_INPUT_BUFFER_PADDING_SIZE);
+            padded.extend_from_slice(payload);
+            padded.resize(payload.len() + AV_INPUT_BUFFER_PADDING_SIZE, 0);
+
             unsafe {
                 self.pkt
                     .add(AVPKT_DATA_OFFSET)
                     .cast::<*mut u8>()
-                    .write_unaligned(payload.as_ptr().cast_mut());
+                    .write_unaligned(padded.as_mut_ptr());
                 self.pkt
                     .add(AVPKT_SIZE_OFFSET)
                     .cast::<i32>()

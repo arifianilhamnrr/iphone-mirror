@@ -65,15 +65,7 @@ verify: bundle
 
 package-linux:
 	cargo build --release --locked
-	@stage="build/linux-stage/iPhone-Mirror-v$(VERSION)-linux-x86_64"; \
-	mkdir -p "$$stage/resources" "$$stage/scripts" dist; \
-	cp target/release/iphone-mirror "$$stage/iphone-mirror"; \
-	cp resources/AppIcon.png "$$stage/resources/AppIcon.png"; \
-	cp scripts/install-linux.sh "$$stage/install.sh"; \
-	cp README.md "$$stage/README.md"; \
-	chmod +x "$$stage/iphone-mirror" "$$stage/install.sh"; \
-	tar -C "build/linux-stage" -czf "dist/iPhone-Mirror-v$(VERSION)-linux-x86_64.tar.gz" "iPhone-Mirror-v$(VERSION)-linux-x86_64"; \
-	echo "Created dist/iPhone-Mirror-v$(VERSION)-linux-x86_64.tar.gz"
+	bash scripts/package-linux.sh
 
 package: verify installer
 	rm -f "$(ZIP)"

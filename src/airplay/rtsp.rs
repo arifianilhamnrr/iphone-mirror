@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -239,7 +239,7 @@ async fn handle_rtsp_connection(
         };
 
         let cseq = req.headers.get("cseq").cloned();
-        let response = dispatch_request(&req, addr.ip(), &mut state, &identity, &callbacks).await;
+        let response = dispatch_request(&req, addr, &mut state, &identity, &callbacks).await;
         let proto = if req.proto.starts_with("HTTP/") {
             "RTSP/1.0"
         } else {
@@ -305,7 +305,7 @@ impl RtspResponse {
 
 async fn dispatch_request(
     req: &RtspRequest,
-    peer_ip: IpAddr,
+    peer_addr: SocketAddr,
     state: &mut SessionState,
     identity: &ServerIdentity,
     callbacks: &Arc<AirPlayCallbacks>,
@@ -382,7 +382,7 @@ async fn dispatch_request(
                 RtspResponse::bad_request()
             }
         },
-        ("SETUP", _) => handle_setup(&req.body, peer_ip, state, callbacks).await,
+        ("SETUP", _) => handle_setup(&req.body, peer_addr, state, callbacks).await,
         ("RECORD", _) => {
             let mut resp = RtspResponse::ok();
             resp.headers.push(("Audio-Latency", "11025".to_string()));
@@ -416,7 +416,7 @@ fn plist_as_u64(value: &Value) -> Option<u64> {
 
 async fn handle_setup(
     body: &[u8],
-    peer_ip: IpAddr,
+    peer_addr: SocketAddr,
     state: &mut SessionState,
     callbacks: &Arc<AirPlayCallbacks>,
 ) -> RtspResponse {
@@ -460,7 +460,7 @@ async fn handle_setup(
         let ntp_port = match state.ntp_port {
             Some(p) => p,
             None => {
-                match spawn_ntp_client(peer_ip, timing_rport, state.stream_shutdown.subscribe())
+                match spawn_ntp_client(peer_addr, timing_rport, state.stream_shutdown.subscribe())
                     .await
                 {
                     Ok(p) => {
@@ -586,11 +586,23 @@ fn current_ntp_timestamp_be() -> [u8; 8] {
 }
 
 async fn spawn_ntp_client(
-    peer_ip: IpAddr,
+    peer_addr: SocketAddr,
     timing_rport: u16,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<u16> {
-    let bind_addr = if peer_ip.is_ipv6() {
+    let target_addr = match peer_addr {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(ipv4) => SocketAddr::V4(std::net::SocketAddrV4::new(ipv4, timing_rport)),
+            None => SocketAddr::V6(std::net::SocketAddrV6::new(
+                *v6.ip(),
+                timing_rport,
+                v6.flowinfo(),
+                v6.scope_id(),
+            )),
+        },
+        SocketAddr::V4(v4) => SocketAddr::V4(std::net::SocketAddrV4::new(*v4.ip(), timing_rport)),
+    };
+    let bind_addr = if target_addr.is_ipv6() {
         "[::]:0"
     } else {
         "0.0.0.0:0"
@@ -598,7 +610,7 @@ async fn spawn_ntp_client(
     let sock = UdpSocket::bind(bind_addr).await?;
     let port = sock.local_addr()?.port();
     let remote = if timing_rport > 0 {
-        Some(SocketAddr::new(peer_ip, timing_rport))
+        Some(target_addr)
     } else {
         None
     };

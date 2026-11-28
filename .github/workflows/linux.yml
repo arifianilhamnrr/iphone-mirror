@@ -19,6 +19,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Linux packaging tools (dpkg, rpmbuild, file, fuse)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg rpm file desktop-file-utils curl
+
       - name: Cache Cargo registry & build artifacts
         uses: actions/cache@v4
         with:
@@ -34,18 +39,8 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
-      - name: Package universal Linux tarball
-        run: |
-          VERSION=$(grep -E '^version = ' Cargo.toml | head -n1 | cut -d'"' -f2)
-          STAGE="build/linux-stage/iPhone-Mirror-v${VERSION}-linux-x86_64"
-          mkdir -p "$STAGE/resources" dist
-          cp target/release/iphone-mirror "$STAGE/iphone-mirror"
-          cp resources/AppIcon.png "$STAGE/resources/AppIcon.png"
-          cp scripts/install-linux.sh "$STAGE/install.sh"
-          cp README.md "$STAGE/README.md"
-          chmod +x "$STAGE/iphone-mirror" "$STAGE/install.sh"
-          tar -C "build/linux-stage" -czf "dist/iPhone-Mirror-v${VERSION}-linux-x86_64.tar.gz" "iPhone-Mirror-v${VERSION}-linux-x86_64"
-          (cd dist && sha256sum "iPhone-Mirror-v${VERSION}-linux-x86_64.tar.gz" > "SHA256SUMS-linux-x86_64.txt")
+      - name: Package universal Linux formats (.tar.gz, .deb, .rpm, .AppImage)
+        run: bash scripts/package-linux.sh
 
       - name: Upload Linux release assets
         if: startsWith(github.ref, 'refs/tags/v')
@@ -53,4 +48,7 @@ jobs:
         with:
           files: |
             dist/iPhone-Mirror-v*-linux-x86_64.tar.gz
+            dist/iphone-mirror_*_amd64.deb
+            dist/iphone-mirror-*-1.x86_64.rpm
+            dist/iPhone-Mirror-v*-x86_64.AppImage
             dist/SHA256SUMS-linux-x86_64.txt

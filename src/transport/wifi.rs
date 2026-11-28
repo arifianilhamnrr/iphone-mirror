@@ -23,7 +23,7 @@ use tokio::{
     net::TcpStream,
     process::Command,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Stable host name presented during RemotePairing. It must not change
 /// between runs, otherwise the saved pairing file no longer matches.
@@ -313,22 +313,10 @@ pub async fn connect(device: &WifiDevice) -> Result<(AdapterHandle, RsdHandshake
     let stream = connect_tcp_prefer_ipv4(&pairing_addr).await?;
     let socket = RpPairingSocket::new(stream);
     let mut pairing = RemotePairingClient::new(socket, SENDING_HOST);
-    if let Err(err) = pairing
+    pairing
         .connect(&mut file, || async { "000000".to_string() })
         .await
-    {
-        warn!(%err, "Saved RemotePairing identity failed; retrying with fresh identity");
-        file = RpPairingFile::generate(SENDING_HOST);
-        let retry_stream = TcpStream::connect(&pairing_addr)
-            .await
-            .with_context(|| format!("Could not reach {pairing_addr}"))?;
-        let retry_socket = RpPairingSocket::new(retry_stream);
-        pairing = RemotePairingClient::new(retry_socket, SENDING_HOST);
-        pairing
-            .connect(&mut file, || async { "000000".to_string() })
-            .await
-            .context("RemotePairing with the Wi-Fi device failed")?;
-    }
+        .context("RemotePairing with the Wi-Fi device failed — connect via USB and click 'Pair Wi-Fi via USB' to refresh pairing keys")?;
     file.write_to_file(&path)
         .await
         .context("Could not persist the RemotePairing file")?;

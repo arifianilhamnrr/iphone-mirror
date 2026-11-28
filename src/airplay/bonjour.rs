@@ -65,25 +65,32 @@ impl BonjourRegistration {
             std::thread::sleep(std::time::Duration::from_millis(100));
 
             let spawn_avahi = |svc_name: &str, svc_type: &str, txt: &[&str]| {
-                let mut cmd = Command::new("avahi-publish-service");
-                cmd.args([svc_name, svc_type, &port_str])
-                    .args(txt)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .kill_on_drop(true);
-                #[cfg(target_os = "linux")]
-                unsafe {
-                    cmd.pre_exec(|| {
-                        extern "C" {
-                            fn prctl(option: std::ffi::c_int, ...) -> std::ffi::c_int;
-                        }
-                        const PR_SET_PDEATHSIG: std::ffi::c_int = 1;
-                        const SIGTERM: std::ffi::c_int = 15;
-                        prctl(PR_SET_PDEATHSIG, SIGTERM);
-                        Ok(())
-                    });
-                }
-                cmd.spawn()
+                let try_prog = |prog: &str, extra_flag: Option<&str>| {
+                    let mut cmd = Command::new(prog);
+                    if let Some(flag) = extra_flag {
+                        cmd.arg(flag);
+                    }
+                    cmd.args([svc_name, svc_type, &port_str])
+                        .args(txt)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .kill_on_drop(true);
+                    #[cfg(target_os = "linux")]
+                    unsafe {
+                        cmd.pre_exec(|| {
+                            extern "C" {
+                                fn prctl(option: std::ffi::c_int, ...) -> std::ffi::c_int;
+                            }
+                            const PR_SET_PDEATHSIG: std::ffi::c_int = 1;
+                            const SIGTERM: std::ffi::c_int = 15;
+                            prctl(PR_SET_PDEATHSIG, SIGTERM);
+                            Ok(())
+                        });
+                    }
+                    cmd.spawn()
+                };
+                try_prog("avahi-publish-service", None)
+                    .or_else(|_| try_prog("avahi-publish", Some("-s")))
             };
 
             if let (Ok(airplay), Ok(raop)) = (
