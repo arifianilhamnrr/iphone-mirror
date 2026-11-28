@@ -1,7 +1,17 @@
 // language: Rust, file: src/ui/launcher.rs, target: Linux (Wayland & X11)
 //! Native Glassmorphism Launcher UI for Linux, matching the macOS SwiftUI launcher.
 
-use crate::{transport::device_scanner::TransportPreference, ui::metal_renderer::MetalRenderer};
+use crate::{
+    notifications::{
+        fallback_relay::NotificationEngine,
+        ipc::{DaemonToHostMessage, HostToDaemonMessage},
+        linux_bluez::{inspect_bluez_status, solicit_ancs_advertisement},
+        linux_desktop::LinuxDesktopNotifier,
+        IosNotification, NotificationSettings,
+    },
+    transport::device_scanner::TransportPreference,
+    ui::metal_renderer::MetalRenderer,
+};
 use ab_glyph_rasterizer::{point, Rasterizer};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -44,6 +54,8 @@ pub struct LauncherSettings {
     pub auto_connect: bool,
     #[serde(default = "default_true")]
     pub auto_check_updates: bool,
+    #[serde(default)]
+    pub notifications: NotificationSettings,
 }
 
 fn default_true() -> bool {
@@ -57,6 +69,7 @@ impl Default for LauncherSettings {
             auto_rotate: true,
             auto_connect: false,
             auto_check_updates: true,
+            notifications: NotificationSettings::default(),
         }
     }
 }
@@ -286,6 +299,7 @@ enum LauncherEvent {
     },
     PairFinished(Result<String, String>),
     ScanRequested,
+    BluezStatusUpdated(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,6 +307,13 @@ enum HitAction {
     Refresh,
     OpenSettings,
     CloseSettings,
+    ToggleNotificationsPanel,
+    ToggleNotificationsEnabled,
+    ToggleMuteWhileMirroring,
+    ToggleHidePreviews,
+    SendTestNotification,
+    SolicitBluezAncs,
+    ClearNotifications,
     SelectMode(TransportPreference),
     SelectDevice(String),
     PrimaryAction,
@@ -1289,6 +1310,19 @@ impl Canvas {
             color,
         );
     }
+
+    fn draw_icon_bell(&mut self, cx: f32, cy: f32, r: f32, color: ColorRgba) {
+        self.fill_circle(cx, cy - r * 0.10, r * 0.55, color);
+        self.draw_line_aa(
+            cx - r * 0.72,
+            cy + r * 0.48,
+            cx + r * 0.72,
+            cy + r * 0.48,
+            1.5,
+            color,
+        );
+        self.fill_circle(cx, cy + r * 0.72, r * 0.22, color);
+    }
 }
 
 // ============================================================================
@@ -1318,6 +1352,11 @@ struct LauncherApp {
     did_auto_connect: bool,
     pairing_in_progress: bool,
     show_settings: bool,
+    show_notifications_panel: bool,
+    bluez_status: String,
+    desktop_notifier: LinuxDesktopNotifier,
+    notification_engine: Option<NotificationEngine>,
+    notification_history: Vec<IosNotification>,
     hovered_action: Option<HitAction>,
     hit_regions: Vec<HitRegion>,
     modifiers: ModifiersState,
@@ -1327,6 +1366,7 @@ struct LauncherApp {
 impl LauncherApp {
     fn new(proxy: EventLoopProxy<LauncherEvent>) -> Self {
         let settings = load_launcher_settings();
+        let notification_engine = NotificationEngine::new(settings.notifications.clone()).ok();
         Self {
             window: None,
             renderer: None,
@@ -1350,10 +1390,53 @@ impl LauncherApp {
             did_auto_connect: false,
             pairing_in_progress: false,
             show_settings: false,
+            show_notifications_panel: false,
+            bluez_status: "Checking BlueZ ANCS status…".to_string(),
+            desktop_notifier: LinuxDesktopNotifier::new(),
+            notification_engine,
+            notification_history: Vec::new(),
             hovered_action: None,
             hit_regions: Vec::new(),
             modifiers: ModifiersState::default(),
             cursor_logical: None,
+        }
+    }
+
+    fn refresh_bluez_status(&self) {
+        let proxy = self.proxy.clone();
+        tokio::spawn(async move {
+            let status = inspect_bluez_status();
+            let _ = proxy.send_event(LauncherEvent::BluezStatusUpdated(status.detail));
+        });
+    }
+
+    fn sync_notification_settings(&mut self) {
+        save_launcher_settings(&self.settings);
+        if let Some(engine) = &mut self.notification_engine {
+            let _ = engine.handle_host_message(
+                HostToDaemonMessage::UpdateSettings {
+                    settings: self.settings.notifications.clone(),
+                },
+                std::time::Instant::now(),
+            );
+        }
+    }
+
+    fn send_test_notification(&mut self) {
+        if let Some(engine) = &mut self.notification_engine {
+            let msgs = engine.handle_host_message(
+                HostToDaemonMessage::SendTestNotification,
+                std::time::Instant::now(),
+            );
+            for msg in msgs {
+                if let DaemonToHostMessage::DeliverNotification { notification } = msg {
+                    self.desktop_notifier.deliver(&notification);
+                    self.notification_history.insert(0, notification);
+                    if self.notification_history.len() > 100 {
+                        self.notification_history.truncate(100);
+                    }
+                }
+            }
         }
     }
 
@@ -1596,6 +1679,40 @@ impl LauncherApp {
             HitAction::CloseSettings => {
                 self.show_settings = false;
             }
+            HitAction::ToggleNotificationsPanel => {
+                self.show_notifications_panel = !self.show_notifications_panel;
+                if self.show_notifications_panel {
+                    self.refresh_bluez_status();
+                }
+            }
+            HitAction::ToggleNotificationsEnabled => {
+                self.settings.notifications.enabled = !self.settings.notifications.enabled;
+                self.sync_notification_settings();
+            }
+            HitAction::ToggleMuteWhileMirroring => {
+                self.settings.notifications.mute_while_mirroring =
+                    !self.settings.notifications.mute_while_mirroring;
+                self.sync_notification_settings();
+            }
+            HitAction::ToggleHidePreviews => {
+                self.settings.notifications.hide_previews =
+                    !self.settings.notifications.hide_previews;
+                self.sync_notification_settings();
+            }
+            HitAction::SendTestNotification => {
+                self.send_test_notification();
+            }
+            HitAction::SolicitBluezAncs => {
+                let proxy = self.proxy.clone();
+                tokio::spawn(async move {
+                    let _ = solicit_ancs_advertisement();
+                    let status = inspect_bluez_status();
+                    let _ = proxy.send_event(LauncherEvent::BluezStatusUpdated(status.detail));
+                });
+            }
+            HitAction::ClearNotifications => {
+                self.notification_history.clear();
+            }
             HitAction::SelectMode(mode) => {
                 self.settings.transport = mode;
                 save_launcher_settings(&self.settings);
@@ -1703,7 +1820,11 @@ impl LauncherApp {
         );
 
         self.draw_sidebar(&mut canvas, sidebar_rect);
-        self.draw_stage(&mut canvas, stage_rect);
+        if self.show_notifications_panel {
+            self.draw_notifications_stage(&mut canvas, stage_rect);
+        } else {
+            self.draw_stage(&mut canvas, stage_rect);
+        }
 
         if self.show_settings {
             self.draw_settings_modal(&mut canvas, lw, lh);
@@ -1737,6 +1858,33 @@ impl LauncherApp {
 
         let refresh_rect = Rect::new(ix + iw - 24.0, y, 24.0, 24.0);
         let settings_rect = Rect::new(ix + iw - 54.0, y, 24.0, 24.0);
+        let bell_rect = Rect::new(ix + iw - 84.0, y, 24.0, 24.0);
+
+        let bell_hover = self.hovered_action == Some(HitAction::ToggleNotificationsPanel);
+        c.fill_circle(
+            bell_rect.x + 12.0,
+            bell_rect.y + 12.0,
+            12.0,
+            if self.show_notifications_panel {
+                ColorRgba::rgba(0.28, 0.62, 1.0, 0.45)
+            } else {
+                ColorRgba::white(if bell_hover { 0.16 } else { 0.08 })
+            },
+        );
+        c.draw_icon_bell(
+            bell_rect.x + 12.0,
+            bell_rect.y + 12.0,
+            5.5,
+            ColorRgba::white(if self.settings.notifications.enabled {
+                0.90
+            } else {
+                0.45
+            }),
+        );
+        self.hit_regions.push(HitRegion {
+            rect: bell_rect,
+            action: HitAction::ToggleNotificationsPanel,
+        });
 
         let settings_hover = self.hovered_action == Some(HitAction::OpenSettings);
         c.fill_circle(
@@ -2448,6 +2596,202 @@ impl LauncherApp {
         }
     }
 
+    fn draw_notifications_stage(&mut self, c: &mut Canvas, panel: Rect) {
+        c.draw_glass_surface(panel, 20.0, 0.06);
+        let pad = 22.0;
+        let ix = panel.x + pad;
+        let iw = panel.w - pad * 2.0;
+        let mut y = panel.y + pad;
+
+        c.draw_icon_bell(ix + 10.0, y + 10.0, 6.5, ColorRgba::rgb(0.32, 0.68, 1.0));
+        c.draw_text(
+            &mut self.fonts,
+            "iPhone Notifications",
+            ix + 24.0,
+            y + 1.0,
+            16.5,
+            true,
+            ColorRgba::white(0.98),
+        );
+
+        let close_rect = Rect::new(ix + iw - 24.0, y, 24.0, 24.0);
+        c.fill_circle(
+            close_rect.x + 12.0,
+            close_rect.y + 12.0,
+            12.0,
+            ColorRgba::white(
+                if self.hovered_action == Some(HitAction::ToggleNotificationsPanel) {
+                    0.18
+                } else {
+                    0.08
+                },
+            ),
+        );
+        c.draw_icon_close(
+            close_rect.x + 12.0,
+            close_rect.y + 12.0,
+            4.2,
+            ColorRgba::white(0.85),
+        );
+        self.hit_regions.push(HitRegion {
+            rect: close_rect,
+            action: HitAction::ToggleNotificationsPanel,
+        });
+
+        y += 38.0;
+        let status_card = Rect::new(ix, y, iw, 92.0);
+        c.fill_rounded_rect(status_card, 12.0, ColorRgba::white(0.06));
+        c.stroke_rounded_rect(status_card, 12.0, 1.0, ColorRgba::white(0.11));
+
+        let bluez_line = self
+            .fonts
+            .truncate_to_width(&self.bluez_status, 12.0, true, iw - 24.0);
+        c.draw_text(
+            &mut self.fonts,
+            &bluez_line,
+            ix + 12.0,
+            y + 12.0,
+            12.0,
+            true,
+            ColorRgba::white(0.92),
+        );
+        let hint = self.fonts.truncate_to_width(
+            "Pair iPhone via Bluetooth and enable Share System Notifications in iPhone Settings.",
+            11.0,
+            false,
+            iw - 24.0,
+        );
+        c.draw_text(
+            &mut self.fonts,
+            &hint,
+            ix + 12.0,
+            y + 32.0,
+            11.0,
+            false,
+            ColorRgba::white(0.62),
+        );
+
+        let buttons = [
+            (
+                "Send Test Notification",
+                HitAction::SendTestNotification,
+                160.0,
+            ),
+            ("Solicit ANCS BLE", HitAction::SolicitBluezAncs, 134.0),
+            ("Clear History", HitAction::ClearNotifications, 110.0),
+        ];
+        let mut bx = ix + 12.0;
+        for (label, action, w) in buttons {
+            let r = Rect::new(bx, y + 54.0, w, 26.0);
+            let hover = self.hovered_action.as_ref() == Some(&action);
+            c.fill_rounded_rect(r, 8.0, ColorRgba::white(if hover { 0.16 } else { 0.09 }));
+            c.stroke_rounded_rect(r, 8.0, 1.0, ColorRgba::white(0.18));
+            c.draw_text_centered(
+                &mut self.fonts,
+                label,
+                r.x + r.w * 0.5,
+                r.y + 6.5,
+                11.0,
+                true,
+                ColorRgba::white(0.92),
+            );
+            self.hit_regions.push(HitRegion { rect: r, action });
+            bx += w + 8.0;
+        }
+
+        y += 106.0;
+        let toggles = [
+            (
+                "Enable Notifications",
+                self.settings.notifications.enabled,
+                HitAction::ToggleNotificationsEnabled,
+            ),
+            (
+                "Mute While Mirroring",
+                self.settings.notifications.mute_while_mirroring,
+                HitAction::ToggleMuteWhileMirroring,
+            ),
+            (
+                "Hide Previews",
+                self.settings.notifications.hide_previews,
+                HitAction::ToggleHidePreviews,
+            ),
+        ];
+        let chip_w = (iw - 16.0) / 3.0;
+        for (i, (label, on, action)) in toggles.into_iter().enumerate() {
+            let r = Rect::new(ix + i as f32 * (chip_w + 8.0), y, chip_w, 28.0);
+            c.fill_rounded_rect(
+                r,
+                8.0,
+                if on {
+                    ColorRgba::rgba(0.24, 0.55, 1.0, 0.35)
+                } else {
+                    ColorRgba::white(0.06)
+                },
+            );
+            c.stroke_rounded_rect(r, 8.0, 1.0, ColorRgba::white(if on { 0.34 } else { 0.14 }));
+            c.draw_text_centered(
+                &mut self.fonts,
+                label,
+                r.x + r.w * 0.5,
+                r.y + 7.5,
+                11.0,
+                on,
+                ColorRgba::white(if on { 0.96 } else { 0.72 }),
+            );
+            self.hit_regions.push(HitRegion { rect: r, action });
+        }
+
+        y += 42.0;
+        if self.notification_history.is_empty() {
+            c.draw_text_centered(
+                &mut self.fonts,
+                "No notifications yet — click 'Send Test Notification' to test FreeDesktop alerts.",
+                panel.x + panel.w * 0.5,
+                y + 70.0,
+                12.0,
+                false,
+                ColorRgba::white(0.55),
+            );
+            return;
+        }
+
+        for notif in self.notification_history.iter().take(5) {
+            if y + 54.0 > panel.y + panel.h - pad {
+                break;
+            }
+            let row = Rect::new(ix, y, iw, 50.0);
+            c.fill_rounded_rect(row, 10.0, ColorRgba::white(0.06));
+            c.stroke_rounded_rect(row, 10.0, 1.0, ColorRgba::white(0.10));
+            let headline = format!("{} • {}", notif.app_display_name, notif.title);
+            let h_trunc = self
+                .fonts
+                .truncate_to_width(&headline, 12.0, true, iw - 24.0);
+            c.draw_text(
+                &mut self.fonts,
+                &h_trunc,
+                ix + 12.0,
+                y + 9.0,
+                12.0,
+                true,
+                ColorRgba::white(0.95),
+            );
+            let b_trunc = self
+                .fonts
+                .truncate_to_width(&notif.body, 11.2, false, iw - 24.0);
+            c.draw_text(
+                &mut self.fonts,
+                &b_trunc,
+                ix + 12.0,
+                y + 27.0,
+                11.2,
+                false,
+                ColorRgba::white(0.72),
+            );
+            y += 58.0;
+        }
+    }
+
     fn draw_primary_button(&mut self, c: &mut Canvas, cx: f32, y: f32, title: &str) {
         let tw = self.fonts.measure_text(title, 14.0, true);
         let bw = (tw + 66.0).max(176.0);
@@ -2870,6 +3214,10 @@ impl ApplicationHandler<LauncherEvent> for LauncherApp {
                         self.error = Some(err);
                     }
                 }
+                self.request_redraw();
+            }
+            LauncherEvent::BluezStatusUpdated(detail) => {
+                self.bluez_status = detail;
                 self.request_redraw();
             }
         }

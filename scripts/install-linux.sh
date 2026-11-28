@@ -37,16 +37,16 @@ echo "==> Installing runtime dependencies (usbmuxd, avahi, ffmpeg, clipboard, ze
 install_deps() {
   if command -v apt-get >/dev/null 2>&1; then
     sudo apt-get update
-    sudo apt-get install -y usbmuxd libimobiledevice-utils avahi-daemon avahi-utils ffmpeg wl-clipboard xclip zenity curl
+    sudo apt-get install -y usbmuxd libimobiledevice-utils avahi-daemon avahi-utils ffmpeg wl-clipboard xclip zenity curl bluez libnotify-bin
   elif command -v dnf >/dev/null 2>&1; then
-    sudo dnf install -y usbmuxd libimobiledevice-utils avahi avahi-tools ffmpeg-free wl-clipboard xclip zenity curl || \
-      sudo dnf install -y usbmuxd avahi avahi-tools wl-clipboard xclip zenity curl
+    sudo dnf install -y usbmuxd libimobiledevice-utils avahi avahi-tools ffmpeg-free wl-clipboard xclip zenity curl bluez libnotify || \
+      sudo dnf install -y usbmuxd avahi avahi-tools wl-clipboard xclip zenity curl bluez libnotify
   elif command -v pacman >/dev/null 2>&1; then
-    sudo pacman -Sy --needed --noconfirm usbmuxd libimobiledevice avahi ffmpeg wl-clipboard xclip zenity curl
+    sudo pacman -Sy --needed --noconfirm usbmuxd libimobiledevice avahi ffmpeg wl-clipboard xclip zenity curl bluez bluez-utils libnotify
   elif command -v zypper >/dev/null 2>&1; then
-    sudo zypper install -y usbmuxd avahi avahi-utils ffmpeg wl-clipboard xclip zenity curl
+    sudo zypper install -y usbmuxd avahi avahi-utils ffmpeg wl-clipboard xclip zenity curl bluez libnotify-tools
   elif command -v apk >/dev/null 2>&1; then
-    sudo apk add usbmuxd avahi avahi-tools ffmpeg wl-clipboard xclip zenity curl
+    sudo apk add usbmuxd avahi avahi-tools ffmpeg wl-clipboard xclip zenity curl bluez libnotify
   else
     echo "Notice: Unknown package manager. Please ensure these runtime tools are installed:"
     echo "  usbmuxd, avahi-daemon + avahi-utils, ffmpeg, wl-clipboard (Wayland) / xclip (X11), zenity"

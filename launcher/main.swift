@@ -190,16 +190,37 @@ final class LauncherModel: ObservableObject {
     @Published var isCheckingUpdates = false
     @Published var updateStatusMessage: String?
 
+    @Published var showNotificationsPanel = false
+    @Published var bleAncsState: BleAncsState = .disabled
+    @Published var notificationsAuthorized = false
+    @Published var notificationsPaused = false
+    @Published var unreadNotificationCount = 0
+    @Published var notificationHistory: [IosNotificationPayload] = []
+    @Published var relayPort: UInt16 = 48125
+    @Published var relayToken: String?
+    @Published var explicitQuit = false
+
     @AppStorage("transport") var transport = "auto"
     @AppStorage("autoRotate") var autoRotate = true
     @AppStorage("autoConnect") var autoConnect = false
     @AppStorage("autoCheckUpdates") var autoCheckUpdates = true
+    @AppStorage("notificationsEnabled") var notificationsEnabled = true
+    @AppStorage("keepInMenuBar") var keepInMenuBar = true
+    @AppStorage("muteWhileMirroring") var muteWhileMirroring = true
+    @AppStorage("hideNotificationPreviews") var hideNotificationPreviews = false
+    @AppStorage("relayEnabled") var relayEnabled = false
+    @AppStorage("mutedBundleIDs") var mutedBundleIDsRaw = ""
 
     private var backend: Process?
     private var scanTask: Task<Void, Never>?
     private var didAutoConnect = false
     private var browsers: [NWBrowser] = []
     private var nearbyByService: [String: Set<String>] = [:]
+    private var notificationManager: MacNotificationManager?
+    private var bleAncsClient: CoreBluetoothAncsClient?
+    private var daemonBridge: NotificationDaemonBridge?
+    private let menuBarController = MenuBarController()
+    private var pendingLaunchBundleID: String?
 
     var backendURL: URL {
         Bundle.main.bundleURL.appendingPathComponent(
@@ -266,6 +287,7 @@ final class LauncherModel: ObservableObject {
     }
 
     func start() {
+        setupNotificationsAndMenuBar()
         guard scanTask == nil else { return }
         startBonjourScanning()
         if autoCheckUpdates {
@@ -277,6 +299,193 @@ final class LauncherModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: 4_000_000_000)
             }
         }
+    }
+
+    private func setupNotificationsAndMenuBar() {
+        if notificationManager == nil {
+            let mgr = MacNotificationManager()
+            mgr.onAuthorizationUpdated = { [weak self] granted, _ in
+                self?.notificationsAuthorized = granted
+            }
+            mgr.onPerformAncsAction = { [weak self] uid, positive in
+                self?.daemonBridge?.sendPerformAction(uid: uid, positive: positive)
+            }
+            mgr.onOpenBundleInMirror = { [weak self] bundleID in
+                self?.openBundleInMirror(bundleID)
+            }
+            mgr.configureAndRequestAuthorization()
+            notificationManager = mgr
+        }
+
+        if daemonBridge == nil {
+            let bridge = NotificationDaemonBridge(backendURL: backendURL)
+            bridge.onWriteControlPoint = { [weak self] data in
+                self?.bleAncsClient?.writeControlPoint(data)
+            }
+            bridge.onDeliverNotification = { [weak self] notif in
+                guard let self else { return }
+                self.recordNotification(notif)
+                if !self.notificationsPaused {
+                    self.notificationManager?.deliver(notif)
+                }
+            }
+            bridge.onRecordHistoryOnly = { [weak self] notif in
+                self?.recordNotification(notif)
+            }
+            bridge.onRetractNotification = { [weak self] uid in
+                self?.notificationManager?.retract(uid: uid)
+                self?.notificationHistory.removeAll { $0.uid == uid }
+                self?.menuBarController.rebuildMenu()
+            }
+            bridge.onRelayReady = { [weak self] port, token in
+                self?.relayPort = port
+                self?.relayToken = token
+            }
+            bridge.start()
+            daemonBridge = bridge
+        }
+
+        if bleAncsClient == nil {
+            let ble = CoreBluetoothAncsClient()
+            ble.onStateChanged = { [weak self] state in
+                self?.bleAncsState = state
+                self?.menuBarController.rebuildMenu()
+            }
+            ble.onConnected = { [weak self] name in
+                self?.daemonBridge?.sendBleConnected(name: name)
+            }
+            ble.onDisconnected = { [weak self] reason in
+                self?.daemonBridge?.sendBleDisconnected(reason: reason)
+            }
+            ble.onNotificationSourceData = { [weak self] data in
+                self?.daemonBridge?.sendBleNotificationSource(data)
+            }
+            ble.onDataSourceData = { [weak self] data in
+                self?.daemonBridge?.sendBleDataSource(data)
+            }
+            bleAncsClient = ble
+        }
+
+        syncNotificationSettings()
+        if notificationsEnabled {
+            bleAncsClient?.start()
+        }
+        menuBarController.setup(model: self) { [weak self] in
+            self?.presentMainWindow()
+        }
+    }
+
+    private func recordNotification(_ notif: IosNotificationPayload) {
+        notificationHistory.removeAll { $0.uid == notif.uid }
+        notificationHistory.insert(notif, at: 0)
+        if notificationHistory.count > 100 {
+            notificationHistory = Array(notificationHistory.prefix(100))
+        }
+        unreadNotificationCount = min(unreadNotificationCount + 1, 99)
+        menuBarController.rebuildMenu()
+    }
+
+    func handleNotificationsEnabledChanged() {
+        syncNotificationSettings()
+        if notificationsEnabled {
+            bleAncsClient?.start()
+        } else {
+            bleAncsClient?.stop()
+        }
+    }
+
+    func reconnectBleAncs() {
+        if notificationsEnabled {
+            bleAncsClient?.reconnect()
+        }
+    }
+
+    func sendTestNotification() {
+        daemonBridge?.sendTestNotification()
+    }
+
+    func dismissNotification(_ notif: IosNotificationPayload) {
+        notificationManager?.retract(uid: notif.uid)
+        daemonBridge?.sendPerformAction(uid: notif.uid, positive: false)
+        notificationHistory.removeAll { $0.uid == notif.uid }
+        menuBarController.rebuildMenu()
+    }
+
+    func syncNotificationSettings() {
+        let muted = mutedBundleIDsRaw
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let payload = NotificationSettingsPayload(
+            enabled: notificationsEnabled && !notificationsPaused,
+            keep_in_menu_bar: keepInMenuBar,
+            mute_while_mirroring: muteWhileMirroring,
+            hide_previews: hideNotificationPreviews,
+            muted_bundle_ids: muted,
+            relay_enabled: relayEnabled,
+            relay_port: relayPort,
+            relay_token: relayToken ?? ""
+        )
+        daemonBridge?.sendUpdateSettings(payload)
+        if keepInMenuBar {
+            menuBarController.setup(model: self) { [weak self] in
+                self?.presentMainWindow()
+            }
+        } else {
+            menuBarController.tearDown()
+        }
+    }
+
+    func openBundleInMirror(_ bundleID: String) {
+        if backendRunning {
+            NSApp.activate(ignoringOtherApps: true)
+            let exec = backendURL
+            let udid = selected?.udid
+            Task.detached(priority: .userInitiated) {
+                let proc = Process()
+                proc.executableURL = exec
+                proc.arguments = udid != nil
+                    ? ["launch-app", "--udid", udid!, bundleID]
+                    : ["launch-app", bundleID]
+                proc.standardOutput = FileHandle.nullDevice
+                proc.standardError = FileHandle.nullDevice
+                try? proc.run()
+            }
+            return
+        }
+        pendingLaunchBundleID = bundleID
+        if canStart {
+            connect()
+        } else {
+            presentMainWindow()
+        }
+    }
+
+    func syncAppIcons() async {
+        let exec = backendURL
+        let udid = selected?.udid
+        await Task.detached(priority: .utility) {
+            let proc = Process()
+            proc.executableURL = exec
+            proc.arguments = udid != nil ? ["fetch-icons", "--udid", udid!] : ["fetch-icons"]
+            proc.standardOutput = FileHandle.nullDevice
+            proc.standardError = FileHandle.nullDevice
+            try? proc.run()
+            proc.waitUntilExit()
+        }.value
+    }
+
+    func presentMainWindow() {
+        Self.showLauncher()
+        for win in NSApp.windows where win.canBecomeMain {
+            win.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    func prepareForExplicitQuit() {
+        explicitQuit = true
+        bleAncsClient?.stop()
+        daemonBridge?.stop()
     }
 
     func checkForUpdates(silent: Bool = false) async {
@@ -499,6 +708,10 @@ final class LauncherModel: ObservableObject {
         var environment = ProcessInfo.processInfo.environment
         environment["IPHONE_MIRROR_SESSION_WORKER"] = "1"
         environment["IPHONE_MIRROR_AUTO_ROTATE"] = autoRotate ? "1" : "0"
+        if let pending = pendingLaunchBundleID, !pending.isEmpty {
+            environment["IPHONE_MIRROR_LAUNCH_BUNDLE_ID"] = pending
+            pendingLaunchBundleID = nil
+        }
 
         if transport == "airplay" {
             environment["IPHONE_MIRROR_TRANSPORT"] = "airplay"
@@ -539,6 +752,8 @@ final class LauncherModel: ObservableObject {
             Task { @MainActor in
                 self?.backend = nil
                 self?.backendRunning = false
+                self?.daemonBridge?.sendSetMirrorActive(false)
+                self?.menuBarController.rebuildMenu()
                 Self.showLauncher()
                 if process.terminationStatus != 0 {
                     let detail = (try? String(contentsOf: logURL, encoding: .utf8))?
@@ -555,6 +770,8 @@ final class LauncherModel: ObservableObject {
             try process.run()
             backend = process
             backendRunning = true
+            daemonBridge?.sendSetMirrorActive(true)
+            menuBarController.rebuildMenu()
             error = nil
             Self.hideLauncher()
             NSRunningApplication(processIdentifier: process.processIdentifier)?
@@ -604,6 +821,32 @@ struct VisualEffectBlur: NSViewRepresentable {
 }
 
 struct WindowGlassConfigurator: NSViewRepresentable {
+    var keepInMenuBar: Bool
+    var explicitQuit: Bool
+
+    final class Coordinator: NSObject, NSWindowDelegate {
+        var keepInMenuBar: Bool
+        var explicitQuit: Bool
+
+        init(keepInMenuBar: Bool, explicitQuit: Bool) {
+            self.keepInMenuBar = keepInMenuBar
+            self.explicitQuit = explicitQuit
+        }
+
+        func windowShouldClose(_ sender: NSWindow) -> Bool {
+            if keepInMenuBar && !explicitQuit {
+                sender.orderOut(nil)
+                NSApp.setActivationPolicy(.accessory)
+                return false
+            }
+            return true
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(keepInMenuBar: keepInMenuBar, explicitQuit: explicitQuit)
+    }
+
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
         DispatchQueue.main.async {
@@ -614,11 +857,15 @@ struct WindowGlassConfigurator: NSViewRepresentable {
             window.isMovableByWindowBackground = false
             window.isOpaque = false
             window.backgroundColor = .clear
+            window.delegate = context.coordinator
         }
         return view
     }
 
-    func updateNSView(_ nsView: NSView, context: Context) {}
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.keepInMenuBar = keepInMenuBar
+        context.coordinator.explicitQuit = explicitQuit
+    }
 }
 
 struct GlassSurface<Content: View>: View {
@@ -809,14 +1056,22 @@ struct ContentView: View {
     var body: some View {
         ZStack {
             AmbientGlassBackdrop(accent: stageAccent)
-            WindowGlassConfigurator()
+            WindowGlassConfigurator(
+                keepInMenuBar: model.keepInMenuBar,
+                explicitQuit: model.explicitQuit
+            )
 
             HStack(spacing: 16) {
                 sidebarCard
                     .frame(width: 268)
 
-                stageCard
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                if model.showNotificationsPanel {
+                    NotificationsStageView()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    stageCard
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
             }
             .padding(.top, 34)
             .padding([.horizontal, .bottom], 18)
@@ -837,6 +1092,35 @@ struct ContentView: View {
                         .font(.system(size: 14, weight: .bold))
                         .foregroundColor(.white)
                     Spacer()
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.16)) {
+                            model.showNotificationsPanel.toggle()
+                            if model.showNotificationsPanel {
+                                model.unreadNotificationCount = 0
+                            }
+                        }
+                    } label: {
+                        ZStack(alignment: .topTrailing) {
+                            Image(systemName: model.bleAncsState.isHealthy ? "bell.badge.fill" : "bell")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundColor(model.showNotificationsPanel ? .white : Color.white.opacity(0.8))
+                                .padding(6)
+                                .background(
+                                    (model.showNotificationsPanel
+                                        ? Color(red: 0.28, green: 0.62, blue: 1.0).opacity(0.45)
+                                        : Color.white.opacity(0.08)),
+                                    in: Circle()
+                                )
+                            if model.unreadNotificationCount > 0 && !model.showNotificationsPanel {
+                                Circle()
+                                    .fill(Color.blue)
+                                    .frame(width: 7, height: 7)
+                                    .offset(x: -1, y: 1)
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .help("iPhone Notifications")
                     Button { Task { await model.scan(manual: true) } } label: {
                         Image(systemName: "arrow.clockwise")
                             .font(.system(size: 12, weight: .semibold))
@@ -1306,6 +1590,30 @@ struct SettingsView: View {
             Toggle("Resize the mirror window when orientation changes", isOn: $autoRotate)
             Toggle("Check for updates on launch", isOn: $autoCheckUpdates)
 
+            Section("iPhone Notifications (v0.5)") {
+                Toggle("Enable iPhone notifications", isOn: $model.notificationsEnabled)
+                    .onChange(of: model.notificationsEnabled) { _ in
+                        model.handleNotificationsEnabledChanged()
+                    }
+                Toggle("Keep running in Menu Bar when closed", isOn: $model.keepInMenuBar)
+                    .onChange(of: model.keepInMenuBar) { _ in model.syncNotificationSettings() }
+                Toggle("Mute banners while mirroring", isOn: $model.muteWhileMirroring)
+                    .onChange(of: model.muteWhileMirroring) { _ in model.syncNotificationSettings() }
+                Toggle("Hide message previews (Privacy)", isOn: $model.hideNotificationPreviews)
+                    .onChange(of: model.hideNotificationPreviews) { _ in model.syncNotificationSettings() }
+                Toggle("Enable Local HTTP Relay fallback", isOn: $model.relayEnabled)
+                    .onChange(of: model.relayEnabled) { _ in model.syncNotificationSettings() }
+                HStack {
+                    Text(model.bleAncsState.statusText)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Send Test") {
+                        model.sendTestNotification()
+                    }
+                }
+            }
+
             HStack(spacing: 10) {
                 Button(model.isCheckingUpdates ? "Checking…" : "Check for Updates") {
                     Task { await model.checkForUpdates(silent: false) }
@@ -1336,7 +1644,7 @@ struct SettingsView: View {
         }
         .modifier(GroupedFormStyle())
         .padding(8)
-        .frame(width: 480, height: 290)
+        .frame(width: 500, height: 470)
     }
 }
 
@@ -1347,6 +1655,15 @@ struct IPhoneMirrorLauncher: App {
     var body: some Scene {
         WindowGroup("iPhone Mirror") {
             ContentView().environmentObject(model)
+        }
+        .commands {
+            CommandGroup(replacing: .appTermination) {
+                Button("Quit iPhone Mirror") {
+                    model.prepareForExplicitQuit()
+                    NSApp.terminate(nil)
+                }
+                .keyboardShortcut("q", modifiers: .command)
+            }
         }
 
         Settings { SettingsView().environmentObject(model) }

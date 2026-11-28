@@ -31,7 +31,7 @@ reset-build:
 build:
 	cargo build --release --locked
 	mkdir -p build/swift-cache
-	xcrun swiftc -O -parse-as-library -module-cache-path build/swift-cache -target $(ARCH)-apple-macosx$(MACOSX_DEPLOYMENT_TARGET) launcher/main.swift -o "$(LAUNCHER)"
+	xcrun swiftc -O -parse-as-library -module-cache-path build/swift-cache -target $(ARCH)-apple-macosx$(MACOSX_DEPLOYMENT_TARGET) launcher/*.swift -framework AppKit -framework SwiftUI -framework Network -framework UserNotifications -framework CoreBluetooth -o "$(LAUNCHER)"
 
 icon:
 	python3 scripts/generate_icon.py

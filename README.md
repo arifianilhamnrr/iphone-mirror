@@ -2,7 +2,7 @@
 
 Native iPhone screen mirroring for **macOS** and **Linux (Wayland & X11)**, written in Rust.
 
-- Version: **0.4.2**
+- Version: **0.5.0**
 - Hosts:
   - **macOS 12 Monterey** or newer (tested up to macOS 26 Tahoe, `x86_64`)
   - **Linux (All Distros)** — both **Wayland** (GNOME, KDE Plasma, Hyprland, Sway) and **X11** (XFCE, i3, Cinnamon, MATE) desktop environments via runtime dynamic loading (PipeWire / PulseAudio / ALSA audio)
@@ -69,6 +69,7 @@ Native iPhone screen mirroring for **macOS** and **Linux (Wayland & X11)**, writ
 - Output-device change detection with automatic backend recreation.
 - Accurate RTCP receiver reports (loss fraction, cumulative loss, jitter, LSR/DLSR).
 - Selectable audio backend (`IPHONE_MIRROR_AUDIO_BACKEND=audiounit|audioqueue`) and opt-in diagnostics (`IPHONE_MIRROR_AUDIO_DIAGNOSTICS=1`).
+- Native iPhone Notification Mirroring over Bluetooth LE ANCS (`UNUserNotificationCenter` + Menu Bar Agent on macOS; BlueZ + FreeDesktop Notifications on Linux) with cached app icons, click-to-open-app, two-way dismiss sync, privacy redaction, and optional local HTTP relay fallback.
 
 ## Experimental features
 
@@ -404,6 +405,7 @@ src/
 ├── codec/       # VideoToolbox decoding and screenshots
 ├── input/       # Touch, keyboard, shortcuts, and clipboard
 ├── media/       # RTP parsing and HEVC depacketization
+├── notifications/ # ANCS v1.1 protocol, storm guard, icon cache, relay, & Linux desktop/BlueZ
 ├── protocol/    # DisplayService negotiation and RTCP feedback
 ├── transfer/    # AFC staging, pasteboard publication, and file limits
 ├── transport/   # usbmuxd, CoreDeviceProxy, RSD, DDI, and Wi-Fi pairing

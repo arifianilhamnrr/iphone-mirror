@@ -62,7 +62,7 @@ Section: utils
 Priority: optional
 Architecture: amd64
 Maintainer: iphone-mirror contributors <https://github.com/arifianilhamnrr/iphone-mirror>
-Recommends: usbmuxd, avahi-daemon, avahi-utils, ffmpeg, wl-clipboard, xclip, zenity
+Recommends: usbmuxd, avahi-daemon, avahi-utils, ffmpeg, wl-clipboard, xclip, zenity, bluez, libnotify-bin
 Description: Native iPhone Screen Mirroring & AirPlay Receiver (Wayland & X11)
  Hardware-friendly iPhone screen mirroring over USB, Wi-Fi (CoreDevice),
  and AirPlay (H.264) across Wayland and X11 Linux desktops.
@@ -86,7 +86,7 @@ Summary:        Native iPhone Screen Mirroring & AirPlay Receiver (Wayland & X11
 License:        GPL-3.0
 URL:            https://github.com/arifianilhamnrr/iphone-mirror
 BuildArch:      x86_64
-Recommends:     usbmuxd, avahi, avahi-tools, ffmpeg, wl-clipboard, xclip, zenity
+Recommends:     usbmuxd, avahi, avahi-tools, ffmpeg, wl-clipboard, xclip, zenity, bluez, libnotify
 
 %description
 Native iPhone Screen Mirroring over USB, Wi-Fi (CoreDevice), and AirPlay (H.264)

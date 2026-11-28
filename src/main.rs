@@ -2,8 +2,9 @@
 use anyhow::{Context, Result};
 use idevice::{
     core_device::{
-        ButtonState, DataInclusionPolicy, IndigoHidClient, MainKeyboardService,
-        PasteboardServiceClient, UniversalHidServiceClient, GENERAL_PASTEBOARD,
+        AppIconTarget, AppServiceClient, ButtonState, DataInclusionPolicy, IconServiceClient,
+        IndigoHidClient, MainKeyboardService, PasteboardServiceClient, UniversalHidServiceClient,
+        GENERAL_PASTEBOARD,
     },
     lockdown::LockdownClient,
     springboardservices::{InterfaceOrientation, SpringBoardServicesClient},
@@ -30,6 +31,9 @@ use iphone_mirror_rs::{
     },
     media::nal_parser::{NalUnitType, ParameterSetCache},
     media::{h265_depacketizer::H265Depacketizer, rtp::RtpPacket},
+    notifications::{
+        fallback_relay::run_stdio_daemon, icon_cache::IconCache, NotificationSettings,
+    },
     protocol::{display_client::DisplayClient, rtcp_stats::RtcpReportStats},
     transfer::{
         afc::AfcTransfer,
@@ -73,6 +77,15 @@ enum Command {
         udid: Option<String>,
         paths: Vec<std::path::PathBuf>,
     },
+    NotifyDaemon,
+    LaunchApp {
+        udid: Option<String>,
+        bundle_id: String,
+    },
+    FetchIcons {
+        udid: Option<String>,
+        bundle_ids: Vec<String>,
+    },
     CheckUpdate,
     Help,
 }
@@ -87,6 +100,8 @@ struct AppSettings {
     auto_connect: bool,
     #[serde(default = "default_true")]
     auto_check_updates: bool,
+    #[serde(default)]
+    notifications: NotificationSettings,
 }
 
 impl Default for AppSettings {
@@ -96,6 +111,7 @@ impl Default for AppSettings {
             auto_rotate: true,
             auto_connect: false,
             auto_check_updates: true,
+            notifications: NotificationSettings::default(),
         }
     }
 }
@@ -1277,6 +1293,34 @@ fn parse_command() -> Result<Command> {
             }
             Ok(Command::SendFiles { udid, paths })
         }
+        Some("notify-daemon") => Ok(Command::NotifyDaemon),
+        Some("launch-app") => {
+            let mut udid = None;
+            let mut bundle_id = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--udid" => {
+                        udid = Some(args.next().context("--udid requires a value")?);
+                    }
+                    other => bundle_id = Some(other.to_string()),
+                }
+            }
+            let bundle_id = bundle_id.context("launch-app requires <bundle_id>")?;
+            Ok(Command::LaunchApp { udid, bundle_id })
+        }
+        Some("fetch-icons") => {
+            let mut udid = None;
+            let mut bundle_ids = Vec::new();
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--udid" => {
+                        udid = Some(args.next().context("--udid requires a value")?);
+                    }
+                    other => bundle_ids.push(other.to_string()),
+                }
+            }
+            Ok(Command::FetchIcons { udid, bundle_ids })
+        }
         Some("check-update") => Ok(Command::CheckUpdate),
         Some("help" | "--help" | "-h") => Ok(Command::Help),
         Some(command) => anyhow::bail!("Unknown command: {command}. Run with --help for usage."),
@@ -1295,6 +1339,9 @@ fn print_help() {
            iphone-mirror pair [--udid <UDID>]\n  \
            iphone-mirror probe-files [--udid <UDID>]\n  \
            iphone-mirror send-files [--udid <UDID>] <path>...\n  \
+           iphone-mirror notify-daemon\n  \
+           iphone-mirror launch-app [--udid <UDID>] <bundle_id>\n  \
+           iphone-mirror fetch-icons [--udid <UDID>] [<bundle_id>...]\n  \
            iphone-mirror check-update\n"
     );
 }
@@ -1335,6 +1382,13 @@ async fn main() -> Result<()> {
         Command::Pair { udid } => pair_device(udid.as_deref()).await,
         Command::ProbeFiles { udid } => probe_files(udid.as_deref()).await,
         Command::SendFiles { udid, paths } => send_files(udid.as_deref(), paths).await,
+        Command::NotifyDaemon => run_stdio_daemon(load_settings().notifications).await,
+        Command::LaunchApp { udid, bundle_id } => {
+            launch_app_command(udid.as_deref(), &bundle_id).await
+        }
+        Command::FetchIcons { udid, bundle_ids } => {
+            fetch_icons_command(udid.as_deref(), bundle_ids).await
+        }
         Command::CheckUpdate => check_for_update().await,
         Command::Help => {
             print_help();
@@ -2119,6 +2173,22 @@ async fn run_mirror() -> Result<()> {
         }
     };
 
+    if let Ok(bundle_id) = env::var("IPHONE_MIRROR_LAUNCH_BUNDLE_ID") {
+        let trimmed = bundle_id.trim();
+        if !trimmed.is_empty() {
+            if let Ok(Ok(mut app_svc)) = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                AppServiceClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake),
+            )
+            .await
+            {
+                let _ = app_svc
+                    .launch_application(trimmed, &[], false, false, None, None, None)
+                    .await;
+            }
+        }
+    }
+
     let event_loop = winit::event_loop::EventLoop::<UiEvent>::with_user_event()
         .build()
         .context("Failed to create the macOS event loop")?;
@@ -2174,6 +2244,35 @@ async fn run_mirror() -> Result<()> {
         let orientation_proxy = stream_proxy.clone();
         let mut orientation_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
+            // Warm up notification icon cache lazily for common iOS apps using the active SpringBoard socket.
+            if let Ok(icon_cache) = IconCache::open_default() {
+                for bundle_id in [
+                    "com.apple.MobileSMS",
+                    "com.apple.mobilephone",
+                    "com.apple.mobilemail",
+                    "com.apple.facetime",
+                    "net.whatsapp.WhatsApp",
+                    "ph.telegra.Telegraph",
+                    "com.burbn.instagram",
+                    "com.atebits.Tweetie2",
+                    "com.google.Gmail",
+                ] {
+                    if *orientation_shutdown.borrow() {
+                        break;
+                    }
+                    if icon_cache.icon_path_if_exists(bundle_id).is_some() {
+                        continue;
+                    }
+                    if let Ok(Ok(png)) = tokio::time::timeout(
+                        std::time::Duration::from_millis(900),
+                        springboard.get_icon_pngdata(bundle_id.to_string()),
+                    )
+                    .await
+                    {
+                        let _ = icon_cache.store_icon_png(bundle_id, &png);
+                    }
+                }
+            }
             let mut poll = tokio::time::interval(std::time::Duration::from_millis(500));
             poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut last_rotation: Option<DisplayRotation> = None;
@@ -3004,15 +3103,89 @@ async fn dispatch_hid_command<R: idevice::ReadWrite>(
     }
 }
 
-async fn connect_optional_hid_tunnel() -> Result<RsdTunnel> {
+async fn connect_rsd_for_udid(udid: Option<&str>) -> Result<RsdTunnel> {
     if let Some(wifi_device) = wifi::endpoint_from_env() {
         return TunnelSource::Wifi(&wifi_device).connect().await;
     }
-    let udid = env::var("IPHONE_MIRROR_UDID").ok();
+    if let Ok(devices) = wifi::WifiDiscovery::discover().await {
+        if let Some(wifi_device) = devices
+            .into_iter()
+            .find(|d| udid.is_none() || d.identifier == udid.unwrap_or_default())
+        {
+            return TunnelSource::Wifi(&wifi_device).connect().await;
+        }
+    }
     let device =
-        DeviceScanner::select_device_with_transport(udid.as_deref(), TransportPreference::Auto)
-            .await?;
+        DeviceScanner::select_device_with_transport(udid, TransportPreference::Auto).await?;
     TunnelSource::Usb(&device).connect().await
+}
+
+async fn connect_optional_hid_tunnel() -> Result<RsdTunnel> {
+    let udid = env::var("IPHONE_MIRROR_UDID").ok();
+    connect_rsd_for_udid(udid.as_deref()).await
+}
+
+async fn launch_app_command(udid: Option<&str>, bundle_id: &str) -> Result<()> {
+    let mut tunnel = connect_rsd_for_udid(udid).await?;
+    let mut app_service = AppServiceClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake)
+        .await
+        .context("Failed to connect CoreDevice AppService")?;
+    app_service
+        .launch_application(bundle_id, &[], false, false, None, None, None)
+        .await
+        .with_context(|| format!("Failed to launch {bundle_id} on iPhone"))?;
+    println!("Launched {bundle_id}");
+    Ok(())
+}
+
+async fn fetch_icons_command(udid: Option<&str>, bundle_ids: Vec<String>) -> Result<()> {
+    let icon_cache = IconCache::open_default()?;
+    let mut tunnel = connect_rsd_for_udid(udid).await?;
+    let targets = if bundle_ids.is_empty() {
+        vec![
+            "com.apple.MobileSMS".to_string(),
+            "com.apple.mobilephone".to_string(),
+            "com.apple.mobilemail".to_string(),
+            "com.apple.facetime".to_string(),
+            "net.whatsapp.WhatsApp".to_string(),
+            "ph.telegra.Telegraph".to_string(),
+            "com.burbn.instagram".to_string(),
+            "com.google.Gmail".to_string(),
+        ]
+    } else {
+        bundle_ids
+    };
+
+    if let Ok(mut icon_svc) =
+        IconServiceClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake).await
+    {
+        for bundle_id in targets {
+            if let Ok(icon) = icon_svc
+                .fetch_icon(
+                    AppIconTarget::BundleIdentifier(bundle_id.clone()),
+                    64.0,
+                    64.0,
+                    2.0,
+                    false,
+                )
+                .await
+            {
+                let _ = icon_cache.store_icon_png(&bundle_id, icon.png_data.as_ref());
+            }
+        }
+        return Ok(());
+    }
+
+    let mut springboard =
+        SpringBoardServicesClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.handshake)
+            .await
+            .context("Neither IconService nor SpringBoardServices is available")?;
+    for bundle_id in targets {
+        if let Ok(png) = springboard.get_icon_pngdata(bundle_id.clone()).await {
+            let _ = icon_cache.store_icon_png(&bundle_id, &png);
+        }
+    }
+    Ok(())
 }
 
 async fn run_airplay_hybrid_hid(
