@@ -19,10 +19,10 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Linux packaging tools (dpkg, rpmbuild, file, fuse)
+      - name: Install Linux runtime & packaging tools (ffmpeg, dpkg, rpmbuild, file)
         run: |
           sudo apt-get update
-          sudo apt-get install -y dpkg rpm file desktop-file-utils curl
+          sudo apt-get install -y ffmpeg dpkg rpm file desktop-file-utils curl
 
       - name: Cache Cargo registry & build artifacts
         uses: actions/cache@v4
