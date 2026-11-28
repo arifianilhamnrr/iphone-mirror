@@ -13,6 +13,41 @@ Native iPhone screen mirroring for **macOS** and **Linux (Wayland & X11)**, writ
 > [!IMPORTANT]
 > This project uses private and undocumented Apple services. Compatibility may change after an iOS or macOS update.
 
+## Screenshots
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="docs/screenshots/launcher-auto.png" alt="Launcher Auto Mode" width="100%" /><br />
+      <strong>Unified Launcher (Auto)</strong> — Automatic USB &amp; Wi-Fi discovery
+    </td>
+    <td align="center" width="50%">
+      <img src="docs/screenshots/mirror-session.png" alt="Live iPhone Screen Mirroring" height="290" /><br />
+      <strong>Live Mirroring</strong> — Hardware-decoded HEVC stream &amp; HID input
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="docs/screenshots/launcher-wifi.png" alt="Wi-Fi Mode &amp; Pair Wi-Fi via USB" width="100%" /><br />
+      <strong>Wi-Fi Mode</strong> — Direct RemotePairing &amp; one-click USB pairing
+    </td>
+    <td align="center" width="50%">
+      <img src="docs/screenshots/launcher-airplay.png" alt="AirPlay H.264 Receiver Mode" width="100%" /><br />
+      <strong>AirPlay Receiver</strong> — H.264 + AAC-ELD audio with Hybrid HID control
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="docs/screenshots/launcher-usb.png" alt="USB Mode" width="100%" /><br />
+      <strong>USB Mode</strong> — Lowest-latency wired mirroring
+    </td>
+    <td align="center" width="50%">
+      <img src="docs/screenshots/settings.png" alt="iPhone Mirror Settings" width="85%" /><br />
+      <strong>Settings</strong> — Transport preference, auto-rotate &amp; update checks
+    </td>
+  </tr>
+</table>
+
 ## Features
 
 - HEVC screen streaming through CoreDevice DisplayService.
