@@ -137,6 +137,10 @@ pub struct NotificationSettings {
     pub relay_port: u16,
     #[serde(default)]
     pub relay_token: String,
+    #[serde(default)]
+    pub forward_http_url: String,
+    #[serde(default)]
+    pub forward_http_token: String,
 }
 
 fn default_true() -> bool {
@@ -158,6 +162,8 @@ impl Default for NotificationSettings {
             relay_enabled: false,
             relay_port: default_relay_port(),
             relay_token: String::new(),
+            forward_http_url: String::new(),
+            forward_http_token: String::new(),
         }
     }
 }

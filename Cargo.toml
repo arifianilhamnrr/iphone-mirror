@@ -50,10 +50,11 @@ rand = "0.8"
 winit = "0.30"
 raw-window-handle = "0.6"
 
-# Linux 2D UI Font Rasterization (Pure Rust, already in Cargo.lock)
+# Linux 2D UI Font Rasterization & BlueZ D-Bus (Pure Rust, zero C deps)
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 ttf-parser = "0.25"
 ab_glyph_rasterizer = "0.1"
+zbus = { version = "4", default-features = false, features = ["tokio"] }
 
 # macOS Native Frameworks (macOS 12 Monterey .. macOS 26 Tahoe)
 [target.'cfg(target_os = "macos")'.dependencies]

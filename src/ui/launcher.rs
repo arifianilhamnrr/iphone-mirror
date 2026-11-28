@@ -3,9 +3,11 @@
 
 use crate::{
     notifications::{
-        fallback_relay::NotificationEngine,
-        ipc::{DaemonToHostMessage, HostToDaemonMessage},
-        linux_bluez::{inspect_bluez_status, solicit_ancs_advertisement},
+        fallback_relay::{forward_notification_http, NotificationEngine},
+        ipc::{decode_b64, DaemonToHostMessage, HostToDaemonMessage},
+        linux_bluez::{
+            inspect_bluez_status, solicit_ancs_advertisement, spawn_bluez_ancs_loop, BluezAncsEvent,
+        },
         linux_desktop::LinuxDesktopNotifier,
         IosNotification, NotificationSettings,
     },
@@ -300,6 +302,7 @@ enum LauncherEvent {
     PairFinished(Result<String, String>),
     ScanRequested,
     BluezStatusUpdated(String),
+    BluezAncs(BluezAncsEvent),
     StreamActive,
 }
 
@@ -1355,6 +1358,7 @@ struct LauncherApp {
     show_settings: bool,
     show_notifications_panel: bool,
     bluez_status: String,
+    bluez_cp_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
     desktop_notifier: LinuxDesktopNotifier,
     notification_engine: Option<NotificationEngine>,
     notification_history: Vec<IosNotification>,
@@ -1393,6 +1397,7 @@ impl LauncherApp {
             show_settings: false,
             show_notifications_panel: false,
             bluez_status: "Checking BlueZ ANCS status…".to_string(),
+            bluez_cp_tx: None,
             desktop_notifier: LinuxDesktopNotifier::new(),
             notification_engine,
             notification_history: Vec::new(),
@@ -1429,14 +1434,51 @@ impl LauncherApp {
                 HostToDaemonMessage::SendTestNotification,
                 std::time::Instant::now(),
             );
-            for msg in msgs {
-                if let DaemonToHostMessage::DeliverNotification { notification } = msg {
+            self.process_daemon_outputs(msgs);
+        }
+    }
+
+    fn process_daemon_outputs(&mut self, msgs: Vec<DaemonToHostMessage>) {
+        for msg in msgs {
+            match msg {
+                DaemonToHostMessage::WriteControlPoint { bytes_b64 } => {
+                    if let (Some(tx), Ok(bytes)) = (&self.bluez_cp_tx, decode_b64(&bytes_b64)) {
+                        let _ = tx.send(bytes);
+                    }
+                }
+                DaemonToHostMessage::DeliverNotification { notification } => {
                     self.desktop_notifier.deliver(&notification);
+                    if !self.settings.notifications.forward_http_url.is_empty() {
+                        let url = self.settings.notifications.forward_http_url.clone();
+                        let tok = self.settings.notifications.forward_http_token.clone();
+                        let n = notification.clone();
+                        tokio::spawn(async move {
+                            let _ = forward_notification_http(&url, &tok, &n).await;
+                        });
+                    }
+                    self.notification_history
+                        .retain(|n| n.uid != notification.uid);
                     self.notification_history.insert(0, notification);
                     if self.notification_history.len() > 100 {
                         self.notification_history.truncate(100);
                     }
                 }
+                DaemonToHostMessage::RecordHistoryOnly { notification } => {
+                    self.notification_history
+                        .retain(|n| n.uid != notification.uid);
+                    self.notification_history.insert(0, notification);
+                    if self.notification_history.len() > 100 {
+                        self.notification_history.truncate(100);
+                    }
+                }
+                DaemonToHostMessage::RetractNotification { uid } => {
+                    self.desktop_notifier.retract(uid);
+                    self.notification_history.retain(|n| n.uid != uid);
+                }
+                DaemonToHostMessage::Status { message } => {
+                    self.bluez_status = message;
+                }
+                _ => {}
             }
         }
     }
@@ -3111,6 +3153,18 @@ impl ApplicationHandler<LauncherEvent> for LauncherApp {
                             }
                         }
                     });
+                    if self.settings.notifications.enabled {
+                        let ancs_proxy = self.proxy.clone();
+                        let (ancs_tx, mut ancs_rx) = tokio::sync::mpsc::unbounded_channel();
+                        spawn_bluez_ancs_loop(ancs_tx);
+                        tokio::spawn(async move {
+                            while let Some(ev) = ancs_rx.recv().await {
+                                if ancs_proxy.send_event(LauncherEvent::BluezAncs(ev)).is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                    }
                     self.render();
                 }
                 Err(err) => {
@@ -3233,6 +3287,51 @@ impl ApplicationHandler<LauncherEvent> for LauncherApp {
             }
             LauncherEvent::BluezStatusUpdated(detail) => {
                 self.bluez_status = detail;
+                self.request_redraw();
+            }
+            LauncherEvent::BluezAncs(ev) => {
+                let now = std::time::Instant::now();
+                match ev {
+                    BluezAncsEvent::Status(msg) => {
+                        self.bluez_status = msg;
+                    }
+                    BluezAncsEvent::Connected { device_name } => {
+                        self.bluez_status = format!("ANCS active: {device_name}");
+                        if let Some(engine) = &mut self.notification_engine {
+                            let _ = engine.handle_host_message(
+                                HostToDaemonMessage::BleConnected {
+                                    peripheral_name: device_name,
+                                },
+                                now,
+                            );
+                        }
+                    }
+                    BluezAncsEvent::Disconnected { reason } => {
+                        self.bluez_cp_tx = None;
+                        self.bluez_status = format!("ANCS disconnected ({reason})");
+                        if let Some(engine) = &mut self.notification_engine {
+                            let _ = engine.handle_host_message(
+                                HostToDaemonMessage::BleDisconnected { reason },
+                                now,
+                            );
+                        }
+                    }
+                    BluezAncsEvent::CommandChannelReady(tx) => {
+                        self.bluez_cp_tx = Some(tx);
+                    }
+                    BluezAncsEvent::NotificationSourcePacket(raw) => {
+                        if let Some(engine) = &mut self.notification_engine {
+                            let outs = engine.handle_notification_source(&raw, now);
+                            self.process_daemon_outputs(outs);
+                        }
+                    }
+                    BluezAncsEvent::DataSourcePacket(raw) => {
+                        if let Some(engine) = &mut self.notification_engine {
+                            let outs = engine.handle_data_source(&raw, now);
+                            self.process_daemon_outputs(outs);
+                        }
+                    }
+                }
                 self.request_redraw();
             }
             LauncherEvent::StreamActive => {

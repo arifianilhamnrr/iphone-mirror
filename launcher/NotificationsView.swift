@@ -108,11 +108,20 @@ struct NotificationsStageView: View {
                         Image(systemName: "network")
                             .font(.system(size: 11))
                             .foregroundColor(.blue)
-                        Text("Local Relay: http://127.0.0.1:\(model.relayPort)/notify")
+                        Text("Relay: \(model.relayLanURL ?? "http://127.0.0.1:\(model.relayPort)/notify")")
                             .font(.system(size: 11, design: .monospaced))
                             .foregroundColor(Color.white.opacity(0.75))
+                            .lineLimit(1)
                         Spacer()
-                        Button("Copy Bearer Token") {
+                        Button("Copy URL") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(
+                                model.relayLanURL ?? "http://127.0.0.1:\(model.relayPort)/notify",
+                                forType: .string
+                            )
+                        }
+                        .font(.system(size: 11))
+                        Button("Copy Token") {
                             NSPasteboard.general.clearContents()
                             NSPasteboard.general.setString(token, forType: .string)
                         }

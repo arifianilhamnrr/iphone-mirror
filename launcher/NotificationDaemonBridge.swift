@@ -16,7 +16,7 @@ private enum DaemonEventDecoder: Decodable {
     case deliverNotification(notification: IosNotificationPayload)
     case recordHistoryOnly(notification: IosNotificationPayload)
     case retractNotification(uid: UInt32)
-    case relayReady(port: UInt16, token: String)
+    case relayReady(port: UInt16, token: String, lan_url: String?)
     case status(message: String)
 
     private enum CodingKeys: String, CodingKey {
@@ -26,6 +26,7 @@ private enum DaemonEventDecoder: Decodable {
         case uid
         case port
         case token
+        case lan_url
         case message
     }
 
@@ -44,7 +45,8 @@ private enum DaemonEventDecoder: Decodable {
         case "relay_ready":
             self = .relayReady(
                 port: try c.decode(UInt16.self, forKey: .port),
-                token: try c.decode(String.self, forKey: .token)
+                token: try c.decode(String.self, forKey: .token),
+                lan_url: try? c.decode(String.self, forKey: .lan_url)
             )
         default:
             let msg = (try? c.decode(String.self, forKey: .message)) ?? type
@@ -58,7 +60,7 @@ final class NotificationDaemonBridge {
     var onDeliverNotification: ((IosNotificationPayload) -> Void)?
     var onRecordHistoryOnly: ((IosNotificationPayload) -> Void)?
     var onRetractNotification: ((UInt32) -> Void)?
-    var onRelayReady: ((UInt16, String) -> Void)?
+    var onRelayReady: ((UInt16, String, String?) -> Void)?
     var onStatus: ((String) -> Void)?
 
     private var process: Process?
@@ -189,8 +191,8 @@ final class NotificationDaemonBridge {
                 onRecordHistoryOnly?(notif)
             case .retractNotification(let uid):
                 onRetractNotification?(uid)
-            case .relayReady(let port, let token):
-                onRelayReady?(port, token)
+            case .relayReady(let port, let token, let lanUrl):
+                onRelayReady?(port, token, lanUrl)
             case .status(let message):
                 onStatus?(message)
             }

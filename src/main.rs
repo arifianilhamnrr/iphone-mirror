@@ -77,7 +77,9 @@ enum Command {
         udid: Option<String>,
         paths: Vec<std::path::PathBuf>,
     },
-    NotifyDaemon,
+    NotifyDaemon {
+        bluez: bool,
+    },
     LaunchApp {
         udid: Option<String>,
         bundle_id: String,
@@ -1293,7 +1295,10 @@ fn parse_command() -> Result<Command> {
             }
             Ok(Command::SendFiles { udid, paths })
         }
-        Some("notify-daemon") => Ok(Command::NotifyDaemon),
+        Some("notify-daemon") => {
+            let bluez = args.any(|arg| arg == "--bluez");
+            Ok(Command::NotifyDaemon { bluez })
+        }
         Some("launch-app") => {
             let mut udid = None;
             let mut bundle_id = None;
@@ -1382,7 +1387,9 @@ async fn main() -> Result<()> {
         Command::Pair { udid } => pair_device(udid.as_deref()).await,
         Command::ProbeFiles { udid } => probe_files(udid.as_deref()).await,
         Command::SendFiles { udid, paths } => send_files(udid.as_deref(), paths).await,
-        Command::NotifyDaemon => run_stdio_daemon(load_settings().notifications).await,
+        Command::NotifyDaemon { bluez } => {
+            run_stdio_daemon(load_settings().notifications, bluez).await
+        }
         Command::LaunchApp { udid, bundle_id } => {
             launch_app_command(udid.as_deref(), &bundle_id).await
         }

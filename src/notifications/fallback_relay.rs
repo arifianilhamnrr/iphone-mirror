@@ -12,17 +12,18 @@ use crate::notifications::{
 };
 use anyhow::{bail, Result};
 use rand::RngCore;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::UdpSocket;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
 static TEST_UID_SEQ: AtomicU32 = AtomicU32::new(900_000);
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RelayNotifyPayload {
     #[serde(default = "default_relay_bundle")]
     app_bundle_id: String,
@@ -37,6 +38,72 @@ struct RelayNotifyPayload {
     category: Option<String>,
     #[serde(default)]
     silent: bool,
+}
+
+/// Best-effort discovery of the laptop's active LAN IPv4 address for HTTP relay instructions.
+pub fn local_lan_ip() -> Option<String> {
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("8.8.8.8:80").ok()?;
+    let addr = sock.local_addr().ok()?;
+    Some(addr.ip().to_string())
+}
+
+/// Forwards an iOS notification to another host's `iPhone Mirror` HTTP relay endpoint (`POST /notify`).
+pub async fn forward_notification_http(
+    url: &str,
+    bearer_token: &str,
+    notif: &IosNotification,
+) -> Result<()> {
+    let stripped = url
+        .trim()
+        .strip_prefix("http://")
+        .ok_or_else(|| anyhow::anyhow!("Relay forward URL must start with http://"))?;
+    let (host_port, path) = match stripped.find('/') {
+        Some(idx) => (&stripped[..idx], &stripped[idx..]),
+        None => (stripped, "/notify"),
+    };
+    let addr = if host_port.contains(':') {
+        host_port.to_string()
+    } else {
+        format!("{host_port}:80")
+    };
+
+    let category = if notif.category.is_call() {
+        Some("incoming_call".to_string())
+    } else {
+        None
+    };
+    let payload = RelayNotifyPayload {
+        app_bundle_id: notif.app_bundle_id.clone(),
+        app_display_name: Some(notif.app_display_name.clone()),
+        title: notif.title.clone(),
+        subtitle: notif.subtitle.clone(),
+        body: notif.body.clone(),
+        category,
+        silent: notif.flags.silent,
+    };
+    let json = serde_json::to_vec(&payload)?;
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nAuthorization: Bearer {bearer_token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        json.len()
+    );
+
+    let mut stream = tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&addr))
+        .await
+        .map_err(|_| anyhow::anyhow!("Timed out connecting to relay {addr}"))??;
+    stream.write_all(req.as_bytes()).await?;
+    stream.write_all(&json).await?;
+    stream.flush().await?;
+
+    let mut resp_buf = [0_u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut resp_buf))
+        .await
+        .map_err(|_| anyhow::anyhow!("Timed out reading relay response"))??;
+    let status_line = String::from_utf8_lossy(&resp_buf[..n]);
+    if !status_line.contains(" 200 ") && !status_line.contains(" 202 ") {
+        bail!("Relay server returned unexpected response: {status_line}");
+    }
+    Ok(())
 }
 
 fn default_relay_bundle() -> String {
@@ -490,7 +557,7 @@ async fn handle_http_connection(
 }
 
 /// Runs the stdio JSON-line notification daemon (invoked by `iPhone Mirror.app` or CLI).
-pub async fn run_stdio_daemon(initial_settings: NotificationSettings) -> Result<()> {
+pub async fn run_stdio_daemon(initial_settings: NotificationSettings, bluez: bool) -> Result<()> {
     let (relay_tx, mut relay_rx) = mpsc::unbounded_channel();
     let mut settings = initial_settings;
     if settings.relay_token.is_empty() {
@@ -517,11 +584,29 @@ pub async fn run_stdio_daemon(initial_settings: NotificationSettings) -> Result<
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
+    let (mut bluez_rx_opt, mut desktop_notifier, mut bluez_cp_tx) = if bluez {
+        let (tx, rx) = mpsc::unbounded_channel();
+        crate::notifications::linux_bluez::spawn_bluez_ancs_loop(tx);
+        (
+            Some(rx),
+            Some(crate::notifications::linux_desktop::LinuxDesktopNotifier::new()),
+            None::<mpsc::UnboundedSender<Vec<u8>>>,
+        )
+    } else {
+        (None, None, None)
+    };
+    #[cfg(target_os = "macos")]
+    let (mut bluez_rx_opt, _bluez_unused) = (None::<()>, bluez);
+
     let mut engine = NotificationEngine::new(settings.clone())?;
     if relay_started {
+        let lan_url =
+            local_lan_ip().map(|ip| format!("http://{ip}:{}/notify", settings.relay_port));
         emit_msg(&DaemonToHostMessage::RelayReady {
             port: settings.relay_port,
             token: settings.relay_token.clone(),
+            lan_url,
         });
     }
 
@@ -538,7 +623,41 @@ pub async fn run_stdio_daemon(initial_settings: NotificationSettings) -> Result<
                         if trimmed.is_empty() {
                             continue;
                         }
-                        if let Ok(msg) = serde_json::from_str::<HostToDaemonMessage>(trimmed) {
+                        if let Ok(mut msg) = serde_json::from_str::<HostToDaemonMessage>(trimmed) {
+                            if let HostToDaemonMessage::UpdateSettings { ref mut settings } = msg {
+                                if settings.relay_token.is_empty() {
+                                    settings.relay_token = engine.settings().relay_token.clone();
+                                    if settings.relay_token.is_empty() {
+                                        settings.relay_token = generate_relay_token();
+                                    }
+                                }
+                                if settings.relay_enabled && !relay_started {
+                                    match spawn_relay_server(
+                                        settings.relay_port,
+                                        settings.relay_token.clone(),
+                                        relay_tx.clone(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {
+                                            relay_started = true;
+                                            let lan_url = local_lan_ip().map(|ip| {
+                                                format!("http://{ip}:{}/notify", settings.relay_port)
+                                            });
+                                            emit_msg(&DaemonToHostMessage::RelayReady {
+                                                port: settings.relay_port,
+                                                token: settings.relay_token.clone(),
+                                                lan_url,
+                                            });
+                                        }
+                                        Err(err) => {
+                                            emit_msg(&DaemonToHostMessage::Status {
+                                                message: format!("Notification relay bind failed: {err}"),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
                             let now = Instant::now();
                             for out in engine.handle_host_message(msg, now) {
                                 emit_msg(&out);
@@ -551,13 +670,108 @@ pub async fn run_stdio_daemon(initial_settings: NotificationSettings) -> Result<
             Some(relay_notif) = relay_rx.recv() => {
                 let now = Instant::now();
                 for out in engine.ingest_external_notification(relay_notif, now) {
+                    #[cfg(not(target_os = "macos"))]
+                    if let Some(dn) = desktop_notifier.as_mut() {
+                        if let DaemonToHostMessage::DeliverNotification { ref notification } = out {
+                            dn.deliver(notification);
+                        }
+                    }
                     emit_msg(&out);
                 }
+            }
+            Some(ev) = next_bluez_event(&mut bluez_rx_opt) => {
+                handle_bluez_event_on_daemon(
+                    ev,
+                    &mut engine,
+                    #[cfg(not(target_os = "macos"))]
+                    &mut desktop_notifier,
+                    #[cfg(not(target_os = "macos"))]
+                    &mut bluez_cp_tx,
+                );
             }
         }
     }
 
     Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn next_bluez_event(
+    rx: &mut Option<mpsc::UnboundedReceiver<crate::notifications::linux_bluez::BluezAncsEvent>>,
+) -> Option<crate::notifications::linux_bluez::BluezAncsEvent> {
+    match rx {
+        Some(inner) => inner.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn next_bluez_event(_rx: &mut Option<()>) -> Option<()> {
+    std::future::pending().await
+}
+
+#[cfg(target_os = "macos")]
+fn handle_bluez_event_on_daemon(_ev: (), _engine: &mut NotificationEngine) {}
+
+#[cfg(not(target_os = "macos"))]
+fn handle_bluez_event_on_daemon(
+    ev: crate::notifications::linux_bluez::BluezAncsEvent,
+    engine: &mut NotificationEngine,
+    desktop_notifier: &mut Option<crate::notifications::linux_desktop::LinuxDesktopNotifier>,
+    bluez_cp_tx: &mut Option<mpsc::UnboundedSender<Vec<u8>>>,
+) {
+    use crate::notifications::linux_bluez::BluezAncsEvent;
+    let now = Instant::now();
+    let outs = match ev {
+        BluezAncsEvent::Status(message) => vec![DaemonToHostMessage::Status { message }],
+        BluezAncsEvent::Connected { device_name } => engine.handle_host_message(
+            HostToDaemonMessage::BleConnected {
+                peripheral_name: device_name,
+            },
+            now,
+        ),
+        BluezAncsEvent::Disconnected { reason } => {
+            *bluez_cp_tx = None;
+            engine.handle_host_message(HostToDaemonMessage::BleDisconnected { reason }, now)
+        }
+        BluezAncsEvent::CommandChannelReady(tx) => {
+            *bluez_cp_tx = Some(tx);
+            Vec::new()
+        }
+        BluezAncsEvent::NotificationSourcePacket(raw) => {
+            engine.handle_notification_source(&raw, now)
+        }
+        BluezAncsEvent::DataSourcePacket(raw) => engine.handle_data_source(&raw, now),
+    };
+    for out in outs {
+        match &out {
+            DaemonToHostMessage::WriteControlPoint { bytes_b64 } => {
+                if let (Some(tx), Ok(bytes)) = (&*bluez_cp_tx, decode_b64(bytes_b64)) {
+                    let _ = tx.send(bytes);
+                }
+            }
+            DaemonToHostMessage::DeliverNotification { notification } => {
+                if let Some(dn) = desktop_notifier.as_mut() {
+                    dn.deliver(notification);
+                }
+                if !engine.settings().forward_http_url.is_empty() {
+                    let url = engine.settings().forward_http_url.clone();
+                    let tok = engine.settings().forward_http_token.clone();
+                    let n = notification.clone();
+                    tokio::spawn(async move {
+                        let _ = forward_notification_http(&url, &tok, &n).await;
+                    });
+                }
+            }
+            DaemonToHostMessage::RetractNotification { uid } => {
+                if let Some(dn) = desktop_notifier.as_mut() {
+                    dn.retract(*uid);
+                }
+            }
+            _ => {}
+        }
+        emit_msg(&out);
+    }
 }
 
 fn emit_msg(msg: &DaemonToHostMessage) {
@@ -633,5 +847,43 @@ mod tests {
         assert!(constant_time_eq(b"secret123", b"secret123"));
         assert!(!constant_time_eq(b"secret123", b"secret124"));
         assert!(!constant_time_eq(b"secret", b"secret123"));
+    }
+
+    #[tokio::test]
+    async fn forward_http_roundtrips_into_relay_server() {
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let token = generate_relay_token();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        spawn_relay_server(port, token.clone(), tx)
+            .await
+            .expect("relay server starts");
+
+        let notif = IosNotification {
+            uid: 55,
+            event_kind: NotificationEventKind::Added,
+            flags: NotificationFlags::default(),
+            category: NotificationCategory::Social,
+            app_bundle_id: "net.whatsapp.WhatsApp".into(),
+            app_display_name: "WhatsApp".into(),
+            title: "Ar".into(),
+            subtitle: None,
+            body: "Forwarded from Linux ANCS".into(),
+            date: None,
+            positive_label: None,
+            negative_label: None,
+            icon_png_path: None,
+        };
+        let url = format!("http://127.0.0.1:{port}/notify");
+        forward_notification_http(&url, &token, &notif)
+            .await
+            .expect("HTTP forward succeeds");
+
+        let received = rx.recv().await.expect("relay received notification");
+        assert_eq!(received.title, "Ar");
+        assert_eq!(received.body, "Forwarded from Linux ANCS");
+        assert_eq!(received.app_bundle_id, "net.whatsapp.WhatsApp");
     }
 }

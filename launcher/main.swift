@@ -198,6 +198,7 @@ final class LauncherModel: ObservableObject {
     @Published var notificationHistory: [IosNotificationPayload] = []
     @Published var relayPort: UInt16 = 48125
     @Published var relayToken: String?
+    @Published var relayLanURL: String?
     @Published var explicitQuit = false
 
     @AppStorage("transport") var transport = "auto"
@@ -337,9 +338,10 @@ final class LauncherModel: ObservableObject {
                 self?.notificationHistory.removeAll { $0.uid == uid }
                 self?.menuBarController.rebuildMenu()
             }
-            bridge.onRelayReady = { [weak self] port, token in
+            bridge.onRelayReady = { [weak self] port, token, lanUrl in
                 self?.relayPort = port
                 self?.relayToken = token
+                self?.relayLanURL = lanUrl
             }
             bridge.start()
             daemonBridge = bridge

@@ -19,13 +19,30 @@ pub enum HostToDaemonMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonToHostMessage {
-    WriteControlPoint { bytes_b64: String },
-    DeliverNotification { notification: IosNotification },
-    RecordHistoryOnly { notification: IosNotification },
-    RetractNotification { uid: u32 },
-    LaunchApp { bundle_id: String },
-    RelayReady { port: u16, token: String },
-    Status { message: String },
+    WriteControlPoint {
+        bytes_b64: String,
+    },
+    DeliverNotification {
+        notification: IosNotification,
+    },
+    RecordHistoryOnly {
+        notification: IosNotification,
+    },
+    RetractNotification {
+        uid: u32,
+    },
+    LaunchApp {
+        bundle_id: String,
+    },
+    RelayReady {
+        port: u16,
+        token: String,
+        #[serde(default)]
+        lan_url: Option<String>,
+    },
+    Status {
+        message: String,
+    },
 }
 
 /// Minimal dependency-free base64 encoder/decoder for small BLE GATT payloads over JSON-line IPC.
